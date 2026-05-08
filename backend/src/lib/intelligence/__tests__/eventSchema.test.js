@@ -15,6 +15,7 @@ import {
 import { computeAlertKey, shouldFireAlert } from '../alertGuard.js';
 import { selectModel, getBudgetSummary } from '../aiCostGuard.js';
 import { getEventBus, resetEventBusCache } from '../eventBusFactory.js';
+import { _reloadIntelligenceFlagsForTesting } from '../../featureFlags.js';
 
 const VALID_EVENT = {
   eventId: '550e8400-e29b-41d4-a716-446655440000',
@@ -93,10 +94,11 @@ describe('IntelligenceEventSchema', () => {
 
 describe('Event bus factory', () => {
   beforeEach(() => {
-    resetEventBusCache();
     delete process.env.ENABLE_EVENT_BUS;
     delete process.env.EVENT_BUS_DRIVER;
     delete process.env.INTEL_BUS_URL;
+    _reloadIntelligenceFlagsForTesting();
+    resetEventBusCache();
   });
 
   it('returns noop bus when ENABLE_EVENT_BUS unset', async () => {
@@ -111,6 +113,7 @@ describe('Event bus factory', () => {
     process.env.ENABLE_EVENT_BUS = 'true';
     process.env.EVENT_BUS_DRIVER = 'http';
     process.env.INTEL_BUS_URL = '';
+    _reloadIntelligenceFlagsForTesting();
     resetEventBusCache();
     assert.equal(getEventBus().driver, 'noop');
   });
@@ -119,6 +122,7 @@ describe('Event bus factory', () => {
     process.env.ENABLE_EVENT_BUS = 'true';
     process.env.EVENT_BUS_DRIVER = 'http';
     process.env.INTEL_BUS_URL = 'http://localhost:4000/api/intelligence/events';
+    _reloadIntelligenceFlagsForTesting();
     resetEventBusCache();
     assert.equal(getEventBus().driver, 'http');
   });
@@ -126,6 +130,7 @@ describe('Event bus factory', () => {
   it('falls back to noop for unimplemented drivers', () => {
     process.env.ENABLE_EVENT_BUS = 'true';
     process.env.EVENT_BUS_DRIVER = 'redis-streams';
+    _reloadIntelligenceFlagsForTesting();
     resetEventBusCache();
     assert.equal(getEventBus().driver, 'noop');
   });
@@ -152,6 +157,7 @@ describe('alertGuard', () => {
 
   it('returns shouldFire=false when ENABLE_INTEL_ALERTS unset', async () => {
     delete process.env.ENABLE_INTEL_ALERTS;
+    _reloadIntelligenceFlagsForTesting();
     const result = await shouldFireAlert(VALID_EVENT);
     assert.equal(result.shouldFire, false);
     assert.equal(result.reason, 'alerts_disabled');
