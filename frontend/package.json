@@ -1,0 +1,41 @@
+{
+  "name": "sap-logistics-hub-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.0",
+    "@tanstack/react-query": "^5.51.0",
+    "zustand": "^4.5.4",
+    "axios": "^1.7.2",
+    "socket.io-client": "^4.7.5",
+    "date-fns": "^3.6.0",
+    "lucide-react": "^0.424.0",
+    "clsx": "^2.1.1",
+    "react-hook-form": "^7.52.1",
+    "@hookform/resolvers": "^3.9.0",
+    "zod": "^3.23.8",
+    "sonner": "^1.5.0",
+    "leaflet": "^1.9.4",
+    "react-leaflet": "^4.2.1",
+    "html5-qrcode": "^2.3.8"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.3.5",
+    "vite-plugin-pwa": "^0.20.1",
+    "tailwindcss": "^3.4.7",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.40"
+  }
+}

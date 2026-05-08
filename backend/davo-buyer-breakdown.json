@@ -1,0 +1,295 @@
+[
+  {
+    "cardCode": "2502746",
+    "cardName": "קימל שיווק והפצה",
+    "short": "קימל",
+    "total": 871764.1500000033,
+    "mixerRev": 871238.7300000032,
+    "nonMixerRev": 525.4200000000001,
+    "mixerQty": 458,
+    "nonMixerQty": 2,
+    "nmShare": 0.0006027088863427087,
+    "invoiceCount": 444,
+    "mixerInvoiceCount": 442,
+    "mixerWithAttach": 0,
+    "attachRate": 0,
+    "topNonMixer": [
+      {
+        "itemCode": "36015",
+        "itemName": "מטחנת בשר DAVO PRP DMG3035",
+        "qty": 1,
+        "revenue": 338.98
+      },
+      {
+        "itemCode": "27517",
+        "itemName": "בלנדר מוט פלוס DAVO DHB807",
+        "qty": 1,
+        "revenue": 186.44
+      }
+    ]
+  },
+  {
+    "cardCode": "165",
+    "cardName": "אלקטרה קמעונאות בע\"מ -מח.חשמל אילת רד 165",
+    "short": "אלקטרה רד 16",
+    "total": 153197.31999999998,
+    "mixerRev": 152607.06999999998,
+    "nonMixerRev": 590.25,
+    "mixerQty": 71,
+    "nonMixerQty": 5,
+    "nmShare": 0.003852874188660742,
+    "invoiceCount": 26,
+    "mixerInvoiceCount": 23,
+    "mixerWithAttach": 1,
+    "attachRate": 0.043478260869565216,
+    "topNonMixer": [
+      {
+        "itemCode": "36012",
+        "itemName": "מטחנת קפה+קוצץ DAVO DAV250",
+        "qty": 5,
+        "revenue": 590.25
+      }
+    ]
+  },
+  {
+    "cardCode": "561",
+    "cardName": "אלקטרה קמעונאות בע\"מ - שקם ביג אילת 561",
+    "short": "אלקטרה ביג אילת",
+    "total": 221937.43,
+    "mixerRev": 221001.1,
+    "nonMixerRev": 936.3299999999999,
+    "mixerQty": 113,
+    "nonMixerQty": 6,
+    "nmShare": 0.004218891784049225,
+    "invoiceCount": 24,
+    "mixerInvoiceCount": 23,
+    "mixerWithAttach": 2,
+    "attachRate": 0.08695652173913043,
+    "topNonMixer": [
+      {
+        "itemCode": "21717",
+        "itemName": "מקציף חלב DAVO DAV280 שחור",
+        "qty": 3,
+        "revenue": 582.18
+      },
+      {
+        "itemCode": "36012",
+        "itemName": "מטחנת קפה+קוצץ DAVO DAV250",
+        "qty": 3,
+        "revenue": 354.15
+      }
+    ]
+  },
+  {
+    "cardCode": "68",
+    "cardName": "א.ל.מ סחר 2000 בע\"מ- אילת התוכנה 16",
+    "short": "א.ל.מ אילת 16",
+    "total": 378289.2,
+    "mixerRev": 378289.2,
+    "nonMixerRev": 0,
+    "mixerQty": 186,
+    "nonMixerQty": 0,
+    "nmShare": 0,
+    "invoiceCount": 7,
+    "mixerInvoiceCount": 7,
+    "mixerWithAttach": 0,
+    "attachRate": 0,
+    "topNonMixer": []
+  },
+  {
+    "cardCode": "69",
+    "cardName": "א.ל.מ סחר 2000 בע\"מ-ביג אילת",
+    "short": "א.ל.מ ביג אילת",
+    "total": 138180.32,
+    "mixerRev": 135701.48,
+    "nonMixerRev": 2478.84,
+    "mixerQty": 73,
+    "nonMixerQty": 15,
+    "nmShare": 0.017939168182560295,
+    "invoiceCount": 21,
+    "mixerInvoiceCount": 20,
+    "mixerWithAttach": 4,
+    "attachRate": 0.2,
+    "topNonMixer": [
+      {
+        "itemCode": "21707",
+        "itemName": "מקציף חלב אינדוקציה נירוסטה DAVO  DAV240",
+        "qty": 6,
+        "revenue": 1240.68
+      },
+      {
+        "itemCode": "21714",
+        "itemName": "מקציף חלב נירוסטה  DAVO  DAV230",
+        "qty": 6,
+        "revenue": 884.76
+      },
+      {
+        "itemCode": "36012",
+        "itemName": "מטחנת קפה DAV 250 DAVO",
+        "qty": 3,
+        "revenue": 353.4
+      }
+    ]
+  },
+  {
+    "cardCode": "2502543",
+    "cardName": "פטקום אלקטריק אילת בע\"מ",
+    "short": "פטקום אילת",
+    "total": 216757.95,
+    "mixerRev": 206941,
+    "nonMixerRev": 9816.95,
+    "mixerQty": 120,
+    "nonMixerQty": 32,
+    "nmShare": 0.04528991900873763,
+    "invoiceCount": 8,
+    "mixerInvoiceCount": 8,
+    "mixerWithAttach": 4,
+    "attachRate": 0.5,
+    "topNonMixer": [
+      {
+        "itemCode": "36015",
+        "itemName": "מטחנת בשר DAVO PRP DMG3035",
+        "qty": 4,
+        "revenue": 2349.12
+      },
+      {
+        "itemCode": "24025",
+        "itemName": "טוסטר לחיצה DAVO DAV135",
+        "qty": 6,
+        "revenue": 1423.74
+      },
+      {
+        "itemCode": "36014",
+        "itemName": "מטחנת בשר DAVO PRO DMG3034",
+        "qty": 2,
+        "revenue": 1280
+      },
+      {
+        "itemCode": "25249",
+        "itemName": "מסחטת הדרים חשמלית DAVO DJC600",
+        "qty": 4,
+        "revenue": 954.84
+      },
+      {
+        "itemCode": "36016",
+        "itemName": "מטחנת בשר DAV 6139 DAVO+קוצץ ירקות",
+        "qty": 2,
+        "revenue": 946
+      }
+    ]
+  },
+  {
+    "cardCode": "25017371",
+    "cardName": "היי ביז בע\"מ - הייטקזון-ועדי עובדים",
+    "short": "היי ביז",
+    "total": 317263.23,
+    "mixerRev": 317263.23,
+    "nonMixerRev": 0,
+    "mixerQty": 281,
+    "nonMixerQty": 0,
+    "nmShare": 0,
+    "invoiceCount": 10,
+    "mixerInvoiceCount": 10,
+    "mixerWithAttach": 0,
+    "attachRate": 0,
+    "topNonMixer": []
+  },
+  {
+    "cardCode": "171",
+    "cardName": "אלקטרה קמעונאות בע\"מ - מח.חשמל הסתת אילת 171",
+    "short": "אלקטרה הסתת אילת",
+    "total": 217782.77999999997,
+    "mixerRev": 211699.66999999995,
+    "nonMixerRev": 6083.110000000001,
+    "mixerQty": 99,
+    "nonMixerQty": 37,
+    "nmShare": 0.027932006378098402,
+    "invoiceCount": 27,
+    "mixerInvoiceCount": 20,
+    "mixerWithAttach": 10,
+    "attachRate": 0.5,
+    "topNonMixer": [
+      {
+        "itemCode": "36012",
+        "itemName": "מטחנת קפה+קוצץ DAVO DAV250",
+        "qty": 16,
+        "revenue": 1888.8
+      },
+      {
+        "itemCode": "25249",
+        "itemName": "מסחטת הדרים חשמלית DAVO DJC600 כסוף",
+        "qty": 4,
+        "revenue": 1000
+      },
+      {
+        "itemCode": "21714",
+        "itemName": "מקציף חלב DAV230 DAVO נירוסטה",
+        "qty": 6,
+        "revenue": 886.26
+      },
+      {
+        "itemCode": "31018",
+        "itemName": "מכונת גלידה DAVO DAV 1280 1.2L",
+        "qty": 1,
+        "revenue": 854.7
+      },
+      {
+        "itemCode": "21814",
+        "itemName": "משקל מטבח DKS340  DAVO",
+        "qty": 7,
+        "revenue": 741.51
+      }
+    ]
+  },
+  {
+    "cardCode": "96",
+    "cardName": "א.ל.מ סחר 2000 בע\"מ-מחסן 96 ראש העין",
+    "short": "א.ל.מ ראש העין",
+    "total": 246102,
+    "mixerRev": 246102,
+    "nonMixerRev": 0,
+    "mixerQty": 120,
+    "nonMixerQty": 0,
+    "nmShare": 0,
+    "invoiceCount": 2,
+    "mixerInvoiceCount": 2,
+    "mixerWithAttach": 0,
+    "attachRate": 0,
+    "topNonMixer": []
+  },
+  {
+    "cardCode": "2502610",
+    "cardName": "ת. צורף בע\"מ- ראשי",
+    "short": "ת. צורף ראשי",
+    "total": 127623.53,
+    "mixerRev": 116228.68,
+    "nonMixerRev": 11394.849999999999,
+    "mixerQty": 49,
+    "nonMixerQty": 26,
+    "nmShare": 0.08928486776693921,
+    "invoiceCount": 12,
+    "mixerInvoiceCount": 8,
+    "mixerWithAttach": 0,
+    "attachRate": 0,
+    "topNonMixer": [
+      {
+        "itemCode": "22718",
+        "itemName": "תנור אפיה מידי שחור DAV 1508B DAVO",
+        "qty": 18,
+        "revenue": 9457.56
+      },
+      {
+        "itemCode": "22711",
+        "itemName": "תנור אפיה מידי לבן DAV 1508W DAVO",
+        "qty": 2,
+        "revenue": 1050.84
+      },
+      {
+        "itemCode": "22507",
+        "itemName": "פאנקיק+קרפ DAVO DAV 129",
+        "qty": 6,
+        "revenue": 886.45
+      }
+    ]
+  }
+]

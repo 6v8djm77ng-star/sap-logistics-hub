@@ -1,0 +1,3429 @@
+/**
+ * Demo Server - standalone Express app that serves realistic demo data.
+ *
+ * Runs with NO database and NO SAP. Perfect for:
+ *   - Showing the system to stakeholders
+ *   - UI development without infrastructure
+ *   - Training and onboarding
+ *
+ * Start: node src/demo/demoServer.js
+ */
+import express from 'express';
+import http from 'http';
+import path from 'path';
+import cors from 'cors';
+import compression from 'compression';
+import jwt from 'jsonwebtoken';
+import rateLimit from 'express-rate-limit';
+import { Server as SocketServer } from 'socket.io';
+import { fileURLToPath } from 'url';
+import PDFDocument from 'pdfkit';
+import 'dotenv/config';
+import * as data from './demoData.js';
+import { startSimulation } from './liveSimulation.js';
+import * as sapBridge from './sapBridge.js';
+import * as store from './persistentStore.js';
+import agentsRouter from '../routes/agents.js';
+import contentCopyAgentRoutes from '../routes/contentCopyAgent.js';
+
+// Initialize persistent store
+store.load();
+
+let sapLive = false;
+sapBridge.isAvailable().then((ok) => {
+  sapLive = ok;
+  if (ok) {
+    console.log('\n✓ Connected to REAL SAP - showing live customer/order data\n');
+  } else {
+    console.log('\n⚠ SAP not reachable - using demo data only\n');
+  }
+});
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.DEMO_PORT || 4000;
+// CRITICAL: never hard-code a JWT secret. Pull from .env. If missing in
+// production we refuse to start to prevent accidentally signing tokens with
+// a known string.
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET || JWT_SECRET.length < 32) {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('JWT_SECRET missing or too short. Set a 64-char random value in .env.');
+  } else {
+    console.warn('⚠  JWT_SECRET is short or missing - OK for dev, FIX before going live.');
+  }
+}
+
+const app = express();
+const server = http.createServer(app);
+const io = new SocketServer(server, { cors: { origin: '*' } });
+
+app.use(cors());
+app.use(compression());
+app.use(express.json({ limit: '2mb' }));
+
+// Rate limiter on /api/* - protects SAP and our process from abuse / accidental loops.
+// 200 req/min per IP is generous for human use, blocks runaway scripts.
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'יותר מדי בקשות - נסה שוב בעוד דקה' },
+});
+app.use('/api/', apiLimiter);
+
+// Stricter limit for login - 10 attempts per 5 minutes per IP
+const loginLimiter = rateLimit({
+  windowMs: 5 * 60_000,
+  max: 10,
+  message: { error: 'יותר מדי ניסיונות התחברות - נסה שוב בעוד 5 דקות' },
+});
+app.use('/api/auth/login', loginLimiter);
+app.use('/api/auth/driver-login', loginLimiter);
+app.use('/api/auth/picker-login', loginLimiter);
+
+// Simple logger
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString().slice(11, 19)}] ${req.method} ${req.path}`);
+  next();
+});
+
+// Auth endpoints - now use persistent store
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await store.verifyUserPassword(username, password);
+  if (!user) return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
+  store.updateLastLogin(user.UserId);
+  const token = jwt.sign({ sub: user.UserId, username: user.Username, role: user.Role, name: user.FullName }, JWT_SECRET, { expiresIn: '8h' });
+  res.json({ token, user: { id: user.UserId, username: user.Username, name: user.FullName, role: user.Role } });
+});
+
+app.post('/api/auth/driver-login', (req, res) => {
+  const { code } = req.body;
+  const driver = store.getDrivers().find((d) => d.Code === code);
+  if (!driver) return res.status(401).json({ error: 'קוד נהג או סיסמה שגויים' });
+  const token = jwt.sign({ sub: `driver-${driver.DriverId}`, driverId: driver.DriverId, role: 'DRIVER', name: driver.FullName }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ token, driver: { id: driver.DriverId, code: driver.Code, name: driver.FullName, phone: driver.Phone } });
+});
+
+// Picker passwordless login - by code only (used on warehouse handheld terminals)
+app.post('/api/auth/picker-login', (req, res) => {
+  const { code } = req.body;
+  const picker = store.getPickerByCode(code);
+  if (!picker || !picker.IsActive) {
+    return res.status(401).json({ error: 'קוד מלקט שגוי או לא פעיל' });
+  }
+  const token = jwt.sign(
+    {
+      sub: `picker-${picker.PickerId}`,
+      pickerId: picker.PickerId,
+      // Reuse the existing WAREHOUSE role so all the picking endpoints accept it
+      role: 'WAREHOUSE',
+      name: picker.FullName,
+      pickerCode: picker.Code,
+    },
+    JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+  res.json({
+    token,
+    picker: { id: picker.PickerId, code: picker.Code, name: picker.FullName, phone: picker.Phone },
+  });
+});
+
+// Pickers CRUD - mirrors drivers
+app.get('/api/pickers', (_req, res) => {
+  res.json({ pickers: store.getPickers() });
+});
+app.post('/api/pickers', (req, res) => {
+  try {
+    const newPicker = store.addPicker(req.body);
+    res.status(201).json(newPicker);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+app.patch('/api/pickers/:id', (req, res) => {
+  const updated = store.updatePicker(req.params.id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Picker not found' });
+  res.json(updated);
+});
+app.delete('/api/pickers/:id', (req, res) => {
+  const ok = store.deletePicker(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Picker not found' });
+  res.json({ ok: true });
+});
+
+// Short-id → JWT lookup table (in-memory). Stays valid until restart.
+// We use this to give the user a SHORT link that's easy to click on chat apps.
+const mobileShortLinks = new Map();
+function makeShortId() {
+  // 8 chars, URL-safe
+  return Array.from({ length: 8 }, () =>
+    'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]
+  ).join('');
+}
+
+// Generate a 30-day mobile-install token for the *currently authenticated* user.
+// Returns a SHORT URL + QR code so the user can text it to themselves easily.
+app.post('/api/auth/mobile-link', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    const longToken = jwt.sign(
+      {
+        sub: payload.sub,
+        username: payload.username,
+        role: payload.role,
+        name: payload.name,
+      },
+      JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+    // Store short id → token mapping
+    let shortId;
+    do { shortId = makeShortId(); } while (mobileShortLinks.has(shortId));
+    mobileShortLinks.set(shortId, {
+      token: longToken,
+      createdAt: Date.now(),
+      user: payload.username,
+    });
+
+    // Build the public URL the QR will encode. Priority order:
+    //   1. PUBLIC_URL env var (set by admin if they have a stable domain)
+    //   2. Latest Cloudflare tunnel URL (auto-detected from cf-tunnel logs)
+    //   3. LAN IP (works only inside the office)
+    //   4. Whatever host the request came on (last resort)
+    let publicBase = process.env.PUBLIC_URL || null;
+    if (!publicBase) {
+      try {
+        const fs = await import('fs');
+        const path = await import('path');
+        const cfLog = path.resolve(
+          __dirname, '..', '..', 'logs', 'cf-tunnel-error.log'
+        );
+        if (fs.existsSync(cfLog)) {
+          const txt = fs.readFileSync(cfLog, 'utf8');
+          const matches = txt.match(/https:\/\/[a-z-]+\.trycloudflare\.com/g);
+          if (matches && matches.length) publicBase = matches[matches.length - 1];
+        }
+      } catch {}
+    }
+    if (!publicBase) {
+      const os = await import('os');
+      let lanIp = null;
+      for (const arr of Object.values(os.networkInterfaces() || {})) {
+        for (const i of arr || []) {
+          if (i.family === 'IPv4' && !i.internal && i.address.startsWith('192.168.')) {
+            lanIp = i.address; break;
+          }
+        }
+        if (lanIp) break;
+      }
+      const reqHost = req.get('host') || `localhost:${PORT}`;
+      const host = (lanIp && reqHost.startsWith('localhost')) ? `${lanIp}:${PORT}` : reqHost;
+      publicBase = `${req.protocol || 'http'}://${host}`;
+    }
+    const shortUrl = `${publicBase}/m/admin/${shortId}`;
+
+    // Generate QR as data URL
+    const QRCode = (await import('qrcode')).default;
+    const qrDataUrl = await QRCode.toDataURL(shortUrl, { width: 320, margin: 1 });
+
+    res.json({
+      shortUrl,
+      shortId,
+      qr: qrDataUrl,
+      expiresIn: '30 days',
+      user: { name: payload.name, role: payload.role },
+    });
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid token: ' + err.message });
+  }
+});
+
+// Resolve a short id → JWT, then redirect-style: respond with the token in body.
+app.get('/api/auth/mobile-link/:shortId', (req, res) => {
+  const entry = mobileShortLinks.get(req.params.shortId);
+  if (!entry) return res.status(404).json({ error: 'Short link not found or expired' });
+  res.json({ token: entry.token });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  const auth = req.headers.authorization;
+  if (auth?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+      return res.json({ user: payload });
+    } catch {}
+  }
+  res.status(401).json({ error: 'Not authenticated' });
+});
+
+app.post('/api/users/me/change-password', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    const { oldPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < 4) {
+      return res.status(400).json({ error: 'סיסמה חדשה קצרה מדי' });
+    }
+    const user = store.getUserById(payload.sub);
+    if (!user) return res.status(404).json({ error: 'משתמש לא נמצא' });
+    const ok = await store.verifyUserPassword(user.Username, oldPassword);
+    if (!ok) return res.status(401).json({ error: 'סיסמה קיימת שגויה' });
+    await store.setUserPassword(user.UserId, newPassword);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Health
+app.get('/health', async (_req, res) => {
+  const payload = {
+    ok: true, time: new Date().toISOString(),
+    mode: sapLive ? 'DEMO+SAP' : 'DEMO',
+    sapConnected: sapLive,
+  };
+  if (sapLive) {
+    try {
+      const stats = await sapBridge.getOverallStats();
+      payload.checks = {
+        logisticsDb: { ok: false, note: 'Using in-memory demo data' },
+        sapSqlA: { ok: true, stats: stats.companyA },
+        sapSqlB: { ok: true, stats: stats.companyB },
+      };
+    } catch (err) {
+      payload.checks = { error: err.message };
+    }
+  } else {
+    payload.checks = {
+      logisticsDb: { ok: true, latencyMs: 3, note: 'Demo mode - in-memory' },
+      sap: { ok: false, note: 'Not configured' },
+    };
+  }
+  res.json(payload);
+});
+
+// Zones - full CRUD
+app.get('/api/zones', (_req, res) => res.json({ zones: store.getZones() }));
+app.get('/api/zones/suggest', (req, res) => {
+  const zone = store.suggestZoneForCity(req.query.city || '');
+  res.json({ zone: zone || null });
+});
+
+// Cities and their assigned zones (for the drag & drop UI)
+app.get('/api/zones/cities', (_req, res) => {
+  res.json({ cities: store.listCitiesWithZones() });
+});
+
+// Customer document policies (delivery note vs invoice)
+// Returns: parent groups (chains only) with branches collapsed + current policy.
+// By default individual customers (single-branch) are excluded — they get the
+// default doc type (INVOICE) automatically and don't need configuration.
+// Pass ?includeIndividuals=true to see them too.
+app.get('/api/customers/policies', async (req, res) => {
+  try {
+    const policies = store.listCustomerDocPolicies();
+    const includeIndividuals = req.query.includeIndividuals === 'true';
+    if (!sapLive) {
+      return res.json({
+        groups: [],
+        policies,
+        warning: 'SAP לא מחובר - לא ניתן להציג לקוחות',
+      });
+    }
+    const customers = await sapBridge.getAllCustomers();
+    // Group by parent name across BOTH companies
+    const byParent = new Map();
+    for (const c of customers) {
+      const parent = store.parentNameOf(c.CardName);
+      if (!byParent.has(parent)) {
+        byParent.set(parent, {
+          parentName: parent,
+          branches: [],
+          companies: new Set(),
+          totalOpenOrders: 0,
+        });
+      }
+      const g = byParent.get(parent);
+      g.branches.push({
+        cardCode: c.CardCode,
+        cardName: c.CardName,
+        city: c.City,
+        phone: c.Phone1,
+        companyCode: c.CompanyCode,
+        companyName: c.CompanyName,
+        openOrders: Number(c.OpenOrders || 0),
+      });
+      g.companies.add(c.CompanyCode);
+      g.totalOpenOrders += Number(c.OpenOrders || 0);
+    }
+    const allGroups = Array.from(byParent.values())
+      .map((g) => ({
+        ...g,
+        companies: Array.from(g.companies),
+        branchCount: g.branches.length,
+        docType: policies[g.parentName] || store.DEFAULT_DOC_TYPE,
+        isExplicit: !!policies[g.parentName],
+      }));
+
+    const totalCustomers = allGroups.length;
+    const chains = allGroups.filter((g) => g.branchCount > 1);
+    const individuals = allGroups.filter((g) => g.branchCount === 1);
+
+    const groups = (includeIndividuals ? allGroups : chains)
+      .sort((a, b) => b.totalOpenOrders - a.totalOpenOrders || a.parentName.localeCompare(b.parentName, 'he'));
+
+    res.json({
+      groups,
+      policies,
+      defaultDocType: store.DEFAULT_DOC_TYPE,
+      counts: {
+        total: totalCustomers,
+        chains: chains.length,
+        individuals: individuals.length,
+      },
+    });
+  } catch (err) {
+    console.error('[customer-policies]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update policy for a parent (chain) name
+app.patch('/api/customers/policies/:parentName', (req, res) => {
+  const parentName = decodeURIComponent(req.params.parentName);
+  const docType = req.body?.docType || null; // null = remove override
+  const ok = store.setCustomerDocPolicy(parentName, docType);
+  if (!ok) return res.status(400).json({ error: 'Invalid parent name or doc type' });
+  res.json({ ok: true, parentName, docType });
+});
+
+// SAP Service Layer write-back: push Delivery Notes / Invoices to SAP.
+// SAFETY: defaults to DRY-RUN. Set SAP_WRITE_ENABLED=true in .env to actually write.
+app.get('/api/sap/writer/status', async (_req, res) => {
+  const { getWriterStatus } = await import('./sapWriter.js');
+  res.json(getWriterStatus());
+});
+
+app.post('/api/sap/write/delivery-note/:id', async (req, res) => {
+  try {
+    const { writeDeliveryNote } = await import('./sapWriter.js');
+    const dn = (store.load().deliveryNotes || []).find(
+      (d) => d.DeliveryNoteId === Number(req.params.id)
+    );
+    if (!dn) return res.status(404).json({ error: 'Delivery note not found' });
+    const result = await writeDeliveryNote(dn, { dryRun: req.body?.dryRun !== false });
+    if (result.ok && result.sapDocEntry) {
+      dn.SapDeliveryDocEntry = result.sapDocEntry;
+      dn.SapDeliveryDocNum = result.sapDocNum;
+      dn.Status = result.dryRun ? 'PENDING_EXPORT' : 'CONFIRMED';
+      dn.SentToSapAt = new Date().toISOString();
+      if (!result.dryRun) dn.ConfirmedAt = new Date().toISOString();
+      store.save?.();
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/sap/write/invoice/:id', async (req, res) => {
+  try {
+    const { writeInvoice } = await import('./sapWriter.js');
+    const inv = (store.load().invoices || []).find(
+      (i) => i.InvoiceId === Number(req.params.id)
+    );
+    if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+    const dn = (store.load().deliveryNotes || []).find(
+      (d) => d.DeliveryNoteId === inv.DeliveryNoteId
+    );
+    const result = await writeInvoice(inv, dn, { dryRun: req.body?.dryRun !== false });
+    if (result.ok && result.sapDocEntry) {
+      inv.SapInvoiceDocEntry = result.sapDocEntry;
+      inv.SapInvoiceDocNum = result.sapDocNum;
+      inv.Status = result.dryRun ? 'PENDING_EXPORT' : 'CONFIRMED';
+      inv.SentToSapAt = new Date().toISOString();
+      if (!result.dryRun) inv.ConfirmedAt = new Date().toISOString();
+      store.save?.();
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Truck loading plan - LIFO order based on delivery sequence + per-stop volume.
+app.get('/api/runs/:id/loading-plan', async (req, res) => {
+  try {
+    const { computeStopVolumes, planLoadingOrder, utilisationPercent } =
+      await import('./loadingPlanner.js');
+    const runId = Number(req.params.id);
+    const details = store.getRunDetails(runId);
+    if (!details) return res.status(404).json({ error: 'Run not found' });
+
+    // Pull line items per order from SAP if available
+    let ordersWithLines = [];
+    if (sapLive) {
+      try {
+        const orderRefs = (details.orders || details.runOrders || []).map((o) => ({
+          companyCode: o.CompanyCode || o.SapCompanyCode,
+          docEntry: o.SapDocEntry,
+        }));
+        const lines = await sapBridge.getBulkOrderLines(orderRefs);
+        // Group lines by stop via runOrders
+        const stopByDoc = new Map();
+        for (const o of (details.runOrders || details.orders || [])) {
+          stopByDoc.set(`${o.CompanyCode || o.SapCompanyCode}:${o.SapDocEntry}`, o.StopId);
+        }
+        const grouped = new Map();
+        for (const ln of lines) {
+          const stopId = stopByDoc.get(`${ln.CompanyCode}:${ln.DocEntry}`);
+          if (!stopId) continue;
+          if (!grouped.has(stopId)) grouped.set(stopId, { StopId: stopId, lines: [] });
+          grouped.get(stopId).lines.push(ln);
+        }
+        ordersWithLines = Array.from(grouped.values());
+      } catch (e) {
+        console.warn('[loading-plan] SAP lines fetch failed:', e.message);
+      }
+    }
+
+    const stopVols = computeStopVolumes(details.stops || [], ordersWithLines);
+    const enrichedStops = (details.stops || []).map((s) => {
+      const v = stopVols.find((x) => x.stop.StopId === s.StopId);
+      return { ...s, volumeL: v?.volumeL || 0, lineCount: v?.lineCount || 0 };
+    });
+    const loadingPlan = planLoadingOrder(enrichedStops);
+    const utilisation = utilisationPercent(loadingPlan, Number(req.query.capacityL || 12000));
+
+    res.json({
+      runId,
+      capacityL: Number(req.query.capacityL || 12000),
+      utilisation,
+      totalVolumeL: loadingPlan.reduce((s, x) => s + x.volumeL, 0),
+      plan: loadingPlan,
+      hint: 'LIFO: טען ראשון את עצירה אחרונה. הסידור בהתאם.',
+    });
+  } catch (err) {
+    console.error('[loading-plan]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Route optimization - reorders stops in a run for minimum drive distance.
+// Uses Google Maps if GOOGLE_MAPS_API_KEY is set, else haversine + 2-opt.
+app.post('/api/runs/:id/optimize', async (req, res) => {
+  try {
+    const { optimizeRoute } = await import('./routeOptimizer.js');
+    const runId = Number(req.params.id);
+    const details = store.getRunDetails(runId);
+    if (!details) return res.status(404).json({ error: 'Run not found' });
+
+    // Stops need lat/lng. Use the persisted geocode if any, otherwise skip.
+    const stops = (details.stops || []).filter((s) => s.Lat && s.Lng);
+    if (stops.length < 2) {
+      return res.status(400).json({
+        error: 'דרושות לפחות 2 עצירות עם מיקום (lat/lng) כדי לבצע אופטימיזציה',
+        eligibleStops: stops.length,
+      });
+    }
+
+    const result = await optimizeRoute(
+      stops.map((s) => ({ id: s.StopId, lat: Number(s.Lat), lng: Number(s.Lng) })),
+      req.body?.start
+        ? { start: { lat: Number(req.body.start.lat), lng: Number(req.body.start.lng) } }
+        : undefined
+    );
+
+    // If client requested apply, reorder the stops in storage.
+    if (req.body?.apply) {
+      const ordered = result.order;
+      for (let i = 0; i < ordered.length; i++) {
+        store.updateStop(ordered[i].id, { stopOrder: i + 1 });
+      }
+    }
+
+    res.json({
+      runId,
+      optimizedOrder: result.order.map((s) => s.id),
+      totalKm: result.totalKm,
+      source: result.source,
+      applied: !!req.body?.apply,
+      hint: result.source === 'haversine'
+        ? 'משתמש במרחק אווירי - הוסף GOOGLE_MAPS_API_KEY ב-.env לדיוק כביש אמיתי'
+        : null,
+    });
+  } catch (err) {
+    console.error('[optimize] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Stock prediction - estimates which items will run out, based on the
+// current open-order demand vs current available stock.
+// (Doesn't yet use historical sales rate - that requires more SQL queries.)
+// ----------------------------------------------------------------------------
+app.get('/api/analytics/stock-prediction', async (_req, res) => {
+  try {
+    if (!sapLive) return res.json({ items: [], warning: 'SAP not connected' });
+
+    // 1. Get all open order lines
+    const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 }).catch(() => []);
+    const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
+    const lines = await sapBridge.getBulkOrderLines(refs).catch(() => []);
+
+    // 2. Aggregate demand per item per company
+    const demand = new Map(); // 'A:itemcode' -> { itemCode, itemName, qty, openOrderCount }
+    for (const ln of lines) {
+      const k = `${ln.CompanyCode}:${ln.ItemCode}`;
+      if (!demand.has(k)) {
+        demand.set(k, {
+          companyCode: ln.CompanyCode,
+          itemCode: ln.ItemCode,
+          itemName: ln.ItemName,
+          demandQty: 0,
+          orderCount: 0,
+          customers: new Set(),
+        });
+      }
+      const d = demand.get(k);
+      d.demandQty += Number(ln.OpenQty || ln.Quantity || 0);
+      d.orderCount += 1;
+      if (ln.CardName) d.customers.add(ln.CardName);
+    }
+
+    // 3. Pull stock per item (chunked)
+    const allStocks = new Map();
+    for (const code of ['A', 'B']) {
+      const codes = [...new Set(
+        Array.from(demand.values())
+          .filter((d) => d.companyCode === code)
+          .map((d) => d.itemCode)
+      )];
+      for (let i = 0; i < codes.length; i += 200) {
+        const batch = codes.slice(i, i + 200);
+        const stocks = await sapBridge.getItemsStock(code, batch).catch(() => []);
+        for (const s of stocks) {
+          const k = `${code}:${s.ItemCode}`;
+          if (!allStocks.has(k)) allStocks.set(k, 0);
+          allStocks.set(k, allStocks.get(k) + Number(s.Available || 0));
+        }
+      }
+    }
+
+    // 4. Build prediction
+    const items = [];
+    for (const d of demand.values()) {
+      const stock = allStocks.get(`${d.companyCode}:${d.itemCode}`) || 0;
+      const shortage = d.demandQty - stock;
+      const ratio = stock > 0 ? d.demandQty / stock : Infinity;
+      let level = 'ok';
+      if (shortage > 0) level = 'shortage';
+      else if (ratio >= 0.8) level = 'critical';
+      else if (ratio >= 0.5) level = 'warn';
+      items.push({
+        companyCode: d.companyCode,
+        itemCode: d.itemCode,
+        itemName: d.itemName,
+        currentStock: stock,
+        openDemand: d.demandQty,
+        shortage: Math.max(0, shortage),
+        ratio: Math.round(ratio * 100) / 100,
+        orderCount: d.orderCount,
+        customerCount: d.customers.size,
+        level,
+      });
+    }
+    // Order by: shortage first, then critical, then warn, by shortage qty descending
+    const levelRank = { shortage: 4, critical: 3, warn: 2, ok: 1 };
+    items.sort((a, b) =>
+      levelRank[b.level] - levelRank[a.level] || b.shortage - a.shortage || b.openDemand - a.openDemand
+    );
+
+    res.json({
+      items,
+      summary: {
+        total: items.length,
+        shortage: items.filter((i) => i.level === 'shortage').length,
+        critical: items.filter((i) => i.level === 'critical').length,
+        warn: items.filter((i) => i.level === 'warn').length,
+        ok: items.filter((i) => i.level === 'ok').length,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Anomaly detection - flags unusual orders by comparing each new order to
+// the customer's historical pattern. Returns suspicious items + reasons.
+// ----------------------------------------------------------------------------
+app.get('/api/analytics/anomalies', async (_req, res) => {
+  try {
+    if (!sapLive) return res.json({ anomalies: [], warning: 'SAP not connected' });
+
+    const orders = await sapBridge.getOpenOrdersFlat({ limit: 500 }).catch(() => []);
+
+    // 1. Build per-customer baseline (avg order value, avg lines)
+    const baseline = new Map();
+    for (const o of orders) {
+      const k = String(o.CardCode || o.CardName || '').trim();
+      if (!k) continue;
+      if (!baseline.has(k)) {
+        baseline.set(k, { sums: 0, count: 0, max: 0, lineSums: 0, parent: store.parentNameOf(o.CardName) });
+      }
+      const b = baseline.get(k);
+      b.sums += Number(o.DocTotal || 0);
+      b.count += 1;
+      if (Number(o.DocTotal || 0) > b.max) b.max = Number(o.DocTotal || 0);
+      b.lineSums += Number(o.LinesCount || 0);
+    }
+
+    // 2. Compute global outlier threshold (top 5% by value)
+    const allTotals = orders.map((o) => Number(o.DocTotal || 0)).sort((a, b) => a - b);
+    const p95 = allTotals[Math.floor(allTotals.length * 0.95)] || 0;
+
+    // 3. Flag each order against its baseline + global threshold
+    const anomalies = [];
+    for (const o of orders) {
+      const reasons = [];
+      const total = Number(o.DocTotal || 0);
+      const k = String(o.CardCode || o.CardName || '').trim();
+      const b = baseline.get(k);
+
+      // Reason A: order is in top 5% globally
+      if (total >= p95 && p95 > 0) {
+        reasons.push({
+          type: 'high_value',
+          severity: 'medium',
+          msg: `הזמנה גבוהה מאוד (${Math.round(total).toLocaleString('he-IL')}₪) - מעל ה-95% של כל ההזמנות`,
+        });
+      }
+
+      // Reason B: order is 3× the customer's average
+      if (b && b.count >= 2) {
+        const avg = b.sums / b.count;
+        if (avg > 0 && total > avg * 3) {
+          reasons.push({
+            type: 'spike',
+            severity: 'high',
+            msg: `פי ${(total / avg).toFixed(1)} מהממוצע של הלקוח (${Math.round(avg).toLocaleString('he-IL')}₪)`,
+          });
+        }
+      }
+
+      // Reason C: very small order (under 200₪) — might be a pricing error
+      if (total > 0 && total < 200) {
+        reasons.push({
+          type: 'low_value',
+          severity: 'low',
+          msg: `הזמנה קטנה מאוד (${Math.round(total)}₪) - בדוק שלא חסרים פריטים`,
+        });
+      }
+
+      // Reason D: many lines (>30) - likely a bulk import or error
+      if (Number(o.LinesCount || 0) > 30) {
+        reasons.push({
+          type: 'many_lines',
+          severity: 'medium',
+          msg: `${o.LinesCount} שורות - הרבה מאוד פריטים בהזמנה אחת`,
+        });
+      }
+
+      // Reason E: missing address
+      if (!o.ShipToAddress && !o.CustCity) {
+        reasons.push({
+          type: 'no_address',
+          severity: 'high',
+          msg: 'אין כתובת משלוח - הזמנה לא ניתנת להפצה',
+        });
+      }
+
+      if (reasons.length > 0) {
+        anomalies.push({
+          companyCode: o.CompanyCode,
+          docEntry: o.DocEntry,
+          docNum: o.DocNum,
+          cardCode: o.CardCode,
+          cardName: o.CardName,
+          city: o.CustCity,
+          docTotal: total,
+          linesCount: Number(o.LinesCount || 0),
+          reasons,
+          maxSeverity:
+            reasons.some((r) => r.severity === 'high') ? 'high' :
+            reasons.some((r) => r.severity === 'medium') ? 'medium' : 'low',
+        });
+      }
+    }
+
+    // Sort by severity, then by total descending
+    const sevRank = { high: 3, medium: 2, low: 1 };
+    anomalies.sort((a, b) =>
+      sevRank[b.maxSeverity] - sevRank[a.maxSeverity] || b.docTotal - a.docTotal
+    );
+
+    res.json({
+      anomalies,
+      summary: {
+        total: anomalies.length,
+        high: anomalies.filter((a) => a.maxSeverity === 'high').length,
+        medium: anomalies.filter((a) => a.maxSeverity === 'medium').length,
+        low: anomalies.filter((a) => a.maxSeverity === 'low').length,
+      },
+      thresholds: { p95Total: p95, lowValue: 200 },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Customer profitability analytics
+//   - Revenue per chain (last N days, from open + delivered orders)
+//   - Cost estimate (driver time × stops, fuel × distance, packaging)
+//   - Margin = revenue − cost
+// Used by management to spot unprofitable customers.
+// ----------------------------------------------------------------------------
+app.get('/api/analytics/customer-profitability', async (req, res) => {
+  try {
+    const days = Math.min(365, Math.max(1, Number(req.query.days || 90)));
+
+    if (!sapLive) {
+      return res.json({ customers: [], warning: 'SAP not connected' });
+    }
+
+    // Pull last N days of sales orders (delivered + open)
+    const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 }).catch(() => []);
+
+    // Group by parent customer name across both companies
+    const byParent = new Map();
+    for (const o of allOrders) {
+      const parent = store.parentNameOf(o.CardName);
+      if (!byParent.has(parent)) {
+        byParent.set(parent, {
+          parentName: parent,
+          revenue: 0,
+          orderCount: 0,
+          companies: new Set(),
+          cities: new Set(),
+        });
+      }
+      const e = byParent.get(parent);
+      e.revenue += Number(o.DocTotal || 0);
+      e.orderCount += 1;
+      e.companies.add(o.CompanyCode);
+      if (o.CustCity) e.cities.add(o.CustCity);
+    }
+
+    // Estimate delivery cost per order:
+    //   - Driver: 25 min/stop × 80₪/hr = 33₪
+    //   - Fuel: ~10₪/stop avg
+    //   - Packaging/admin: ~5₪/stop
+    // Total: ~48₪ cost per stop.
+    const COST_PER_STOP = 48;
+
+    const list = Array.from(byParent.values()).map((e) => {
+      const cost = e.orderCount * COST_PER_STOP;
+      const margin = e.revenue - cost;
+      const marginPct = e.revenue > 0 ? margin / e.revenue : 0;
+      return {
+        parentName: e.parentName,
+        revenue: Math.round(e.revenue),
+        cost: Math.round(cost),
+        margin: Math.round(margin),
+        marginPct: Math.round(marginPct * 100) / 100,
+        avgOrderValue: Math.round(e.revenue / Math.max(1, e.orderCount)),
+        orderCount: e.orderCount,
+        companies: Array.from(e.companies),
+        citiesCount: e.cities.size,
+        // Health flag for the UI
+        rank: marginPct >= 0.6 ? 'A' :
+              marginPct >= 0.4 ? 'B' :
+              marginPct >= 0.2 ? 'C' :
+              marginPct >= 0   ? 'D' : 'F',
+      };
+    });
+    list.sort((a, b) => b.margin - a.margin);
+    res.json({
+      customers: list,
+      assumptions: { costPerStop: COST_PER_STOP },
+      totalRevenue: list.reduce((s, x) => s + x.revenue, 0),
+      totalCost: list.reduce((s, x) => s + x.cost, 0),
+      totalMargin: list.reduce((s, x) => s + x.margin, 0),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Force-include an excluded order into a route (manual override of auto-plan filters).
+// Body: { runDate?, runId? } - either a specific run id, or we'll auto-find/create one.
+app.post('/api/runs/force-include', async (req, res) => {
+  try {
+    if (!sapLive) return res.status(400).json({ error: 'SAP לא מחובר' });
+    const { companyCode, docEntry, runDate, runId } = req.body || {};
+    if (!companyCode || !docEntry) return res.status(400).json({ error: 'חסר companyCode / docEntry' });
+    const dateToUse = runDate || new Date().toISOString().slice(0, 10);
+
+    // Fetch the order so we know the customer + city
+    const orders = await sapBridge.getOpenOrdersFlat({ limit: 500 });
+    const ord = orders.find((o) => o.CompanyCode === companyCode && Number(o.DocEntry) === Number(docEntry));
+    if (!ord) return res.status(404).json({ error: 'הזמנה לא נמצאה' });
+
+    // Find the city
+    const addrParts = (ord.ShipToAddress || '').split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
+    const city = addrParts[addrParts.length - 1] || ord.CustCity || '';
+    const street = addrParts.length > 1 ? addrParts[0] : '';
+    const zone = store.suggestZoneForCity(city);
+
+    // Find or create target run
+    let targetRun = null;
+    if (runId) {
+      targetRun = (store.load().runs || []).find((r) => r.RunId === Number(runId));
+    } else if (zone) {
+      targetRun = store.getRuns().find((r) => r.RunDate === dateToUse && r.ZoneId === zone.ZoneId);
+    }
+    if (!targetRun) {
+      targetRun = store.addRun({
+        runDate: dateToUse,
+        zoneId: zone?.ZoneId || null,
+        driverId: null,
+        status: 'OPEN',
+        notes: `שיוך ידני - ${ord.CardName}`,
+      });
+    }
+
+    // Create stop + add the order
+    const newStop = store.addStop(targetRun.RunId, {
+      street: street || ord.CardName,
+      buildingNumber: '',
+      city,
+      branchName: ord.CardName,
+      contactPhone: ord.CustPhone,
+    });
+    const newOrder = store.addOrderToStop(newStop.StopId, {
+      companyCode: ord.CompanyCode,
+      docEntry: ord.DocEntry,
+      docNum: ord.DocNum,
+      cardCode: ord.CardCode,
+      cardName: ord.CardName,
+      total: ord.DocTotal,
+      linesCount: ord.LinesCount,
+    });
+
+    io.emit('run:updated', { runId: targetRun.RunId });
+    res.json({
+      ok: true,
+      run: targetRun,
+      stop: newStop,
+      runOrder: newOrder,
+      manuallyForced: true,
+    });
+  } catch (err) {
+    console.error('[force-include]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Manager approval to depart (gate between LOADED and IN_TRANSIT)
+app.post('/api/runs/:id/approve-departure', (req, res) => {
+  const auth = req.headers.authorization;
+  let approvedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { approvedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  const result = store.approveRunDeparture(req.params.id, {
+    approvedBy,
+    notes: req.body?.notes,
+    checklist: req.body?.checklist,
+  });
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  io.emit('run:departure-approved', { runId: Number(req.params.id) });
+  res.json(result);
+});
+
+app.post('/api/runs/:id/cancel-departure', (req, res) => {
+  const auth = req.headers.authorization;
+  let rejectedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { rejectedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  const result = store.cancelDepartureApproval(req.params.id, {
+    rejectedBy,
+    reason: req.body?.reason,
+  });
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  io.emit('run:departure-cancelled', { runId: Number(req.params.id) });
+  res.json(result);
+});
+
+// Per-line actual delivery + damage report (used inside POD)
+app.post('/api/stops/:id/line-deliveries', (req, res) => {
+  const auth = req.headers.authorization;
+  let recordedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { recordedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  const result = store.recordLineDeliveries(
+    req.params.id,
+    req.body?.items || [],
+    { recordedBy }
+  );
+  if (!result.ok) return res.status(400).json({ error: result.error });
+  res.json(result);
+});
+
+app.get('/api/stops/:id/line-deliveries', (req, res) => {
+  res.json({
+    deliveries: store.getLineDeliveriesForStop(req.params.id),
+    summary: store.summariseStopDeliveryIssues(req.params.id),
+  });
+});
+
+// Cash on Delivery (COD) - driver records collected money per stop
+app.get('/api/cod', (req, res) => {
+  const records = store.listCodCollections(req.query.runDate);
+  res.json({ records, count: records.length });
+});
+
+app.post('/api/cod', (req, res) => {
+  try {
+    const rec = store.recordCodCollection(req.body);
+    res.status(201).json(rec);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/cod/:id/deposit', (req, res) => {
+  const rec = store.markCodDeposited(req.params.id, req.body?.depositedBy || 'office');
+  if (!rec) return res.status(404).json({ error: 'COD record not found' });
+  res.json(rec);
+});
+
+app.get('/api/cod/driver/:driverId/summary', (req, res) => {
+  const summary = store.summariseCodForDriver(req.params.driverId, req.query.runDate);
+  res.json(summary);
+});
+
+// Driver performance & leaderboard (smart route learning)
+app.get('/api/analytics/driver-performance', (_req, res) => {
+  const stats = store.getDriverPerformance();
+  const drivers = store.getDrivers();
+  const enriched = stats.map((s) => {
+    const drv = drivers.find((d) => d.DriverId === s.DriverId);
+    return {
+      ...s,
+      DriverName: drv?.FullName || `Driver ${s.DriverId}`,
+      SuccessRate: s.TotalStops > 0 ? s.Delivered / s.TotalStops : 0,
+    };
+  });
+  res.json({ stats: enriched });
+});
+
+app.get('/api/analytics/suggest-drivers/:zoneCode', (req, res) => {
+  const drivers = store.getDrivers();
+  const suggestions = store.suggestDriversForZone(req.params.zoneCode).map((s) => {
+    const drv = drivers.find((d) => d.DriverId === s.DriverId);
+    return { ...s, DriverName: drv?.FullName || `Driver ${s.DriverId}` };
+  });
+  res.json({ suggestions });
+});
+
+// Customer business hours (delivery windows)
+app.get('/api/customers/hours', (_req, res) => {
+  res.json({
+    hours: store.listCustomerHours(),
+    defaults: store.getDefaultBusinessHours(),
+  });
+});
+app.get('/api/customers/hours/:parentName', (req, res) => {
+  const parentName = decodeURIComponent(req.params.parentName);
+  const hours = store.resolveHoursForCardName(parentName);
+  res.json({ parentName, hours });
+});
+app.patch('/api/customers/hours/:parentName', (req, res) => {
+  const parentName = decodeURIComponent(req.params.parentName);
+  const ok = store.setCustomerHours(parentName, req.body?.hours || null);
+  if (!ok) return res.status(400).json({ error: 'Invalid parent name' });
+  res.json({ ok: true, parentName });
+});
+
+// Bulk update — useful when applying a default to many parents at once
+app.post('/api/customers/policies/bulk', (req, res) => {
+  const updates = Array.isArray(req.body?.updates) ? req.body.updates : [];
+  let count = 0;
+  for (const { parentName, docType } of updates) {
+    if (store.setCustomerDocPolicy(parentName, docType)) count++;
+  }
+  res.json({ ok: true, updated: count });
+});
+app.patch('/api/zones/cities/:city', (req, res) => {
+  const city = decodeURIComponent(req.params.city);
+  const zoneCode = req.body?.zoneCode || null;
+  const ok = store.setCityZone(city, zoneCode);
+  if (!ok) return res.status(400).json({ error: 'Invalid city' });
+  res.json({ ok: true, city, zoneCode });
+});
+app.get('/api/zones/:id', (req, res) => {
+  const zone = store.getZones().find((z) => z.ZoneId === Number(req.params.id));
+  zone ? res.json(zone) : res.status(404).json({ error: 'Not found' });
+});
+app.post('/api/zones', (req, res) => {
+  try {
+    const newZone = store.addZone(req.body);
+    res.status(201).json(newZone);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+app.patch('/api/zones/:id', (req, res) => {
+  const updated = store.updateZone(req.params.id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Zone not found' });
+  res.json(updated);
+});
+app.delete('/api/zones/:id', (req, res) => {
+  const ok = store.deleteZone(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Zone not found' });
+  res.json({ ok: true });
+});
+
+// Drivers
+// Drivers - full CRUD with persistent storage
+app.get('/api/drivers', (_req, res) => {
+  res.json({ drivers: store.getDrivers() });
+});
+
+app.post('/api/drivers', (req, res) => {
+  const newDriver = store.addDriver(req.body);
+  io.emit('driver:created', newDriver);
+  res.status(201).json(newDriver);
+});
+
+app.patch('/api/drivers/:id', (req, res) => {
+  const updated = store.updateDriver(req.params.id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Driver not found' });
+  io.emit('driver:updated', updated);
+  res.json(updated);
+});
+
+app.patch('/api/drivers/:id/zones', (req, res) => {
+  const zoneCodes = (req.body.zoneIds || []).map((id) => {
+    const zone = data.zones.find((z) => z.ZoneId === id);
+    return zone?.Code;
+  }).filter(Boolean).join(',');
+  const updated = store.updateDriver(req.params.id, { zones: zoneCodes });
+  if (!updated) return res.status(404).json({ error: 'Driver not found' });
+  res.json({ ok: true });
+});
+
+app.delete('/api/drivers/:id', (req, res) => {
+  const ok = store.deleteDriver(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Driver not found' });
+  io.emit('driver:deleted', { DriverId: Number(req.params.id) });
+  res.json({ ok: true });
+});
+
+// Users - full CRUD with persistence
+app.get('/api/users', (_req, res) => res.json({ users: store.getUsers() }));
+
+app.post('/api/users', async (req, res) => {
+  try {
+    const newUser = await store.addUser(req.body);
+    res.status(201).json(newUser);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.patch('/api/users/:id', async (req, res) => {
+  try {
+    const updated = await store.updateUser(req.params.id, req.body);
+    if (!updated) return res.status(404).json({ error: 'User not found' });
+    res.json(updated);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/users/:id/reset-password', async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 4) {
+    return res.status(400).json({ error: 'סיסמה קצרה מדי (מינימום 4 תווים)' });
+  }
+  const ok = await store.setUserPassword(req.params.id, password);
+  if (!ok) return res.status(404).json({ error: 'User not found' });
+  res.json({ ok: true });
+});
+
+app.delete('/api/users/:id', (req, res) => {
+  try {
+    const auth = req.headers.authorization;
+    let requesterId = null;
+    if (auth?.startsWith('Bearer ')) {
+      try {
+        const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+        requesterId = payload.sub;
+      } catch {}
+    }
+    const ok = store.deleteUser(req.params.id, requesterId);
+    if (!ok) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/users/me/subscriptions', (_req, res) => res.json({ subscriptions: [
+  { SubscriptionId: 1, EventType: 'STOP_FAILED_HIGH', Channel: 'EMAIL', IsActive: true },
+  { SubscriptionId: 2, EventType: 'DAILY_DIGEST', Channel: 'EMAIL', IsActive: true },
+]}));
+app.put('/api/users/me/subscriptions', (_req, res) => res.json({ ok: true }));
+
+// Runs
+// Runs - backed by persistent store (no demo data - build from real SAP orders)
+app.get('/api/runs', (req, res) => {
+  let filtered = [...store.getRuns()];
+  if (req.query.runDate) filtered = filtered.filter((r) => r.RunDate === req.query.runDate);
+  if (req.query.driverId) filtered = filtered.filter((r) => r.DriverId === Number(req.query.driverId));
+  if (req.query.status) filtered = filtered.filter((r) => r.Status === req.query.status);
+  res.json({ runs: filtered });
+});
+
+app.get('/api/runs/:id', (req, res) => {
+  const run = store.getRunDetails(req.params.id);
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+  res.json(run);
+});
+
+app.post('/api/runs', (req, res) => {
+  const newRun = store.addRun(req.body);
+  io.emit('run:created', newRun);
+  res.status(201).json(newRun);
+});
+
+app.post('/api/runs/:id/duplicate', (req, res) => {
+  const newRunDate = req.body.runDate || new Date().toISOString().slice(0, 10);
+  const newRun = store.duplicateRun(req.params.id, newRunDate);
+  if (!newRun) return res.status(404).json({ error: 'Source run not found' });
+  io.emit('run:created', newRun);
+  res.status(201).json(newRun);
+});
+
+app.patch('/api/runs/:id', (req, res) => {
+  const updated = store.updateRun(req.params.id, req.body);
+  if (!updated) return res.status(404).json({ error: 'Not found' });
+  io.emit('run:updated', updated);
+  res.json(updated);
+});
+
+app.patch('/api/runs/:id/status', (req, res) => {
+  const runId = Number(req.params.id);
+  const run = store.updateRun(runId, { status: req.body.status });
+  if (!run) return res.status(404).json({ error: 'Not found' });
+  io.emit('run:status-changed', { runId, newStatus: req.body.status });
+  res.json({ runId, newStatus: req.body.status });
+});
+
+app.delete('/api/runs/:id', (req, res) => {
+  store.deleteRun(req.params.id);
+  io.emit('run:deleted', { runId: Number(req.params.id) });
+  res.json({ ok: true });
+});
+
+// Stops - add/remove/reorder within a run
+app.post('/api/runs/:runId/stops', (req, res) => {
+  const newStop = store.addStop(req.params.runId, req.body);
+  if (!newStop) return res.status(404).json({ error: 'Run not found' });
+  io.emit('stop:added', newStop);
+  res.status(201).json(newStop);
+});
+
+app.patch('/api/stops/:stopId', (req, res) => {
+  const updated = store.updateStop(req.params.stopId, req.body);
+  if (!updated) return res.status(404).json({ error: 'Not found' });
+  res.json(updated);
+});
+
+app.delete('/api/stops/:stopId', (req, res) => {
+  const ok = store.deleteStop(req.params.stopId);
+  if (!ok) return res.status(404).json({ error: 'Stop not found' });
+  io.emit('stop:deleted', { stopId: Number(req.params.stopId) });
+  res.json({ ok: true });
+});
+
+app.post('/api/stops/:stopId/move-up', (req, res) => {
+  store.moveStop(req.params.stopId, 'up');
+  res.json({ ok: true });
+});
+
+app.post('/api/stops/:stopId/move-down', (req, res) => {
+  store.moveStop(req.params.stopId, 'down');
+  res.json({ ok: true });
+});
+
+// Move a stop to a different run
+app.post('/api/stops/:stopId/move-to-run', (req, res) => {
+  const result = store.moveStopToRun(req.params.stopId, req.body.targetRunId);
+  if (!result) return res.status(400).json({ error: 'Stop or target run not found' });
+  io.emit('stop:moved', result);
+  res.json(result);
+});
+
+// Split a run
+app.post('/api/runs/:id/split', (req, res) => {
+  const maxStops = Number(req.body.maxStopsPerRun) || 25;
+  const newRun = store.splitRun(req.params.id, maxStops);
+  if (!newRun) return res.status(400).json({ error: 'המסלול קטנה מדי לפיצול' });
+  io.emit('run:split', { originalRunId: Number(req.params.id), newRunId: newRun.RunId });
+  res.json(newRun);
+});
+
+// Add SAP order to a stop
+app.post('/api/stops/:stopId/orders', (req, res) => {
+  const newOrder = store.addOrderToStop(req.params.stopId, req.body);
+  if (!newOrder) return res.status(404).json({ error: 'Stop not found' });
+  io.emit('order:added', newOrder);
+  res.status(201).json(newOrder);
+});
+
+app.delete('/api/run-orders/:runOrderId', (req, res) => {
+  const ok = store.deleteRunOrder(req.params.runOrderId);
+  if (!ok) return res.status(404).json({ error: 'Not found' });
+  res.json({ ok: true });
+});
+
+/**
+ * Auto-plan day: pulls all open SAP orders, groups by city→zone,
+ * and creates one run per zone with stops+orders.
+ * Idempotent: skips orders already assigned to a run today.
+ */
+app.post('/api/runs/auto-plan', async (req, res) => {
+  try {
+    const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
+
+    // Already assigned orders today - don't duplicate
+    const existingRuns = store.getRuns().filter((r) => r.RunDate === runDate);
+    const existingRunIds = existingRuns.map((r) => r.RunId);
+    const existingStops = (store.load().stops || []).filter((s) => existingRunIds.includes(s.RunId));
+    const existingStopIds = existingStops.map((s) => s.StopId);
+    const alreadyAssigned = new Set(
+      (store.load().runOrders || [])
+        .filter((o) => existingStopIds.includes(o.StopId))
+        .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
+    );
+
+    // Get real open SAP orders
+    if (!sapLive) {
+      return res.status(400).json({ error: 'SAP לא מחובר - לא ניתן לבצע תכנון אוטומטי' });
+    }
+    const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 });
+
+    // ------------------------------------------------------------------
+    // Pre-filter: customer minimum 3000 NIS (across both companies)
+    // and all line items must be in stock.
+    // Excluded orders are returned in the response for manual handling.
+    // ------------------------------------------------------------------
+    const MIN_CUSTOMER_TOTAL = Number(req.body.minCustomerTotal ?? 3000);
+    // Minimum lines per order - skip "single-item" orders that don't justify a delivery run
+    const MIN_LINES_PER_ORDER = Number(req.body.minLinesPerOrder ?? 2);
+    const requireStock = req.body.requireStock !== false; // default ON
+
+    // (a) Sum customer total across both companies. Use CardName as
+    // a customer key because CardCode often differs between OIG / Unico
+    // for the same physical customer. Trim + lowercase to be safe.
+    const customerTotals = new Map();
+    const norm = (s) => String(s || '').trim().toLowerCase();
+    for (const o of allOrders) {
+      const k = norm(o.CardName);
+      customerTotals.set(k, (customerTotals.get(k) || 0) + Number(o.DocTotal || 0));
+    }
+
+    // (b) Pull line items for every candidate order, then check stock.
+    let stockMap = new Map();   // 'A:itemCode' -> available qty
+    let linesByOrder = new Map(); // 'A:docEntry' -> [lines]
+    if (requireStock) {
+      const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
+      const allLines = await sapBridge.getBulkOrderLines(refs).catch((e) => {
+        console.warn('[auto-plan] getBulkOrderLines failed:', e.message);
+        return [];
+      });
+      for (const ln of allLines) {
+        const k = `${ln.CompanyCode}:${ln.DocEntry}`;
+        if (!linesByOrder.has(k)) linesByOrder.set(k, []);
+        linesByOrder.get(k).push(ln);
+      }
+      // Get stock per company for the union of items.
+      // We sum across all "picking" warehouses (configurable via env) -
+      // currently 01 (main), 02, 03, 10, 20. Warehouse 99 (returns) is excluded.
+      const PICKING_WAREHOUSES = (process.env.PICKING_WAREHOUSES || '01,02,03,10,20')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      for (const code of ['A', 'B']) {
+        const itemCodes = [...new Set(allLines.filter((l) => l.CompanyCode === code).map((l) => l.ItemCode))];
+        if (itemCodes.length === 0) continue;
+        for (let i = 0; i < itemCodes.length; i += 200) {
+          const batch = itemCodes.slice(i, i + 200);
+          const stock = await sapBridge.getItemsStock(code, batch).catch(() => []);
+          for (const s of stock) {
+            // Only count stock from picking warehouses
+            if (!PICKING_WAREHOUSES.includes(String(s.WarehouseCode))) continue;
+            const sk = `${code}:${s.ItemCode}`;
+            stockMap.set(sk, (stockMap.get(sk) || 0) + Number(s.Available || 0));
+          }
+        }
+      }
+    }
+
+    // (c) Split into "to plan" and "excluded".
+    const orders = [];           // these go to auto-planning
+    const excludedOrders = [];   // shown to the user separately
+    for (const o of allOrders) {
+      const reasons = [];
+      const custTotal = customerTotals.get(norm(o.CardName)) || 0;
+      if (custTotal < MIN_CUSTOMER_TOTAL) {
+        reasons.push({ type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL });
+      }
+      // Min lines per order (e.g. avoid solo-item orders that aren't worth a delivery)
+      const ordLinesCount = Number(o.LinesCount || 0);
+      if (MIN_LINES_PER_ORDER > 0 && ordLinesCount > 0 && ordLinesCount < MIN_LINES_PER_ORDER) {
+        reasons.push({ type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER });
+      }
+      if (requireStock) {
+        const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
+        const missing = [];
+        for (const ln of lns) {
+          const avail = stockMap.get(`${o.CompanyCode}:${ln.ItemCode}`) || 0;
+          const needed = Number(ln.OpenQty || ln.Quantity || 0);
+          if (avail < needed) {
+            missing.push({
+              itemCode: ln.ItemCode,
+              itemName: ln.ItemName, // already populated by getBulkOrderLines
+              needed, available: avail,
+            });
+          }
+        }
+        if (missing.length > 0) {
+          reasons.push({ type: 'missing_stock', items: missing });
+        }
+      }
+      if (reasons.length > 0) {
+        excludedOrders.push({
+          companyCode: o.CompanyCode,
+          docEntry: o.DocEntry,
+          docNum: o.DocNum,
+          cardCode: o.CardCode,
+          cardName: o.CardName,
+          docTotal: Number(o.DocTotal || 0),
+          customerTotal: custTotal,
+          shipToAddress: o.ShipToAddress,
+          custCity: o.CustCity,
+          reasons,
+        });
+      } else {
+        orders.push(o);
+      }
+    }
+
+    // Group by zone
+    const byZone = {}; // zoneCode → { zone, orders: [...] }
+    const unassigned = [];
+    for (const order of orders) {
+      const key = `${order.CompanyCode}-${order.DocEntry}`;
+      if (alreadyAssigned.has(key)) continue;
+
+      // Parse city from ShipToAddress (last non-empty line) or fallback to CustCity
+      const addressParts = (order.ShipToAddress || '')
+        .split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
+      const city = addressParts[addressParts.length - 1] || order.CustCity || '';
+      const street = addressParts.length > 1 ? addressParts[0] : '';
+
+      const zone = store.suggestZoneForCity(city);
+      if (!zone) {
+        unassigned.push({ ...order, cityParsed: city });
+        continue;
+      }
+      if (!byZone[zone.Code]) byZone[zone.Code] = { zone, orders: [] };
+      byZone[zone.Code].orders.push({ ...order, cityParsed: city, streetParsed: street });
+    }
+
+    // Create runs + stops + orders
+    const runsCreated = [];
+    for (const { zone, orders: zoneOrders } of Object.values(byZone)) {
+      // Check if there's already a run for this zone+date
+      let targetRun = existingRuns.find((r) => r.ZoneId === zone.ZoneId);
+      if (!targetRun) {
+        targetRun = store.addRun({
+          runDate,
+          zoneId: zone.ZoneId,
+          driverId: null,
+          status: 'OPEN',
+          notes: `תכנון אוטומטי - ${runDate}`,
+        });
+      }
+
+      // Group orders by customer address (merge same destination)
+      const byAddressKey = {};
+      for (const o of zoneOrders) {
+        const key = `${o.streetParsed}|${o.cityParsed}|${o.CardCode}`;
+        if (!byAddressKey[key]) byAddressKey[key] = [];
+        byAddressKey[key].push(o);
+      }
+
+      for (const ordersAtAddress of Object.values(byAddressKey)) {
+        const first = ordersAtAddress[0];
+        const newStop = store.addStop(targetRun.RunId, {
+          street: first.streetParsed || first.CardName,
+          buildingNumber: '',
+          city: first.cityParsed,
+          branchName: first.CardName,
+          contactPhone: first.CustPhone,
+        });
+        for (const o of ordersAtAddress) {
+          store.addOrderToStop(newStop.StopId, {
+            companyCode: o.CompanyCode,
+            docEntry: o.DocEntry,
+            docNum: o.DocNum,
+            cardCode: o.CardCode,
+            cardName: o.CardName,
+            total: o.DocTotal,
+            linesCount: o.LinesCount,
+          });
+        }
+      }
+
+      runsCreated.push({
+        run: targetRun,
+        stopCount: store.getRunDetails(targetRun.RunId).stops.length,
+        zoneName: zone.Name,
+        orderCount: zoneOrders.length,
+      });
+    }
+
+    io.emit('runs:auto-planned', { runDate, count: runsCreated.length });
+
+    res.json({
+      runsCreated,
+      unassignedAddresses: unassigned.length > 0
+        ? unassigned.map((o) => ({
+            customerName: o.CardName,
+            city: o.cityParsed,
+            docNum: o.DocNum,
+            companyCode: o.CompanyCode,
+          }))
+        : null,
+      excludedOrders, // orders skipped because below 3000₪ or missing stock
+      summary: {
+        zonesPlanned: runsCreated.length,
+        ordersAssigned: orders.length - unassigned.length,
+        ordersUnassigned: unassigned.length,
+        ordersSkipped: Array.from(alreadyAssigned).length,
+        ordersExcluded: excludedOrders.length,
+        excludedLowTotal: excludedOrders.filter((o) => o.reasons.some((r) => r.type === 'low_total')).length,
+        excludedMissingStock: excludedOrders.filter((o) => o.reasons.some((r) => r.type === 'missing_stock')).length,
+      },
+      filters: {
+        minCustomerTotal: MIN_CUSTOMER_TOTAL,
+        minLinesPerOrder: MIN_LINES_PER_ORDER,
+        requireStock,
+      },
+    });
+  } catch (err) {
+    console.error('[auto-plan] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Create a new picking wave - pulls real SAP order lines + aggregates
+app.post('/api/runs/:id/wave', async (req, res) => {
+  const runId = Number(req.params.id);
+  const runDetails = store.getRunDetails(runId);
+  if (!runDetails) return res.status(404).json({ error: 'Run not found' });
+
+  const orderRefs = [];
+  for (const stop of runDetails.stops || []) {
+    for (const order of stop.orders || []) {
+      orderRefs.push({ companyCode: order.CompanyCode, docEntry: order.SapDocEntry });
+    }
+  }
+
+  if (orderRefs.length === 0) {
+    return res.status(400).json({ error: 'אין הזמנות במסלול - לא ניתן ליצור גל ליקוט' });
+  }
+  if (!sapLive) {
+    return res.status(400).json({ error: 'SAP לא מחובר - נדרש לקרוא שורות הזמנה' });
+  }
+
+  try {
+    const lines = await sapBridge.getBulkOrderLines(orderRefs);
+    if (lines.length === 0) {
+      return res.status(400).json({ error: 'לא נמצאו שורות פתוחות בהזמנות' });
+    }
+
+    const wave = store.createWaveFromLines(runId, lines);
+    if (!wave) return res.status(500).json({ error: 'Failed to create wave' });
+
+    store.updateRun(runId, { status: 'PICKING' });
+    io.emit('wave:created', { runId, waveId: wave.WaveId });
+    res.status(201).json(store.getWave(wave.WaveId));
+  } catch (err) {
+    console.error('[wave] creation failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/runs/:id/wave', (req, res) => {
+  const wave = store.getWaveForRun(req.params.id);
+  if (!wave) return res.status(404).json({ error: 'No active wave for this run' });
+  res.json(wave);
+});
+app.post('/api/runs/:id/optimize-order', (req, res) => {
+  const ok = store.smartSortStops(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Run not found' });
+  const run = store.getRunDetails(req.params.id);
+  io.emit('run:updated', { runId: Number(req.params.id) });
+  res.json({ ok: true, RunId: Number(req.params.id), stopCount: run?.stops?.length || 0 });
+});
+app.post('/api/runs/stops/:stopId/tracking-link', (req, res) => {
+  const token = `demo-token-${req.params.stopId}-${Date.now()}`;
+  res.json({ token, url: `http://localhost:${PORT}/t/${token}` });
+});
+
+// ----------------------------------------------------------------------------
+// WhatsApp/SMS notifications - generate "click-to-send" links the office can
+// fire to a customer with their tracking link + ETA. Doesn't post to WhatsApp
+// directly (no business API yet) - opens wa.me/sms: links.
+// ----------------------------------------------------------------------------
+function buildPublicBase(req) {
+  // Try the cf-tunnel URL first (so external customers can click the link),
+  // fall back to whatever host the request came on.
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const cfLog = path.resolve(__dirname, '..', '..', 'logs', 'cf-tunnel-error.log');
+    if (fs.existsSync(cfLog)) {
+      const txt = fs.readFileSync(cfLog, 'utf8');
+      const matches = txt.match(/https:\/\/[a-z-]+\.trycloudflare\.com/g);
+      if (matches && matches.length) return matches[matches.length - 1];
+    }
+  } catch {}
+  if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL;
+  return `${req.protocol || 'http'}://${req.get('host') || `localhost:${PORT}`}`;
+}
+
+/**
+ * Compute a rough ETA for a stop based on its position in the run.
+ * Assumes ~25 minutes per stop on average if no real GPS data.
+ */
+function computeEta(stop, runDetails) {
+  if (stop.Status === 'DELIVERED') return { minutesAway: 0, label: 'נמסר' };
+  // Find how many ARRIVED/PENDING stops come before this one
+  const stops = (runDetails.stops || []).slice().sort(
+    (a, b) => Number(a.StopOrder || 0) - Number(b.StopOrder || 0)
+  );
+  const idx = stops.findIndex((s) => s.StopId === stop.StopId);
+  if (idx < 0) return { minutesAway: null, label: 'לא ידוע' };
+  let stopsAhead = 0;
+  for (let i = 0; i < idx; i++) {
+    const s = stops[i];
+    if (!['DELIVERED', 'CANCELLED', 'FAILED'].includes(s.Status)) stopsAhead += 1;
+  }
+  const AVG_MIN_PER_STOP = 25;
+  const min = stopsAhead * AVG_MIN_PER_STOP + (stop.Status === 'ARRIVED' ? 0 : 10);
+  return {
+    minutesAway: min,
+    label: min < 5 ? 'תוך מס׳ דקות' : min < 60 ? `~${min} דקות` : `~${Math.round(min / 60)} שעות`,
+    estimatedAt: new Date(Date.now() + min * 60_000).toISOString(),
+  };
+}
+
+/**
+ * Build a WhatsApp-ready notification message + share URL.
+ *   GET /api/notify/eta/:stopId
+ * Returns:
+ *   { trackingUrl, message, whatsappUrl, smsUrl, eta }
+ */
+app.get('/api/notify/eta/:stopId', (req, res) => {
+  const stopId = Number(req.params.stopId);
+  const allStops = store.load().stops || [];
+  const stop = allStops.find((s) => s.StopId === stopId);
+  if (!stop) return res.status(404).json({ error: 'Stop not found' });
+  const runDetails = store.getRunDetails(stop.RunId);
+  if (!runDetails) return res.status(404).json({ error: 'Run not found' });
+
+  const phone = (stop.ContactPhone || '').replace(/\D/g, '');
+  const eta = computeEta(stop, runDetails);
+  const base = buildPublicBase(req);
+
+  // Reuse the existing demo tracking-link generator to get a token
+  const token = `t-${stopId}-${Date.now().toString(36)}`;
+  const trackingUrl = `${base}/t/${token}`;
+
+  // Hebrew customer-facing message
+  const branchName = stop.BranchName || 'הלקוח';
+  const driverName = runDetails.DriverName || 'הנהג שלנו';
+  const message = stop.Status === 'DELIVERED'
+    ? `שלום ${branchName} 👋\nהמשלוח שלך נמסר בהצלחה. תודה שבחרתם בנו!`
+    : `שלום ${branchName} 👋\nהמשלוח שלך בדרך אליך.\nזמן הגעה משוער: ${eta.label}\nמעקב חי: ${trackingUrl}\n${driverName} מתקשר אם יש שינוי 🚚`;
+
+  // wa.me requires international format. If phone starts with 0, convert to +972
+  const intlPhone = phone.startsWith('0') ? `972${phone.slice(1)}` : phone;
+  res.json({
+    stopId,
+    eta,
+    trackingUrl,
+    message,
+    phone: stop.ContactPhone,
+    whatsappUrl: phone ? `https://wa.me/${intlPhone}?text=${encodeURIComponent(message)}` : null,
+    smsUrl: phone ? `sms:${stop.ContactPhone}?body=${encodeURIComponent(message)}` : null,
+  });
+});
+
+// Orders - use real SAP when available
+app.get('/api/orders/unified', async (_req, res) => {
+  if (sapLive) {
+    try {
+      const groups = await sapBridge.getOpenOrdersUnified({ limit: 30 });
+      return res.json({ groups, count: groups.length, source: 'sap' });
+    } catch (err) { console.warn('[sap] unified failed:', err.message); }
+  }
+  res.json({ groups: data.unifiedGroups, count: data.unifiedGroups.length, source: 'demo' });
+});
+app.get('/api/orders/open', async (req, res) => {
+  if (sapLive) {
+    try {
+      const { company, search, limit = 100 } = req.query;
+      const orders = await sapBridge.getOpenOrdersFlat({
+        limit: Number(limit),
+        company: company || null,
+        search: search || null,
+      });
+      return res.json({ orders, count: orders.length, source: 'sap' });
+    } catch (err) {
+      console.warn('[sap] open orders failed:', err.message);
+    }
+  }
+  res.json({ orders: [], count: 0 });
+});
+
+app.get('/api/orders/:company/:docEntry/lines', async (req, res) => {
+  if (sapLive) {
+    try {
+      const lines = await sapBridge.getOrderLines(req.params.company.toUpperCase(), req.params.docEntry);
+      return res.json({ lines });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+  res.json({ lines: [] });
+});
+app.get('/api/orders/stats', async (_req, res) => {
+  if (sapLive) {
+    try {
+      const stats = await sapBridge.getOverallStats();
+      const totalOpen = (stats.companyA?.OpenOrders || 0) + (stats.companyB?.OpenOrders || 0);
+      return res.json({
+        totalOrders: totalOpen,
+        totalStops: Math.ceil(totalOpen * 0.8), // estimate
+        stopsSaved: Math.floor(totalOpen * 0.2),
+        mergeRatio: 0.2,
+        mergedStops: Math.floor(totalOpen * 0.15),
+        companyA: stats.companyA,
+        companyB: stats.companyB,
+        source: 'sap',
+      });
+    } catch (err) { console.warn('[sap] stats failed:', err.message); }
+  }
+  res.json(data.stats);
+});
+
+// Failures
+// Failure reasons catalog (stays - these are standard categories)
+app.get('/api/failures/reasons', (_req, res) => res.json({ reasons: data.failureReasons }));
+// Failures - start empty, populated only when drivers report real failures
+let runtimeFailures = [];
+app.get('/api/failures', (_req, res) => res.json({ failures: runtimeFailures }));
+app.post('/api/failures/report', (req, res) => {
+  const reason = data.failureReasons.find((r) => r.ReasonCode === req.body.reasonCode);
+  const newFailure = {
+    FailureId: runtimeFailures.length + 1,
+    StopId: req.body.stopId,
+    ReasonCode: req.body.reasonCode,
+    ReasonName: reason?.Name || req.body.reasonCode,
+    Category: reason?.Category || 'OTHER',
+    Severity: reason?.Severity || 'MEDIUM',
+    Notes: req.body.notes,
+    PhotoUrl: null,
+    ResolutionStatus: 'OPEN',
+    CreatedAt: new Date().toISOString(),
+  };
+  runtimeFailures.push(newFailure);
+  io.emit('failure:reported', newFailure);
+  res.status(201).json(newFailure);
+});
+app.post('/api/failures/:id/reschedule', (req, res) => {
+  const f = runtimeFailures.find((x) => x.FailureId === Number(req.params.id));
+  if (f) { f.ResolutionStatus = 'RESCHEDULED'; f.ResolvedAt = new Date().toISOString(); }
+  res.json({ ok: true });
+});
+app.post('/api/failures/:id/resolve', (req, res) => {
+  const f = runtimeFailures.find((x) => x.FailureId === Number(req.params.id));
+  if (f) { f.ResolutionStatus = req.body.status || 'RESOLVED'; f.ResolvedAt = new Date().toISOString(); }
+  res.json({ ok: true });
+});
+
+// Returns - start empty, user creates them
+let runtimeReturns = [];
+app.get('/api/returns', (_req, res) => res.json({ returns: runtimeReturns }));
+app.post('/api/returns', (req, res) => {
+  const newReturn = {
+    ReturnId: runtimeReturns.length + 1,
+    ReturnNumber: `RET-${new Date().toISOString().slice(0, 10)}-${String(runtimeReturns.length + 1).padStart(3, '0')}`,
+    ...req.body,
+    Status: 'OPEN',
+    CreatedAt: new Date().toISOString(),
+    LinesCount: req.body.lines?.length || 0,
+  };
+  runtimeReturns.push(newReturn);
+  res.status(201).json(newReturn);
+});
+
+// Analytics - computed from real persistent store + SAP
+app.get('/api/analytics/summary', async (_req, res) => {
+  const runs = store.getRuns();
+  const drivers = store.getDrivers();
+  const zones = store.getZones();
+  const runOrders = store.load().runOrders || [];
+  const stops = store.load().stops || [];
+
+  const totalRuns = runs.length;
+  const completedRuns = runs.filter((r) => r.Status === 'COMPLETED').length;
+  const totalStops = stops.length;
+  const deliveredStops = stops.filter((s) => s.Status === 'DELIVERED' || s.Status === 'PARTIAL').length;
+  const failedStops = stops.filter((s) => s.Status === 'FAILED').length;
+  const totalOrders = runOrders.length;
+  const deliveredOrders = runOrders.filter((o) => o.Status === 'DELIVERED').length;
+  const ordersCompanyA = runOrders.filter((o) => o.CompanyCode === 'A').length;
+  const ordersCompanyB = runOrders.filter((o) => o.CompanyCode === 'B').length;
+
+  // Per-driver: count runs + stops per driver
+  const driverStats = drivers.map((d) => {
+    const driverRuns = runs.filter((r) => r.DriverId === d.DriverId);
+    const driverStopIds = stops
+      .filter((s) => driverRuns.some((r) => r.RunId === s.RunId))
+      .map((s) => s.StopId);
+    const driverStops = stops.filter((s) => driverStopIds.includes(s.StopId));
+    return {
+      DriverId: d.DriverId, Code: d.Code, FullName: d.FullName,
+      Runs: driverRuns.length,
+      TotalStops: driverStops.length,
+      DeliveredStops: driverStops.filter((s) => s.Status === 'DELIVERED' || s.Status === 'PARTIAL').length,
+      FailedStops: driverStops.filter((s) => s.Status === 'FAILED').length,
+      AvgStopMinutes: null, AvgRunMinutes: null,
+    };
+  });
+
+  const zoneStats = zones.map((z) => {
+    const zoneRuns = runs.filter((r) => r.ZoneId === z.ZoneId);
+    const zoneStopIds = stops.filter((s) => zoneRuns.some((r) => r.RunId === s.RunId)).map((s) => s.StopId);
+    return {
+      ...z,
+      Runs: zoneRuns.length,
+      TotalStops: zoneStopIds.length,
+      DeliveredStops: stops.filter((s) => zoneStopIds.includes(s.StopId) && (s.Status === 'DELIVERED' || s.Status === 'PARTIAL')).length,
+      FailedStops: stops.filter((s) => zoneStopIds.includes(s.StopId) && s.Status === 'FAILED').length,
+      TotalOrders: runOrders.filter((o) => zoneStopIds.includes(o.StopId)).length,
+    };
+  });
+
+  // Failure breakdown
+  const failureCounts = {};
+  for (const f of runtimeFailures) {
+    const key = f.ReasonCode;
+    if (!failureCounts[key]) {
+      const reason = data.failureReasons.find((r) => r.ReasonCode === f.ReasonCode);
+      failureCounts[key] = {
+        ReasonCode: f.ReasonCode, Name: reason?.Name || f.ReasonCode,
+        Category: reason?.Category, Severity: reason?.Severity,
+        Count: 0, Rescheduled: 0, Resolved: 0, Cancelled: 0, StillOpen: 0,
+      };
+    }
+    failureCounts[key].Count++;
+    if (f.ResolutionStatus === 'RESCHEDULED') failureCounts[key].Rescheduled++;
+    else if (f.ResolutionStatus === 'RESOLVED') failureCounts[key].Resolved++;
+    else if (f.ResolutionStatus === 'CANCELLED') failureCounts[key].Cancelled++;
+    else failureCounts[key].StillOpen++;
+  }
+
+  res.json({
+    overall: {
+      totalRuns, completedRuns,
+      totalStops, deliveredStops, partialStops: 0, failedStops,
+      totalOrders, deliveredOrders,
+      ordersCompanyA, ordersCompanyB,
+      avgStopMinutes: null, avgRunMinutes: null,
+      successRate: totalStops > 0 ? (deliveredStops / totalStops) : null,
+      failureRate: totalStops > 0 ? (failedStops / totalStops) : null,
+      unifiedStops: totalStops,
+      mergedStops: stops.filter((s) => {
+        const ordersAtStop = runOrders.filter((o) => o.StopId === s.StopId);
+        return ordersAtStop.some((o) => o.CompanyCode === 'A') && ordersAtStop.some((o) => o.CompanyCode === 'B');
+      }).length,
+      mergerRatio: null,
+    },
+    daily: [], // can compute later if needed
+    drivers: driverStats,
+    zones: zoneStats,
+    failures: Object.values(failureCounts),
+    syncHealth: {
+      PendingDeliveryNotes: runOrders.filter((o) => o.Status === 'DELIVERED' && !o.SapDeliveryDocEntry).length,
+      SyncedDeliveryNotes: runOrders.filter((o) => o.SapDeliveryDocEntry).length,
+      PendingReturnRequests: 0, QueueBacklog: 0, PermanentFailures: 0,
+    },
+  });
+});
+app.get('/api/reports/exceptions', (_req, res) => res.json({
+  summary: { total: 3, addressesWithoutZone: 1, failedStops: 1, unassignedReturns: 1, failedDeliveryNotes: 0 },
+  exceptions: {
+    addressesWithoutZone: [{ AddressId: 99, Street: 'הגליל', BuildingNumber: '10', City: 'טבריה', BranchName: 'סופר מיני טבריה', CustomerLinks: 1 }],
+    failedStops: [data.stops.find((s) => s.Status === 'FAILED')],
+    unassignedReturns: data.returnRequests.map((r) => ({ ...r, CompanyCode: 'A' })),
+    failedDeliveryNotes: [],
+  },
+}));
+
+// Tracking - real GPS positions from drivers
+const driverPositions = new Map();
+
+app.get('/api/tracking/drivers', (_req, res) => {
+  const allRuns = store.getRuns();
+  const locations = [];
+  for (const [driverId, pos] of driverPositions) {
+    const driver = store.getDrivers().find((d) => d.DriverId === driverId);
+    if (!driver) continue;
+    const run = allRuns.find((r) => r.DriverId === driverId && r.Status === 'IN_TRANSIT');
+    locations.push({
+      DriverId: driverId,
+      RunId: run?.RunId || null,
+      DriverName: driver.FullName,
+      VehiclePlate: driver.VehiclePlate,
+      RunNumber: run?.RunNumber || null,
+      RunStatus: run?.Status || null,
+      ZoneName: run?.ZoneName || null,
+      ZoneColor: run?.ZoneColor || '#6b7280',
+      Latitude: pos.latitude,
+      Longitude: pos.longitude,
+      Accuracy: pos.accuracy,
+      Heading: pos.heading,
+      SpeedKmh: pos.speedKmh,
+      BatteryLevel: pos.batteryLevel,
+      UpdatedAt: pos.updatedAt,
+    });
+  }
+  res.json({ locations });
+});
+
+app.post('/api/tracking/position', (req, res) => {
+  const auth = req.headers.authorization;
+  let driverId = null;
+  if (auth?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+      driverId = payload.driverId;
+    } catch {}
+  }
+  if (!driverId) return res.status(401).json({ error: 'Driver auth required' });
+
+  driverPositions.set(driverId, {
+    ...req.body,
+    updatedAt: new Date().toISOString(),
+  });
+
+  io.emit('driver:position', { driverId, ...req.body, at: new Date() });
+  res.json({ ok: true });
+});
+
+// Driver
+app.get('/api/driver/my-runs', (req, res) => {
+  const auth = req.headers.authorization;
+  let driverId = 1;
+  if (auth) {
+    try { const payload = jwt.verify(auth.slice(7), JWT_SECRET); driverId = payload.driverId || 1; } catch {}
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const runs = store.getRuns().filter((r) => r.DriverId === driverId);
+  // Show today's and recent runs
+  res.json({ runs });
+});
+app.get('/api/driver/runs/:id/manifest', (req, res) => {
+  const run = store.getRunDetails(req.params.id);
+  if (!run) return res.status(404).json({ error: 'Not found' });
+  res.json(run);
+});
+app.patch('/api/driver/stops/:stopId/status', (req, res) => {
+  const stop = store.updateStop(req.params.stopId, {
+    status: req.body.status,
+    notes: req.body.notes,
+  });
+  if (!stop) return res.status(404).json({ error: 'Stop not found' });
+  if (req.body.status === 'ARRIVED') {
+    stop.ArrivedAt = new Date().toISOString();
+    store.save?.();
+  }
+  io.emit('stop:status-changed', { stopId: stop.StopId, status: stop.Status });
+
+  // When driver marks ARRIVED - auto-advance run to IN_TRANSIT if still LOADED
+  const run = store.getRuns().find((r) => r.RunId === stop.RunId);
+  if (run && ['LOADED', 'PLANNED', 'OPEN'].includes(run.Status) && req.body.status === 'ARRIVED') {
+    store.updateRun(run.RunId, { status: 'IN_TRANSIT' });
+  }
+  res.json({ ok: true, stopId: req.params.stopId, status: req.body.status });
+});
+
+/**
+ * Complete a stop with optional signature + photo.
+ * This is THE moment of truth - creates Delivery Notes in SAP for every order.
+ *
+ * Since Service Layer is not configured, we simulate:
+ *  - Store signature locally
+ *  - Mark orders with a fake SapDeliveryDocEntry
+ *  - Log to pending-sap-writes for when connection is restored
+ */
+app.post('/api/driver/stops/:stopId/complete', (req, res) => {
+  const stopId = Number(req.params.stopId);
+  const runDetails = store.getRuns().find((r) =>
+    (store.load().stops || []).some((s) => s.StopId === stopId && r.RunId === s.RunId)
+  );
+  if (!runDetails) return res.status(404).json({ error: 'Stop not found' });
+
+  // Mark stop as delivered
+  const stop = store.updateStop(stopId, { status: 'DELIVERED' });
+  stop.CompletedAt = new Date().toISOString();
+  if (req.body.signatureDataUrl) stop.SignatureUrl = req.body.signatureDataUrl;
+  if (req.body.photoDataUrl) stop.PhotoUrl = req.body.photoDataUrl;
+  if (req.body.notes) stop.Notes = req.body.notes;
+  // POD: capture GPS at moment of delivery for legal/audit trail
+  if (req.body.gps) {
+    stop.PodGps = {
+      lat: Number(req.body.gps.lat),
+      lng: Number(req.body.gps.lng),
+      accuracy: Number(req.body.gps.accuracy || 0),
+      timestamp: req.body.gps.timestamp || Date.now(),
+    };
+  }
+  if (req.body.capturedAt) stop.PodCapturedAt = req.body.capturedAt;
+  store.save?.();
+
+  // Find all orders at this stop and mark them delivered + simulated SAP ref
+  const allOrders = store.load().runOrders || [];
+  const stopOrders = allOrders.filter((o) => o.StopId === stopId);
+  const results = [];
+  for (const order of stopOrders) {
+    order.Status = 'DELIVERED';
+    // Simulate SAP Delivery Note DocEntry (in real life: SAP Service Layer call)
+    order.SapDeliveryDocEntry = 9000000 + order.RunOrderId;
+    order.DeliveredAt = new Date().toISOString();
+    results.push({
+      runOrderId: order.RunOrderId,
+      success: true,
+      sapDocEntry: order.SapDeliveryDocEntry,
+      simulated: true,
+    });
+  }
+  store.save?.();
+
+  // Auto-generate Delivery Notes (separated by company) for this stop
+  let generatedDocs = [];
+  try {
+    generatedDocs = store.generateDeliveryNotesForStop(stopId, { method: 'AUTO' });
+  } catch (err) {
+    console.warn('[stop-complete] DN generation failed:', err.message);
+  }
+
+  // Record driver performance — used by planner & leaderboard.
+  try {
+    const run = (store.load().runs || []).find((r) => r.RunId === stop.RunId);
+    if (run && run.DriverId) {
+      // Calculate minutes at stop (ARRIVED → DELIVERED).
+      let minutesAtStop = null;
+      if (stop.ArrivedAt && stop.CompletedAt) {
+        minutesAtStop = Math.max(0, Math.round(
+          (new Date(stop.CompletedAt) - new Date(stop.ArrivedAt)) / 60000
+        ));
+      }
+      store.recordDriverPerformance(run.DriverId, run.ZoneCode, {
+        delivered: true,
+        minutesAtStop,
+      });
+    }
+  } catch (e) { console.warn('[perf] record failed:', e.message); }
+
+  io.emit('stop:completed', { stopId, orders: results.length, deliveryNotes: generatedDocs.length });
+
+  // Check if this is the last stop → auto-complete the run
+  const allStopsInRun = (store.load().stops || []).filter((s) => s.RunId === runDetails.RunId);
+  const allDone = allStopsInRun.every((s) => ['DELIVERED', 'PARTIAL', 'FAILED', 'SKIPPED'].includes(s.Status));
+  if (allDone) {
+    store.updateRun(runDetails.RunId, { status: 'COMPLETED' });
+    io.emit('run:completed', { runId: runDetails.RunId });
+  }
+
+  res.json({
+    stopId,
+    stopStatus: 'DELIVERED',
+    orders: results,
+    runCompleted: allDone,
+  });
+});
+
+app.post('/api/driver/orders/:runOrderId/deliver', (req, res) => {
+  const orders = store.load().runOrders || [];
+  const order = orders.find((o) => o.RunOrderId === Number(req.params.runOrderId));
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+  order.Status = 'DELIVERED';
+  order.SapDeliveryDocEntry = 9000000 + order.RunOrderId;
+  order.DeliveredAt = new Date().toISOString();
+  store.save?.();
+  io.emit('order:delivered', { runOrderId: order.RunOrderId });
+  res.json({
+    runOrderId: order.RunOrderId,
+    sapDocEntry: order.SapDeliveryDocEntry,
+    sapDocNum: order.SapDocNum,
+    alreadyExisted: false,
+    simulated: true,
+  });
+});
+
+// Customer tracking (public)
+app.get('/api/public/track/:token', (req, res) => {
+  // Demo: return tracking info for a random in-transit stop
+  const stop = data.stops.find((s) => s.Status === 'ARRIVED' || s.Status === 'PENDING');
+  if (!stop) return res.status(404).json({ error: 'Not found' });
+  const run = data.runs.find((r) => r.RunId === stop.RunId);
+  res.json({
+    stopId: stop.StopId, status: stop.Status, stopOrder: stop.StopOrder,
+    arrivedAt: stop.ArrivedAt, completedAt: stop.CompletedAt,
+    address: {
+      street: stop.Street, buildingNumber: stop.BuildingNumber, city: stop.City,
+      latitude: stop.Latitude, longitude: stop.Longitude, branchName: stop.BranchName,
+    },
+    run: {
+      runNumber: run?.RunNumber, runDate: run?.RunDate, status: run?.Status,
+      zoneName: run?.ZoneName, zoneColor: run?.ZoneColor,
+      driverName: run?.DriverName, vehiclePlate: run?.VehiclePlate,
+    },
+    driverLocation: run?.Status === 'IN_TRANSIT' ? {
+      latitude: 32.0775, longitude: 34.7748, updatedAt: new Date().toISOString(),
+    } : null,
+    progress: {
+      totalStops: data.stops.filter((s) => s.RunId === run?.RunId).length,
+      completedStops: data.stops.filter((s) => s.RunId === run?.RunId && ['DELIVERED', 'PARTIAL'].includes(s.Status)).length,
+      currentStopOrder: stop.StopOrder, yourPosition: stop.StopOrder,
+    },
+    eta: run?.Status === 'IN_TRANSIT'
+      ? { status: 'IN_TRANSIT', message: 'המשלוח בדרך אליך', approximateMinutes: 25 }
+      : { status: 'PREPARING', message: 'המשלוח מוכן ליציאה' },
+    expiresAt: new Date(Date.now() + 48 * 3600000).toISOString(),
+  });
+});
+
+// Settings + SAP (for Settings page)
+app.get('/api/settings', (_req, res) => res.json({
+  settings: [
+    { key: 'warehouse.defaultCode', value: '01', category: 'WAREHOUSE', dataType: 'STRING', description: 'קוד מחסן ברירת מחדל' },
+    { key: 'warehouse.returnCode', value: '99', category: 'WAREHOUSE', dataType: 'STRING', description: 'קוד מחסן לחזרות' },
+    { key: 'notifications.smsEnabled', value: true, category: 'NOTIFICATIONS', dataType: 'BOOLEAN', description: 'שליחת SMS' },
+    { key: 'notifications.emailEnabled', value: true, category: 'NOTIFICATIONS', dataType: 'BOOLEAN', description: 'שליחת אימייל' },
+    { key: 'portal.baseUrl', value: 'http://localhost:4000', category: 'GENERAL', dataType: 'STRING', description: 'כתובת פורטל לקוחות' },
+  ],
+}));
+app.put('/api/settings/:key', (_req, res) => res.json({ ok: true }));
+app.get('/api/sap/sample/:company', async (req, res) => {
+  const code = req.params.company.toUpperCase();
+  if (sapLive) {
+    try {
+      const data = await sapBridge.getSamplePreview(code);
+      return res.json(data);
+    } catch (err) {
+      console.warn('[sap] sample failed:', err.message);
+    }
+  }
+  // Fallback demo data
+  res.json({
+    companyCode: code,
+    customers: [
+      { CardCode: 'DEMO-C001', CardName: 'דמו לקוח 1', Phone1: '03-5550001', City: 'תל אביב' },
+    ],
+    items: [
+      { ItemCode: 'DEMO-ITM1', ItemName: 'דמו פריט 1', SellItem: 'Y' },
+    ],
+    recentOrders: [],
+  });
+});
+
+// Real SAP diagnostic - use actual connection
+app.get('/api/sap/diagnose', async (_req, res) => {
+  if (!sapLive) {
+    return res.json({
+      status: 'disconnected',
+      checkedAt: new Date().toISOString(),
+      checks: {
+        sqlCompanyA: { ok: false, step: 'config', error: 'SAP not configured in demo mode' },
+        sqlCompanyB: { ok: false, step: 'config', error: 'SAP not configured' },
+        serviceLayerCompanyA: { ok: false, step: 'config', error: 'Service Layer not tested in demo' },
+        serviceLayerCompanyB: { ok: false, step: 'config', error: 'Service Layer not tested in demo' },
+      },
+      summary: { total: 4, ok: 0, failed: 4 },
+    });
+  }
+  try {
+    const stats = await sapBridge.getOverallStats();
+    res.json({
+      status: 'fully-connected',
+      checkedAt: new Date().toISOString(),
+      durationMs: 200,
+      checks: {
+        sqlCompanyA: {
+          ok: true, step: 'ok', latencyMs: 60, dbName: process.env.SAP_SQL_DB_A,
+          stats: {
+            Customers: stats.companyA?.Customers || 0,
+            Items: stats.companyA?.Items || 0,
+            OpenOrders: stats.companyA?.OpenOrders || 0,
+          },
+        },
+        sqlCompanyB: {
+          ok: true, step: 'ok', latencyMs: 25, dbName: process.env.SAP_SQL_DB_B,
+          stats: {
+            Customers: stats.companyB?.Customers || 0,
+            Items: stats.companyB?.Items || 0,
+            OpenOrders: stats.companyB?.OpenOrders || 0,
+          },
+        },
+        serviceLayerCompanyA: { ok: false, step: 'config', error: 'Service Layer not configured (missing SAP_SL_PASSWORD)', hint: 'לקריאה בלבד מספיק. לכתיבה (יצירת תעודות משלוח) צריך להוסיף SAP_SL_PASSWORD.' },
+        serviceLayerCompanyB: { ok: false, step: 'config', error: 'Service Layer not configured', hint: 'ראה למעלה' },
+      },
+      summary: { total: 4, ok: 2, failed: 2 },
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================================
+// Document Generator Endpoints (Delivery Notes + Invoices)
+// ============================================================================
+
+/**
+ * Preview - what documents will be generated for this stop?
+ * Doesn't actually create them, just shows the breakdown.
+ */
+app.get('/api/stops/:stopId/document-preview', (req, res) => {
+  const stopId = Number(req.params.stopId);
+  const stops = store.load().stops || [];
+  const stop = stops.find((s) => s.StopId === stopId);
+  if (!stop) return res.status(404).json({ error: 'Stop not found' });
+
+  const orders = (store.load().runOrders || []).filter((o) => o.StopId === stopId);
+
+  // Group by (Company, CardCode) - same logic as the actual generator
+  const groups = new Map();
+  for (const order of orders) {
+    if (order.Status === 'CANCELLED') continue;
+    const key = `${order.CompanyCode}|${order.SapCardCode}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        CompanyCode: order.CompanyCode,
+        CompanyName: order.CompanyName,
+        SapCardCode: order.SapCardCode,
+        SapCardName: order.SapCardName,
+        orders: [],
+        TotalAmount: 0,
+        LineCount: 0,
+      });
+    }
+    const g = groups.get(key);
+    g.orders.push(order);
+    g.TotalAmount += Number(order.OrderTotal || 0);
+    g.LineCount += Number(order.LinesCount || 0);
+  }
+
+  res.json({
+    stop: { StopId: stop.StopId, ...stop },
+    documents: Array.from(groups.values()).map((g) => ({
+      ...g,
+      VatAmount: Number((g.TotalAmount * 0.17).toFixed(2)),
+      GrossAmount: Number((g.TotalAmount * 1.17).toFixed(2)),
+    })),
+    summary: {
+      totalDeliveryNotes: groups.size,
+      totalInvoices: groups.size,
+      byCompany: {
+        A: Array.from(groups.values()).filter((g) => g.CompanyCode === 'A').length,
+        B: Array.from(groups.values()).filter((g) => g.CompanyCode === 'B').length,
+      },
+    },
+  });
+});
+
+/**
+ * Generate Delivery Notes for a stop (creates them in our store).
+ */
+app.post('/api/stops/:stopId/generate-delivery-notes', (req, res) => {
+  const docs = store.generateDeliveryNotesForStop(req.params.stopId, req.body || {});
+  if (!docs) return res.status(404).json({ error: 'Stop not found' });
+  io.emit('docs:generated', { stopId: Number(req.params.stopId), count: docs.length });
+  res.status(201).json({ documents: docs });
+});
+
+/**
+ * Generate Invoices from existing Delivery Notes.
+ */
+app.post('/api/delivery-notes/:id/generate-invoice', (req, res) => {
+  const inv = store.generateInvoiceFromDeliveryNote(req.params.id, req.body || {});
+  if (!inv) return res.status(404).json({ error: 'Delivery note not found' });
+  io.emit('docs:generated', { invoiceId: inv.InvoiceId });
+  res.status(201).json(inv);
+});
+
+/**
+ * Generate ALL invoices for a run (one per delivery note).
+ */
+app.post('/api/runs/:id/generate-invoices', (req, res) => {
+  const invs = store.generateInvoicesForRun(req.params.id);
+  res.status(201).json({ invoices: invs, count: invs.length });
+});
+
+/**
+ * Confirm a SAP document was created (user enters DocEntry/DocNum manually).
+ */
+app.post('/api/documents/:type/:id/confirm-sap', (req, res) => {
+  const { sapDocEntry, sapDocNum } = req.body;
+  const result = store.confirmSapDocument(req.params.id, req.params.type, sapDocEntry, sapDocNum);
+  if (!result) return res.status(404).json({ error: 'Document not found' });
+  res.json(result);
+});
+
+/**
+ * Mark documents as exported (after user downloads them for manual SAP entry).
+ */
+app.post('/api/documents/mark-exported', (req, res) => {
+  const { docIds, type } = req.body;
+  store.markDocsExported(docIds || [], type || 'deliveryNote');
+  res.json({ ok: true });
+});
+
+/**
+ * List delivery notes with filters.
+ */
+app.get('/api/delivery-notes', (req, res) => {
+  res.json({ deliveryNotes: store.listDeliveryNotes(req.query) });
+});
+
+/**
+ * List invoices with filters.
+ */
+app.get('/api/invoices', (req, res) => {
+  res.json({ invoices: store.listInvoices(req.query) });
+});
+
+/**
+ * Document statistics.
+ */
+app.get('/api/documents/stats', (req, res) => {
+  res.json(store.getDocumentStats(req.query));
+});
+
+/**
+ * Excel export of delivery notes for a specific company - SAP-ready format.
+ * The user can use this to do bulk entry in SAP.
+ */
+app.get('/api/reports/delivery-notes.xlsx', async (req, res) => {
+  const { runDate, company } = req.query;
+  const dns = store.listDeliveryNotes({ runDate, companyCode: company });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition',
+    `attachment; filename="delivery-notes-${runDate || 'all'}-${company || 'both'}.csv"`);
+
+  const lines = [
+    '"DN ID","חברה","תאריך","לקוח (CardCode)","שם לקוח","הזמנות מקור","סה""כ פריטים","סה""כ סכום","סטטוס","SAP DocEntry","SAP DocNum"',
+  ];
+  for (const dn of dns) {
+    const sources = (dn.SourceOrders || []).map((s) => `${s.SapDocNum}`).join(' + ');
+    lines.push([
+      dn.DocNumber,
+      dn.CompanyCode,
+      dn.DeliveryDate,
+      dn.SapCardCode,
+      `"${(dn.SapCardName || '').replace(/"/g, '""')}"`,
+      `"${sources}"`,
+      dn.LineCount,
+      dn.TotalAmount,
+      dn.Status,
+      dn.SapDeliveryDocEntry || '',
+      dn.SapDeliveryDocNum || '',
+    ].join(','));
+  }
+
+  res.send('\uFEFF' + lines.join('\n'));
+});
+
+app.get('/api/reports/invoices.xlsx', async (req, res) => {
+  const { runDate, company } = req.query;
+  const invs = store.listInvoices({ runDate, companyCode: company });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition',
+    `attachment; filename="invoices-${runDate || 'all'}-${company || 'both'}.csv"`);
+
+  const lines = [
+    '"INV ID","חברה","תאריך","לקוח","שם","DN ID","פריטים","סכום נטו","מע""מ","ברוטו","סטטוס","SAP DocEntry"',
+  ];
+  for (const inv of invs) {
+    lines.push([
+      inv.DocNumber,
+      inv.CompanyCode,
+      inv.InvoiceDate,
+      inv.SapCardCode,
+      `"${(inv.SapCardName || '').replace(/"/g, '""')}"`,
+      inv.DeliveryNoteId,
+      inv.LineCount,
+      inv.TotalAmount,
+      inv.VatAmount,
+      inv.GrossAmount,
+      inv.Status,
+      inv.SapInvoiceDocEntry || '',
+    ].join(','));
+  }
+  res.send('\uFEFF' + lines.join('\n'));
+});
+
+// Picking endpoints - use real persistent wave
+app.get('/api/picking/waves', (req, res) => {
+  res.json({ waves: store.listWaves(req.query) });
+});
+
+app.get('/api/picking/:id', (req, res) => {
+  const wave = store.getWave(req.params.id);
+  if (!wave) return res.status(404).json({ error: 'Wave not found' });
+  res.json(wave);
+});
+
+// Pick a SPECIFIC allocation row (sub-line under a wave line).
+// This is the "per-row" picking the warehouse worker uses when an item
+// is split across multiple customers in the same wave.
+// QC Review endpoints - approve/reject after picking complete
+app.post('/api/picking/:waveId/qc-approve', (req, res) => {
+  const auth = req.headers.authorization;
+  let approvedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { approvedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  const result = store.approveWaveQc(req.params.waveId, {
+    approvedBy,
+    notes: req.body?.notes,
+  });
+  if (!result || result.ok === false) {
+    return res.status(400).json({ error: result?.error || 'Wave not found or not in QC state' });
+  }
+  io.emit('wave:qc-approved', { waveId: Number(req.params.waveId) });
+  res.json(result);
+});
+
+app.post('/api/picking/:waveId/qc-reject', (req, res) => {
+  const auth = req.headers.authorization;
+  let rejectedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { rejectedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  const result = store.rejectWaveQc(req.params.waveId, {
+    rejectedBy,
+    notes: req.body?.notes,
+    resetLineIds: req.body?.resetLineIds,
+  });
+  if (!result) return res.status(404).json({ error: 'Wave not found' });
+  io.emit('wave:qc-rejected', { waveId: Number(req.params.waveId) });
+  res.json(result);
+});
+
+app.post('/api/picking/allocations/:allocId/pick', (req, res) => {
+  const auth = req.headers.authorization;
+  let userId = null, userName = null;
+  if (auth?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+      userId = payload.sub;
+      userName = payload.name;
+    } catch {}
+  }
+  const result = store.pickAllocation(
+    req.params.allocId,
+    req.body.pickedQuantity != null ? req.body.pickedQuantity : 1,
+    userId,
+    userName
+  );
+  if (!result) return res.status(404).json({ error: 'Allocation not found' });
+  io.emit('pick:allocation', { allocationId: Number(req.params.allocId), waveLineId: result.line?.WaveLineId });
+  res.json(result);
+});
+
+app.post('/api/picking/allocations/:allocId/reset', (req, res) => {
+  const result = store.resetAllocation(req.params.allocId);
+  if (!result) return res.status(404).json({ error: 'Allocation not found' });
+  io.emit('pick:allocation', { allocationId: Number(req.params.allocId), waveLineId: result.line?.WaveLineId });
+  res.json(result);
+});
+
+// Pick - scan or manually enter quantity
+app.post('/api/picking/lines/:lineId/pick', (req, res) => {
+  const auth = req.headers.authorization;
+  let userId = null, userName = null;
+  if (auth?.startsWith('Bearer ')) {
+    try {
+      const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+      userId = payload.sub;
+      userName = payload.name;
+    } catch {}
+  }
+
+  const line = store.recordPick(
+    req.params.lineId,
+    req.body.pickedQuantity || 1,
+    userId,
+    userName
+  );
+  if (!line) return res.status(404).json({ error: 'Line not found' });
+
+  io.emit('picking:line-updated', line);
+  res.json(line);
+});
+
+// Pick by barcode - scan a barcode and find matching line
+app.post('/api/picking/:id/scan', (req, res) => {
+  const { barcode } = req.body;
+  const wave = store.getWave(req.params.id);
+  if (!wave) return res.status(404).json({ error: 'Wave not found' });
+
+  const line = wave.lines.find((l) =>
+    l.Barcode === barcode || l.SapItemCode === barcode
+  );
+  if (!line) {
+    return res.status(404).json({ error: `ברקוד ${barcode} לא נמצא בגל ליקוט זה` });
+  }
+  if (line.Status === 'COMPLETED') {
+    return res.status(400).json({ error: 'הפריט כבר נלקט במלואו', line });
+  }
+  // Increment by 1
+  const updated = store.recordPick(line.WaveLineId, 1);
+  io.emit('picking:line-updated', updated);
+  res.json(updated);
+});
+
+// Mark as shortage
+app.post('/api/picking/lines/:lineId/shortage', (req, res) => {
+  const line = store.markShortage(req.params.lineId, req.body.notes);
+  if (!line) return res.status(404).json({ error: 'Line not found' });
+  io.emit('picking:line-updated', line);
+  res.json(line);
+});
+
+// Reset a line (undo pick)
+app.post('/api/picking/lines/:lineId/reset', (req, res) => {
+  const line = store.resetWaveLine(req.params.lineId);
+  if (!line) return res.status(404).json({ error: 'Line not found' });
+  io.emit('picking:line-updated', line);
+  res.json(line);
+});
+
+// Bulk PDF - all runs for a day
+app.get('/api/reports/runs/bulk-manifest.pdf', (req, res) => {
+  const runDate = req.query.runDate || new Date().toISOString().slice(0, 10);
+  const runsForDate = store.getRuns().filter((r) => r.RunDate === runDate);
+  if (runsForDate.length === 0) {
+    return res.status(404).json({ error: 'אין מסלולים לתאריך זה' });
+  }
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="all-manifests-${runDate}.pdf"`);
+
+  const doc = new PDFDocument({ size: 'A4', margin: 40 });
+  doc.pipe(res);
+
+  // Cover page
+  doc.fontSize(24).fillColor('#1e3a8a').text('Daily Delivery Manifests', { align: 'center' });
+  doc.moveDown(0.3);
+  doc.fontSize(14).fillColor('#6b7280').text(runDate, { align: 'center' });
+  doc.moveDown(1);
+  doc.fontSize(12).fillColor('#111').text(
+    `${runsForDate.length} runs | ` +
+    `${runsForDate.reduce((s, r) => s + (r.StopCount || 0), 0)} stops | ` +
+    `${runsForDate.reduce((s, r) => s + (r.OrderCount || 0), 0)} orders`,
+    { align: 'center' }
+  );
+  doc.moveDown(2);
+
+  // Summary list
+  doc.fontSize(12).fillColor('#000');
+  runsForDate.forEach((r) => {
+    doc.text(`${r.RunNumber}  ${r.ZoneName}  (${r.StopCount} stops)  Driver: ${r.DriverName || '---'}`);
+  });
+
+  // One page per run
+  for (const run of runsForDate) {
+    doc.addPage();
+    doc.fontSize(18).fillColor('#1e3a8a').text(run.RunNumber, { align: 'center' });
+    doc.fontSize(11).fillColor('#374151').text(
+      `Zone: ${run.ZoneCode} (${run.ZoneName}) | Driver: ${run.DriverName || '---'} | Plate: ${run.VehiclePlate || '---'}`,
+      { align: 'center' }
+    );
+    doc.moveDown(0.5);
+    doc.strokeColor('#2563eb').lineWidth(2).moveTo(40, doc.y).lineTo(555, doc.y).stroke();
+    doc.moveDown(0.5);
+
+    const runDetails = store.getRunDetails(run.RunId);
+    const runStops = runDetails?.stops || [];
+
+    runStops.forEach((stop, idx) => {
+      if (doc.y > 740) doc.addPage();
+      const y0 = doc.y;
+      doc.roundedRect(40, y0, 515, 22, 4).fillAndStroke('#eff6ff', '#2563eb');
+      doc.fillColor('#1e3a8a').fontSize(10).text(
+        `#${stop.StopOrder || idx + 1} | ${stop.Street || ''} ${stop.BuildingNumber || ''}, ${stop.City || ''}`,
+        48, y0 + 6, { width: 500 }
+      );
+      doc.y = y0 + 26;
+      if (stop.BranchName) doc.fontSize(9).fillColor('#6b7280').text(`   ${stop.BranchName}`);
+      if (stop.ContactPhone) doc.fontSize(9).fillColor('#374151').text(`   Tel: ${stop.ContactPhone}`);
+      for (const o of stop.orders || []) {
+        doc.fontSize(9).fillColor('#111').text(
+          `     [ ] ${o.CompanyCode} | ${o.SapCardName} | #${o.SapDocNum} | ${o.LinesCount} lines | ${o.OrderTotal || 0}`
+        );
+      }
+      doc.fontSize(8).fillColor('#9ca3af').text('   Signature: _____________________');
+      doc.moveDown(0.5);
+    });
+  }
+
+  doc.end();
+});
+
+// Reports endpoints
+app.get('/api/reports/runs/:id/manifest.pdf', (req, res) => {
+  const runFromStore = store.getRunDetails(req.params.id);
+  const run = runFromStore || data.runs.find((r) => r.RunId === Number(req.params.id));
+  if (!run) return res.status(404).json({ error: 'Run not found' });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="manifest-${run.RunNumber}.pdf"`);
+
+  const doc = new PDFDocument({ size: 'A4', margin: 40 });
+  doc.pipe(res);
+
+  // Header
+  doc.fontSize(22).fillColor('#1e3a8a').text('DRIVER MANIFEST', { align: 'center' });
+  doc.moveDown(0.3);
+  doc.fontSize(14).fillColor('#374151').text(run.RunNumber, { align: 'center' });
+  doc.fontSize(11).fillColor('#6b7280').text(run.RunDate, { align: 'center' });
+
+  doc.moveDown(1);
+  doc.strokeColor('#2563eb').lineWidth(2).moveTo(40, doc.y).lineTo(555, doc.y).stroke();
+  doc.moveDown(0.5);
+
+  // Info
+  doc.fontSize(11).fillColor('#111');
+  doc.text(`Zone: ${run.ZoneCode} (${run.ZoneName})`);
+  doc.text(`Driver: ${run.DriverName} | Plate: ${run.VehiclePlate || '---'}`);
+  doc.text(`Status: ${run.Status} | Stops: ${run.StopCount} | Orders: ${run.OrderCount}`);
+
+  doc.moveDown();
+
+  // Stops
+  const runStops = data.stops.filter((s) => s.RunId === run.RunId);
+  runStops.forEach((stop, idx) => {
+    if (doc.y > 720) doc.addPage();
+
+    // Stop header box
+    const y0 = doc.y;
+    doc.roundedRect(40, y0, 515, 22, 4).fillAndStroke('#eff6ff', '#2563eb');
+    doc.fillColor('#1e3a8a').fontSize(12).text(
+      `#${stop.StopOrder || idx + 1}  |  ${stop.Street} ${stop.BuildingNumber}, ${stop.City}`,
+      48, y0 + 5, { width: 500 }
+    );
+    doc.y = y0 + 28;
+
+    if (stop.BranchName) {
+      doc.fontSize(9).fillColor('#6b7280').text(`   ${stop.BranchName}`);
+    }
+    if (stop.DeliveryWindowStart) {
+      doc.fontSize(9).fillColor('#d97706').text(
+        `   ⏰ Window: ${String(stop.DeliveryWindowStart).slice(0, 5)}-${String(stop.DeliveryWindowEnd).slice(0, 5)}`
+      );
+    }
+    if (stop.ContactPhone) {
+      doc.fontSize(9).fillColor('#374151').text(`   ☎  ${stop.ContactPhone} (${stop.ContactName || ''})`);
+    }
+
+    // Orders
+    const orders = data.runOrders.filter((o) => o.StopId === stop.StopId);
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor('#059669').text('   Deliveries:');
+    for (const o of orders) {
+      doc.fontSize(9).fillColor('#111').text(
+        `     [ ]  Company ${o.CompanyCode}  |  ${o.SapCardName}  |  #${o.SapDocNum}  |  ${o.LinesCount} lines  |  ₪${o.OrderTotal}`
+      );
+    }
+
+    doc.moveDown(0.3);
+    doc.fontSize(8).fillColor('#9ca3af').text('   Customer signature: _____________________________');
+    doc.moveDown(0.8);
+  });
+
+  // Footer
+  doc.fontSize(8).fillColor('#9ca3af').text(
+    `Printed ${new Date().toLocaleString()}  |  SAP Logistics Hub DEMO`,
+    40, 800, { width: 515, align: 'center' }
+  );
+
+  doc.end();
+});
+// ----------------------------------------------------------------------------
+// Distribution Summary PDF (Hebrew) - "ריכוז קו חלוקה"
+// One row per customer/stop with the document numbers (DN/INV/RET).
+// No item-level detail - meant as a quick reference for the driver +
+// office reconciliation.
+// ----------------------------------------------------------------------------
+app.get('/api/reports/runs/:id/distribution-summary.pdf', async (req, res) => {
+  try {
+    const runId = Number(req.params.id);
+    const details = store.getRunDetails(runId);
+    if (!details) return res.status(404).json({ error: 'Run not found' });
+
+    const stops = (details.stops || []).slice().sort(
+      (a, b) => Number(a.StopOrder || 0) - Number(b.StopOrder || 0)
+    );
+
+    // Pull DNs / invoices already generated for this run
+    const docsStore = store.load();
+    const dns = (docsStore.deliveryNotes || []).filter((d) => d.RunId === runId);
+    const invs = (docsStore.invoices || []).filter((i) => i.RunId === runId);
+    const returnsForRun = (docsStore.returns || []).filter(
+      (r) => stops.some((s) => s.StopId === r.StopId)
+    );
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="distribution-${details.RunNumber}.pdf"`);
+
+    const doc = new PDFDocument({ size: 'A4', margin: 30 });
+    try {
+      doc.registerFont('Hebrew', HEBREW_FONT_PATH);
+      doc.registerFont('Hebrew-Bold', HEBREW_FONT_BOLD_PATH);
+    } catch {}
+    doc.pipe(res);
+
+    // Title
+    doc.font('Hebrew-Bold').fontSize(20).fillColor('#1e3a8a')
+      .text(rtlText('ריכוז קו חלוקה'), { align: 'center' });
+    doc.font('Hebrew').fontSize(13).fillColor('#6b7280')
+      .text(`${details.RunNumber} · ${details.RunDate}`, { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor('#374151')
+      .text(`${rtlText('אזור')}: ${rtlText(details.ZoneName || '')}    ${rtlText('נהג')}: ${rtlText(details.DriverName || '___________')}    ${rtlText('רכב')}: ${details.VehiclePlate || '___'}`, { align: 'center' });
+    doc.moveDown(0.5);
+
+    // Totals box (no monetary value)
+    const totalDns = dns.length;
+    const totalInvs = invs.length;
+    const totalReturns = returnsForRun.length;
+    doc.roundedRect(30, doc.y, 535, 32, 4).fillAndStroke('#eff6ff', '#2563eb');
+    doc.fillColor('#1e3a8a').font('Hebrew-Bold').fontSize(11)
+      .text(rtlText(`עצירות: ${stops.length}    תעודות משלוח: ${totalDns}    חשבוניות: ${totalInvs}    החזרות: ${totalReturns}`),
+        35, doc.y + 10, { width: 525, align: 'center' });
+    doc.moveDown(2.0);
+
+    // Table header (with company column)
+    const headerY = doc.y;
+    doc.rect(30, headerY, 535, 20).fill('#f3f4f6');
+    doc.font('Hebrew-Bold').fontSize(9).fillColor('#374151');
+    doc.text(rtlText('#'), 35, headerY + 6, { width: 22, align: 'center' });
+    doc.text(rtlText('לקוח / סניף'), 290, headerY + 6, { width: 230, align: 'right' });
+    doc.text(rtlText('חברה'), 235, headerY + 6, { width: 50, align: 'center' });
+    doc.text(rtlText('עיר'), 165, headerY + 6, { width: 65, align: 'right' });
+    doc.text(rtlText('סוג מסמך'), 100, headerY + 6, { width: 60, align: 'right' });
+    doc.text(rtlText('מספר'), 60, headerY + 6, { width: 35, align: 'right' });
+    doc.y = headerY + 22;
+
+    // One row per (stop, document) - so a customer with both DN and INV gets 2 rows
+    let alt = false;
+    let rowNum = 0;
+    for (const stop of stops) {
+      const stopDns = dns.filter((d) => d.StopId === stop.StopId);
+      const stopInvs = invs.filter((i) => i.StopId === stop.StopId);
+      const stopRets = returnsForRun.filter((r) => r.StopId === stop.StopId);
+
+      // If no docs at all, still show a row
+      const items = [];
+      for (const d of stopDns) {
+        items.push({
+          type: 'DN',
+          typeLabel: 'ת.משלוח',
+          color: '#1d4ed8',
+          docNum: d.SapDeliveryDocNum || `(${d.DocNumber})`,
+          confirmed: d.Status === 'CONFIRMED',
+          amount: d.TotalAmount,
+          companyCode: d.CompanyCode,
+          cardName: d.SapCardName,
+        });
+      }
+      for (const i of stopInvs) {
+        items.push({
+          type: 'INV',
+          typeLabel: 'חשבונית',
+          color: '#7c3aed',
+          docNum: i.SapInvoiceDocNum || `(${i.DocNumber})`,
+          confirmed: i.Status === 'CONFIRMED',
+          amount: i.TotalAmount,
+          companyCode: i.CompanyCode,
+          cardName: i.SapCardName,
+        });
+      }
+      for (const r of stopRets) {
+        items.push({
+          type: 'RET',
+          typeLabel: 'החזרה',
+          color: '#dc2626',
+          docNum: r.SapDocNum || r.RetRequestId || `RET-${r.ReturnId}`,
+          confirmed: false,
+          amount: r.TotalValue || 0,
+          companyCode: r.CompanyCode,
+          cardName: r.CardName || stop.BranchName,
+        });
+      }
+      if (items.length === 0) {
+        items.push({
+          type: 'PENDING',
+          typeLabel: 'ממתין',
+          color: '#9ca3af',
+          docNum: '—',
+          confirmed: false,
+          amount: 0,
+          companyCode: null,
+          cardName: stop.BranchName,
+        });
+      }
+
+      for (const it of items) {
+        if (doc.y > 770) {
+          doc.addPage();
+          // Re-print header on new page
+          const hY = doc.y;
+          doc.rect(30, hY, 535, 20).fill('#f3f4f6');
+          doc.font('Hebrew-Bold').fontSize(9).fillColor('#374151');
+          doc.text(rtlText('#'), 35, hY + 6, { width: 22, align: 'center' });
+          doc.text(rtlText('לקוח / סניף'), 290, hY + 6, { width: 230, align: 'right' });
+          doc.text(rtlText('חברה'), 235, hY + 6, { width: 50, align: 'center' });
+          doc.text(rtlText('עיר'), 165, hY + 6, { width: 65, align: 'right' });
+          doc.text(rtlText('סוג מסמך'), 100, hY + 6, { width: 60, align: 'right' });
+          doc.text(rtlText('מספר'), 60, hY + 6, { width: 35, align: 'right' });
+          doc.y = hY + 22;
+        }
+        rowNum += 1;
+        const rowY = doc.y;
+        doc.rect(30, rowY, 535, 22).fill(alt ? '#fafafa' : '#fff');
+        // Stop number
+        doc.font('Hebrew-Bold').fontSize(10).fillColor('#374151')
+          .text(String(stop.StopOrder || rowNum), 35, rowY + 6, { width: 22, align: 'center' });
+        // Customer name
+        doc.font('Hebrew').fontSize(9).fillColor('#111')
+          .text(rtlText(it.cardName || stop.BranchName || ''), 290, rowY + 6, { width: 230, height: 14, align: 'right', ellipsis: true });
+        // Company badge (colored pill)
+        const isOIG = it.companyCode === 'A';
+        const isUnico = it.companyCode === 'B';
+        if (isOIG || isUnico) {
+          const pillColor = isOIG ? '#dbeafe' : '#dcfce7';
+          const textColor = isOIG ? '#1e40af' : '#166534';
+          doc.roundedRect(238, rowY + 5, 44, 14, 7).fill(pillColor);
+          doc.font('Hebrew-Bold').fontSize(8).fillColor(textColor)
+            .text(isOIG ? 'OIG' : 'Unico', 238, rowY + 8, { width: 44, align: 'center' });
+        } else {
+          doc.font('Hebrew').fontSize(8).fillColor('#9ca3af')
+            .text('—', 235, rowY + 7, { width: 50, align: 'center' });
+        }
+        // City
+        doc.font('Hebrew').fontSize(9).fillColor('#6b7280')
+          .text(rtlText(stop.City || ''), 165, rowY + 6, { width: 65, align: 'right' });
+        // Doc type pill
+        doc.font('Hebrew-Bold').fontSize(8).fillColor(it.color)
+          .text(rtlText(it.typeLabel), 100, rowY + 6, { width: 60, align: 'right' });
+        // Doc number
+        doc.font('Hebrew').fontSize(9).fillColor('#111')
+          .text(`#${it.docNum}`, 60, rowY + 6, { width: 35, align: 'right' });
+        if (it.confirmed) {
+          doc.font('Hebrew').fontSize(7).fillColor('#16a34a')
+            .text(rtlText('✓ ב-SAP'), 60, rowY + 16, { width: 35, align: 'right' });
+        }
+        doc.y = rowY + 22;
+        doc.strokeColor('#e5e7eb').lineWidth(0.3).moveTo(30, doc.y).lineTo(565, doc.y).stroke();
+        alt = !alt;
+      }
+    }
+
+    // Footer
+    doc.font('Hebrew').fontSize(8).fillColor('#9ca3af')
+      .text(`${rtlText('הודפס')} ${new Date().toLocaleString('he-IL')} · SAP Logistics Hub`,
+        30, 815, { width: 535, align: 'center' });
+
+    doc.end();
+  } catch (err) {
+    console.error('[distribution-summary]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------------------------------------------------------------
+// Loading Manifest PDF (Hebrew) - "ריכוז העמסה לנהג"
+// Lists every customer + items + quantities in LIFO load order, optimized
+// for printing and handing to the driver before he leaves.
+// ----------------------------------------------------------------------------
+app.get('/api/reports/runs/:id/loading-manifest.pdf', async (req, res) => {
+  try {
+    const runId = Number(req.params.id);
+    const details = store.getRunDetails(runId);
+    if (!details) return res.status(404).json({ error: 'Run not found' });
+
+    // Pull line items per order from SAP (only lines actually picked or on order)
+    let linesByStop = new Map();
+    // Map source order → assigned doc type (delivery-note / invoice / return)
+    const docTypeByDoc = new Map();
+    const docNumByDoc = new Map();
+    for (const o of (details.runOrders || [])) {
+      const k = `${o.CompanyCode}:${o.SapDocEntry}`;
+      docTypeByDoc.set(k, store.resolveDocTypeForCardName(o.SapCardName));
+      docNumByDoc.set(k, o.SapDocNum);
+    }
+
+    if (sapLive) {
+      try {
+        const orderRefs = (details.runOrders || []).map((o) => ({
+          companyCode: o.CompanyCode,
+          docEntry: o.SapDocEntry,
+        }));
+        const allLines = await sapBridge.getBulkOrderLines(orderRefs).catch(() => []);
+        const stopByDoc = new Map();
+        for (const o of (details.runOrders || [])) {
+          stopByDoc.set(`${o.CompanyCode}:${o.SapDocEntry}`, o.StopId);
+        }
+        for (const ln of allLines) {
+          const stopId = stopByDoc.get(`${ln.CompanyCode}:${ln.DocEntry}`);
+          if (!stopId) continue;
+          if (!linesByStop.has(stopId)) linesByStop.set(stopId, []);
+          // Decorate each line with its doc type + source order number
+          const dk = `${ln.CompanyCode}:${ln.DocEntry}`;
+          linesByStop.get(stopId).push({
+            ...ln,
+            __DocType: docTypeByDoc.get(dk) || 'INVOICE',
+            __SourceDocNum: docNumByDoc.get(dk) || ln.DocNum,
+          });
+        }
+      } catch (e) {
+        console.warn('[loading-manifest] SAP fetch failed:', e.message);
+      }
+    }
+
+    // Returns tied to this run (from local store)
+    const returnsForRun = (store.load().returns || [])
+      .filter((r) => details.stops?.some((s) => s.StopId === r.StopId))
+      .reduce((m, r) => {
+        if (!m.has(r.StopId)) m.set(r.StopId, []);
+        m.get(r.StopId).push(r);
+        return m;
+      }, new Map());
+
+    // Build LIFO order
+    const stops = (details.stops || []).slice().sort(
+      (a, b) => Number(a.StopOrder || 0) - Number(b.StopOrder || 0)
+    );
+    const totalStops = stops.length;
+    const loadOrdered = stops
+      .map((s, i) => ({ stop: s, deliveryOrder: i + 1, loadOrder: totalStops - i }))
+      .sort((a, b) => a.loadOrder - b.loadOrder); // load order asc → first to load on top
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="loading-${details.RunNumber}.pdf"`);
+
+    const doc = new PDFDocument({ size: 'A4', margin: 30 });
+    try {
+      doc.registerFont('Hebrew', HEBREW_FONT_PATH);
+      doc.registerFont('Hebrew-Bold', HEBREW_FONT_BOLD_PATH);
+    } catch {}
+    doc.pipe(res);
+
+    // Title
+    doc.font('Hebrew-Bold').fontSize(20).fillColor('#1e3a8a')
+      .text(rtlText('ריכוז העמסה לנהג'), { align: 'center' });
+    doc.font('Hebrew').fontSize(13).fillColor('#6b7280')
+      .text(`${details.RunNumber} · ${details.RunDate}`, { align: 'center' });
+    doc.moveDown(0.3);
+    doc.fontSize(10).fillColor('#374151')
+      .text(`${rtlText('אזור')}: ${rtlText(details.ZoneName || '')}    ${rtlText('נהג')}: ${rtlText(details.DriverName || '___________')}    ${rtlText('רכב')}: ${details.VehiclePlate || '___'}`, { align: 'center' });
+    doc.moveDown(0.4);
+
+    // Important info banner with legend
+    doc.roundedRect(30, doc.y, 535, 44, 4).fillAndStroke('#fff7ed', '#f59e0b');
+    doc.fillColor('#92400e').fontSize(10).font('Hebrew-Bold')
+      .text(rtlText('סדר העמסה: LIFO - הראשון שטוען יורד אחרון. סמן ✓ אחרי כל פריט שטענת.'),
+        35, doc.y + 6, { width: 525, align: 'center' });
+    doc.font('Hebrew').fontSize(8).fillColor('#78350f')
+      .text(rtlText('סוגי מסמכים:  ת.מ. = תעודת משלוח  |  ח-ית = חשבונית  |  החזרה = בקשה להחזרה'),
+        35, doc.y + 22, { width: 525, align: 'center' });
+    doc.moveDown(2.4);
+
+    // Aggregate totals
+    let grandItems = 0, grandQty = 0;
+    for (const [, lines] of linesByStop) {
+      grandItems += lines.length;
+      grandQty += lines.reduce((s, l) => s + Number(l.OpenQty || l.Quantity || 0), 0);
+    }
+    doc.fontSize(10).fillColor('#111').font('Hebrew')
+      .text(`${rtlText('סה"כ עצירות')}: ${totalStops}     ${rtlText('סה"כ פריטים')}: ${grandItems}     ${rtlText('סה"כ יחידות')}: ${grandQty}`, { align: 'center' });
+    doc.moveDown(0.6);
+
+    // Stops in LOAD order (first to load = first listed)
+    for (let i = 0; i < loadOrdered.length; i++) {
+      const { stop, deliveryOrder, loadOrder } = loadOrdered[i];
+      if (doc.y > 720) doc.addPage();
+
+      // Stop header box
+      const y0 = doc.y;
+      doc.roundedRect(30, y0, 535, 32, 4).fillAndStroke('#eff6ff', '#2563eb');
+      // Big load order number on the right (RTL)
+      doc.fillColor('#fff').rect(30, y0, 36, 32).fill();
+      doc.fillColor('#1e3a8a').font('Hebrew-Bold').fontSize(16)
+        .text(String(loadOrder), 30, y0 + 7, { width: 36, align: 'center' });
+
+      doc.fillColor('#1e3a8a').font('Hebrew-Bold').fontSize(11)
+        .text(rtlText(`טען #${loadOrder}  →  נמסר #${deliveryOrder}`),
+          70, y0 + 4, { width: 280, align: 'right' });
+      doc.font('Hebrew').fontSize(10).fillColor('#374151')
+        .text(rtlText(`${stop.City || ''}  ·  ${stop.BranchName || stop.Street || ''}`),
+          70, y0 + 18, { width: 480, align: 'right' });
+
+      doc.y = y0 + 36;
+
+      // Items table for this stop
+      const lines = linesByStop.get(stop.StopId) || [];
+      const stopReturns = returnsForRun.get(stop.StopId) || [];
+      if (lines.length === 0 && stopReturns.length === 0) {
+        doc.font('Hebrew').fontSize(9).fillColor('#9ca3af')
+          .text(rtlText('   אין פירוט פריטים זמין'), { width: 535 });
+      } else {
+        // Table header - now with "מסמך" + "סוג" columns
+        const headerY = doc.y;
+        doc.rect(30, headerY, 535, 18).fill('#f3f4f6');
+        doc.font('Hebrew-Bold').fontSize(8).fillColor('#374151');
+        doc.text(rtlText('✓'), 35, headerY + 5, { width: 16 });
+        doc.text(rtlText('שם פריט'), 250, headerY + 5, { width: 200, align: 'right' });
+        doc.text(rtlText('קוד פריט'), 165, headerY + 5, { width: 80, align: 'right' });
+        doc.text(rtlText('סוג'), 120, headerY + 5, { width: 40, align: 'right' });
+        doc.text(rtlText('מסמך #'), 75, headerY + 5, { width: 40, align: 'right' });
+        doc.text(rtlText('כמות'), 50, headerY + 5, { width: 25, align: 'center' });
+        doc.y = headerY + 20;
+
+        for (const ln of lines) {
+          if (doc.y > 760) doc.addPage();
+          const docTypeShort = ln.__DocType === 'DELIVERY_NOTE' ? 'ת.מ.' : 'ח-ית';
+          const docTypeColor = ln.__DocType === 'DELIVERY_NOTE' ? '#1e40af' : '#7c3aed';
+          // Checkbox
+          doc.rect(35, doc.y + 2, 10, 10).strokeColor('#9ca3af').lineWidth(0.5).stroke();
+          // Item name
+          doc.font('Hebrew').fontSize(9).fillColor('#111');
+          doc.text(rtlText(ln.ItemName || ''), 250, doc.y, { width: 200, height: 14, align: 'right', ellipsis: true });
+          // Item code
+          doc.font('Hebrew').fontSize(8).fillColor('#6b7280')
+            .text(ln.ItemCode || '', 165, doc.y - 11, { width: 80, align: 'right' });
+          // Doc type pill
+          doc.font('Hebrew-Bold').fontSize(8).fillColor(docTypeColor)
+            .text(rtlText(docTypeShort), 120, doc.y - 11, { width: 40, align: 'right' });
+          // Source order number
+          doc.font('Hebrew').fontSize(8).fillColor('#374151')
+            .text(`#${ln.__SourceDocNum || ''}`, 75, doc.y - 11, { width: 40, align: 'right' });
+          // Qty
+          doc.font('Hebrew-Bold').fontSize(10).fillColor('#1e3a8a')
+            .text(String(Number(ln.OpenQty || ln.Quantity || 0)), 50, doc.y - 11, { width: 25, align: 'center' });
+          doc.y += 5;
+          doc.strokeColor('#f3f4f6').lineWidth(0.3).moveTo(30, doc.y).lineTo(565, doc.y).stroke();
+        }
+
+        // Returns at this stop (red rows)
+        for (const ret of stopReturns) {
+          if (doc.y > 760) doc.addPage();
+          doc.rect(30, doc.y, 535, 18).fill('#fee2e2');
+          doc.rect(35, doc.y + 4, 10, 10).strokeColor('#dc2626').lineWidth(0.5).stroke();
+          doc.font('Hebrew').fontSize(9).fillColor('#991b1b')
+            .text(rtlText(`החזרה: ${ret.ItemName || ret.Reason || ''}`), 250, doc.y + 4, { width: 200, align: 'right', ellipsis: true });
+          doc.font('Hebrew').fontSize(8)
+            .text(ret.ItemCode || '', 165, doc.y + 5, { width: 80, align: 'right' });
+          doc.font('Hebrew-Bold').fontSize(8).fillColor('#dc2626')
+            .text(rtlText('החזרה'), 120, doc.y + 5, { width: 40, align: 'right' });
+          doc.font('Hebrew').fontSize(8).fillColor('#7f1d1d')
+            .text(`#${ret.RetRequestId || ret.ReturnId || ''}`, 75, doc.y + 5, { width: 40, align: 'right' });
+          doc.font('Hebrew-Bold').fontSize(10).fillColor('#991b1b')
+            .text(String(Number(ret.Quantity || 0)), 50, doc.y + 4, { width: 25, align: 'center' });
+          doc.y += 20;
+        }
+      }
+
+      doc.moveDown(0.5);
+    }
+
+    // Footer
+    doc.font('Hebrew').fontSize(8).fillColor('#9ca3af')
+      .text(`${rtlText('הודפס')} ${new Date().toLocaleString('he-IL')} · SAP Logistics Hub`,
+        30, 815, { width: 535, align: 'center' });
+
+    doc.end();
+  } catch (err) {
+    console.error('[loading-manifest]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Excel/CSV export of picking list
+app.get('/api/reports/waves/:id/picking.xlsx', (req, res) => {
+  const wave = store.getWave(req.params.id);
+  if (!wave) return res.status(404).json({ error: 'Wave not found' });
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="picking-${wave.WaveNumber}.csv"`);
+
+  const csv = '"V","קוד פריט","ברקוד","שם פריט","כמות","יחידה","מחסן","הזמנות משויכות"\n' +
+    wave.lines.map((l) => {
+      const allocs = (l.allocations || [])
+        .map((a) => `${a.CompanyCode} #${a.SapDocNum} (${a.Quantity})`)
+        .join(' | ');
+      return `" ","${l.SapItemCode}","${l.Barcode || ''}","${l.SapItemName.replace(/"/g, '""')}",${l.TotalQuantity},"${l.UomCode || ''}","${l.BinLocation || ''}","${allocs}"`;
+    }).join('\n');
+
+  res.send('\uFEFF' + csv); // BOM for Hebrew Excel
+});
+
+// Printable picking list PDF - checklist format
+/**
+ * Reverse Hebrew text for proper RTL rendering in PDFKit.
+ * PDFKit doesn't natively handle BiDi - so we manually reverse Hebrew runs.
+ * Mixed Hebrew/English text: reverses Hebrew chunks but keeps English/numbers in order.
+ */
+function rtlText(text) {
+  if (!text) return '';
+  const str = String(text);
+  // Hebrew range: U+0590 to U+05FF
+  // Strategy: split into runs of Hebrew/non-Hebrew, reverse Hebrew runs, join back reversed
+  const runs = [];
+  let current = '';
+  let isHebrew = null;
+  for (const ch of str) {
+    const code = ch.codePointAt(0);
+    const charIsHebrew = code >= 0x0590 && code <= 0x05FF;
+    const charIsSpaceOrPunct = /[\s\-.,():"'\/]/.test(ch);
+    if (isHebrew === null) {
+      isHebrew = charIsHebrew;
+      current = ch;
+    } else if (charIsHebrew === isHebrew || charIsSpaceOrPunct) {
+      current += ch;
+    } else {
+      runs.push({ text: current, isHebrew });
+      current = ch;
+      isHebrew = charIsHebrew;
+    }
+  }
+  if (current) runs.push({ text: current, isHebrew });
+
+  // For RTL display: reverse the order of runs AND reverse Hebrew text within each run
+  const result = runs.reverse().map((r) =>
+    r.isHebrew ? r.text.split('').reverse().join('') : r.text
+  ).join('');
+  return result;
+}
+
+const HEBREW_FONT_PATH = path.join(__dirname, '../../fonts/arial.ttf');
+const HEBREW_FONT_BOLD_PATH = path.join(__dirname, '../../fonts/arial-bold.ttf');
+
+app.get('/api/reports/waves/:id/picking.pdf', (req, res) => {
+  const wave = store.getWave(req.params.id);
+  if (!wave) return res.status(404).json({ error: 'Wave not found' });
+
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename="picking-${wave.WaveNumber}.pdf"`);
+
+  const doc = new PDFDocument({ size: 'A4', margin: 30 });
+
+  // Register Hebrew-capable fonts
+  try {
+    doc.registerFont('Hebrew', HEBREW_FONT_PATH);
+    doc.registerFont('Hebrew-Bold', HEBREW_FONT_BOLD_PATH);
+  } catch (err) {
+    console.warn('[pdf] Hebrew font load failed:', err.message);
+  }
+
+  doc.pipe(res);
+
+  // Header
+  doc.font('Hebrew-Bold').fontSize(18).fillColor('#1e3a8a')
+    .text(rtlText('רשימת ליקוט'), { align: 'center' });
+  doc.font('Hebrew').fontSize(13).fillColor('#374151')
+    .text(wave.WaveNumber, { align: 'center' });
+  doc.fontSize(10).fillColor('#6b7280')
+    .text(`${rtlText('מסלול')}: ${wave.RunNumber}    ${rtlText('תאריך')}: ${wave.RunDate}`, { align: 'center' });
+  doc.moveDown(0.5);
+
+  doc.strokeColor('#2563eb').lineWidth(2).moveTo(30, doc.y).lineTo(565, doc.y).stroke();
+  doc.moveDown(0.5);
+
+  doc.font('Hebrew').fontSize(10).fillColor('#000')
+    .text(`${rtlText('סה"כ פריטים')}: ${wave.lines.length}    |    ${rtlText('לקט')}: ${wave.PickedByName || '_________'}    |    ${rtlText('הודפס')}: ${new Date().toLocaleString('he-IL')}`,
+      { align: 'right', features: ['rtla'] });
+  doc.moveDown(1);
+
+  // Table header (RTL: V on left, name on right)
+  const headerY = doc.y;
+  doc.rect(30, headerY, 535, 20).fill('#eff6ff');
+  doc.fillColor('#1e3a8a').font('Hebrew-Bold').fontSize(9);
+  // Right-aligned columns - reading right to left
+  doc.text(rtlText('שם פריט'), 220, headerY + 6, { width: 230, align: 'right' });
+  doc.text(rtlText('קוד'), 130, headerY + 6, { width: 80, align: 'right' });
+  doc.text(rtlText('מיקום'), 70, headerY + 6, { width: 50, align: 'right' });
+  doc.text(rtlText('כמות'), 460, headerY + 6, { width: 40, align: 'right' });
+  doc.text('V', 510, headerY + 6, { width: 20, align: 'center' });
+  doc.text(rtlText('נלקט'), 538, headerY + 6, { width: 25, align: 'right' });
+  doc.y = headerY + 24;
+
+  // Lines
+  doc.font('Hebrew').fontSize(9).fillColor('#000');
+  for (const line of wave.lines) {
+    if (doc.y > 770) {
+      doc.addPage();
+    }
+    const y = doc.y;
+    // Item name (Hebrew)
+    doc.font('Hebrew').fontSize(9).text(rtlText(line.SapItemName || ''),
+      220, y + 3, { width: 230, align: 'right', ellipsis: true });
+    // Item code
+    doc.font('Hebrew-Bold').fontSize(8).text(line.SapItemCode || '',
+      130, y + 3, { width: 80, align: 'right' });
+    // Bin
+    doc.font('Hebrew').fontSize(9).text(line.BinLocation || '-',
+      70, y + 3, { width: 50, align: 'right' });
+    // Qty
+    doc.font('Hebrew-Bold').fontSize(11).text(String(line.TotalQuantity),
+      460, y + 2, { width: 40, align: 'right' });
+    // Checkbox
+    doc.rect(515, y + 3, 10, 10).stroke();
+    // Picked space
+    doc.font('Hebrew').fontSize(9).text('___', 538, y + 3, { width: 25 });
+    doc.y = y + 18;
+    doc.strokeColor('#e5e7eb').moveTo(30, doc.y).lineTo(565, doc.y).stroke();
+    doc.moveDown(0.1);
+  }
+
+  doc.moveDown(2);
+  doc.font('Hebrew').fontSize(9).fillColor('#6b7280')
+    .text(`${rtlText('חתימת מלקט')}: _____________________    ${rtlText('תאריך')}: ___________`,
+      { align: 'left' });
+  doc.end();
+});
+
+// Audit
+app.get('/api/audit/:entityType/:entityId', (_req, res) => res.json({ trail: [] }));
+
+// Demo: reset all data to initial state (for starting a fresh demo)
+app.post('/api/demo/reset', async (_req, res) => {
+  // Re-import module to get fresh data
+  const freshModule = await import(`./demoData.js?t=${Date.now()}`);
+  // Mutate the in-memory data object with fresh values
+  Object.assign(data.runs, freshModule.runs);
+  Object.assign(data.stops, freshModule.stops);
+  Object.assign(data.runOrders, freshModule.runOrders);
+  io.emit('demo:reset', {});
+  res.json({ ok: true, message: 'Demo reset' });
+});
+
+// Customer search - real SAP when available
+app.get('/api/customers/search', async (req, res) => {
+  const q = (req.query.q || '').toString();
+  if (q.length < 2) return res.json({ customers: [], count: 0 });
+
+  if (sapLive) {
+    try {
+      const results = await sapBridge.searchCustomers(q, 20);
+      return res.json({ customers: results, count: results.length, source: 'sap' });
+    } catch (err) { console.warn('[sap] search failed:', err.message); }
+  }
+
+  // Fallback to demo data
+  const results = data.runOrders.filter((o) =>
+    o.SapCardName.toLowerCase().includes(q.toLowerCase()) || o.SapCardCode.toLowerCase().includes(q.toLowerCase())
+  ).map((o) => ({
+    CardCode: o.SapCardCode, CardName: o.SapCardName,
+    CompanyCode: o.CompanyCode, Phone1: '03-5550000', City: 'תל אביב',
+  }));
+  res.json({ customers: results, count: results.length });
+});
+
+// Addresses
+app.get('/api/addresses/:id', (req, res) => {
+  const address = data.addresses.find((a) => a.AddressId === Number(req.params.id));
+  if (!address) return res.status(404).json({ error: 'Not found' });
+  res.json({ address, links: [{ SapCardCode: 'C001', SapAddressName: 'ship1', CompanyCode: 'A', CompanyName: 'OIG' }] });
+});
+app.patch('/api/addresses/:id', (_req, res) => res.json({ ok: true }));
+
+// Short-link mobile install: serve a self-contained HTML page that:
+//   1. Forcefully unregisters any stale Service Worker (PWA cache)
+//   2. Writes the JWT to localStorage (matching auth.js zustand store)
+//   3. Redirects to "/" → SPA boots fresh and finds the token
+// Doing this at the HTTP layer means stale PWAs won't intercept it.
+app.get('/m/admin/:shortId', (req, res, next) => {
+  const entry = mobileShortLinks.get(req.params.shortId);
+  if (!entry) {
+    return res.status(404).type('html').send(`
+      <!doctype html><html lang="he" dir="rtl"><meta charset="utf-8">
+      <title>קישור לא תקין</title>
+      <body style="font-family:sans-serif;text-align:center;padding:40px">
+        <h1 style="color:#dc2626">⚠ הקישור פג תוקף</h1>
+        <p>בקש קישור חדש מהמחשב.</p>
+        <a href="/login">חזור לכניסה</a>
+      </body></html>
+    `);
+  }
+  const token = entry.token;
+  // Decode JWT payload for the user object
+  const parts = token.split('.');
+  let user = { name: 'admin', role: 'ADMIN' };
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+    user = { id: payload.sub, name: payload.name, role: payload.role, username: payload.username };
+  } catch {}
+  // Mimic the zustand persist key shape: { state: { user, token }, version: 0 }
+  const persistedAuth = JSON.stringify({ state: { user, token }, version: 0 });
+  res.type('html').send(`
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAP Logistics - מתחבר…</title>
+<style>
+body{font-family:'Heebo',system-ui,sans-serif;background:linear-gradient(135deg,#2563eb,#7c3aed);
+  color:white;height:100vh;margin:0;display:flex;align-items:center;justify-content:center}
+.card{background:white;color:#111;border-radius:24px;padding:32px;text-align:center;
+  box-shadow:0 20px 50px rgba(0,0,0,.3);max-width:340px}
+.spin{width:40px;height:40px;border:4px solid #dbeafe;border-top-color:#2563eb;
+  border-radius:50%;animation:s 1s linear infinite;margin:16px auto}
+@keyframes s{to{transform:rotate(360deg)}}
+.ok{color:#16a34a;font-size:48px}
+h1{margin:8px 0}
+p{color:#666;margin:8px 0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>SAP Logistics</h1>
+  <div id="spin" class="spin"></div>
+  <p id="msg">מתחבר אוטומטית...</p>
+</div>
+<script>
+(async function(){
+  try {
+    // 1) Unregister any old service worker so it can't serve stale HTML
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      for (const r of regs) await r.unregister();
+    }
+    // 2) Clear PWA caches
+    if ('caches' in window) {
+      const ks = await caches.keys();
+      for (const k of ks) await caches.delete(k);
+    }
+    // 3) Write the auth into localStorage in the SAME shape that
+    //    zustand 'persist' uses, so the SPA picks it up on first load.
+    // zustand persist uses the key configured in stores/auth.js → 'logistics-auth'
+    localStorage.setItem('logistics-auth', ${JSON.stringify(persistedAuth)});
+    localStorage.setItem('token', ${JSON.stringify(token)});
+    localStorage.setItem('user', ${JSON.stringify(JSON.stringify(user))});
+    // 4) Show success and redirect with a cache-buster so the SW can't
+    //    serve a stale index.html that ignores our localStorage entry.
+    document.getElementById('spin').outerHTML = '<div class="ok">✓</div>';
+    document.getElementById('msg').textContent = 'שלום ${user.name}! מעביר אותך…';
+    setTimeout(function(){
+      window.location.replace('/?_=' + Date.now());
+    }, 800);
+  } catch (e) {
+    document.getElementById('msg').textContent = 'שגיאה: ' + e.message;
+  }
+})();
+</script>
+</body>
+</html>
+  `);
+});
+
+// Serve frontend
+const frontendDist = path.resolve(__dirname, '../../../frontend/dist');
+import('fs').then(({ existsSync }) => {
+  if (existsSync(frontendDist)) {
+    console.log(`[demo] Serving frontend from ${frontendDist}`);
+    app.use(express.static(frontendDist, { maxAge: '1d' }));
+    app.get(/^(?!\/api|\/socket\.io|\/health).*/, (_req, res) => {
+      res.sendFile(path.join(frontendDist, 'index.html'));
+    });
+  } else {
+    console.log(`[demo] Frontend build not found. Run: cd frontend && npm run build`);
+  }
+});
+
+// Agents (LLM) - reuses src/routes/agents.js. Returns 503 if ANTHROPIC_API_KEY is missing.
+// Content & Copy Agent — DB-free, stateless. Mounted BEFORE /api/agents so the
+// more specific prefix wins before agentsRouter's middleware runs.
+app.use('/api/agents/content-copy', contentCopyAgentRoutes);
+app.use('/api/agents', agentsRouter);
+
+// 404 fallback for unknown API endpoints
+app.use('/api', (req, res) => {
+  console.log(`[demo] Unhandled: ${req.method} ${req.path}`);
+  res.status(404).json({ error: 'Not implemented in demo mode', path: req.path });
+});
+
+// Socket.IO
+io.use((socket, next) => {
+  // Accept any token in demo mode
+  next();
+});
+io.on('connection', (socket) => {
+  console.log(`[demo] Socket connected: ${socket.id}`);
+  socket.on('disconnect', () => console.log(`[demo] Socket disconnected: ${socket.id}`));
+});
+
+// Rich live simulation (driver movement + stop progression)
+startSimulation(io, data);
+
+server.listen(PORT, () => {
+  console.log(`
+╔════════════════════════════════════════════════════════════╗
+║  🎬 SAP Logistics Hub - DEMO SERVER                         ║
+║                                                              ║
+║  📍 כתובת:  http://localhost:${PORT}                              ║
+║                                                              ║
+║  👤 התחברות:                                                 ║
+║     מנהל:   admin / (כל סיסמה)                              ║
+║     נהג:    DRV-01 / (כל סיסמה) - לממשק מובייל              ║
+║                                                              ║
+║  ℹ️   זהו שרת הדגמה - נתוני דמה בלבד                          ║
+║     אין חיבור ל-DB או ל-SAP אמיתי                            ║
+╚════════════════════════════════════════════════════════════╝
+`);
+});

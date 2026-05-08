@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sap-logistics-hub:latest
+    container_name: logistics-hub
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      NODE_ENV: production
+    ports:
+      - "4000:4000"
+    volumes:
+      # Persist uploads (signatures, photos) between restarts
+      - ./backend/uploads:/app/backend/uploads
+      - ./backend/logs:/app/backend/logs
+    networks:
+      - logistics-net
+    # Run migrations on startup before server starts
+    command: sh -c "node backend/src/db/migrate.js && node backend/src/server.js"
+
+networks:
+  logistics-net:
+    driver: bridge
+
+# Note: assumes SQL Server is already running on host or accessible at the
+# address in backend/.env. If you need a containerized SQL Server for dev,
+# uncomment below:
+#
+#   sqlserver:
+#     image: mcr.microsoft.com/mssql/server:2022-latest
+#     container_name: logistics-mssql
+#     restart: unless-stopped
+#     environment:
+#       ACCEPT_EULA: "Y"
+#       SA_PASSWORD: "YourStrong@Password1"
+#       MSSQL_PID: "Express"
+#     ports:
+#       - "1433:1433"
+#     volumes:
+#       - sqldata:/var/opt/mssql
+#     networks:
+#       - logistics-net
+#
+# volumes:
+#   sqldata:

@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: 'Heebo', system-ui, sans-serif;
+  @apply bg-gray-50 text-gray-900;
+}
+
+/* Ensure numbers stay LTR even in RTL context */
+.ltr-numeric {
+  direction: ltr;
+  unicode-bidi: bidi-override;
+  display: inline-block;
+}
+
+/* Status pill colors */
+.status-OPEN        { @apply bg-gray-100 text-gray-800 border-gray-200; }
+.status-PLANNED     { @apply bg-blue-100 text-blue-800 border-blue-200; }
+.status-PICKING     { @apply bg-amber-100 text-amber-800 border-amber-200; }
+.status-LOADED      { @apply bg-indigo-100 text-indigo-800 border-indigo-200; }
+.status-IN_TRANSIT  { @apply bg-purple-100 text-purple-800 border-purple-200; }
+.status-COMPLETED   { @apply bg-green-100 text-green-800 border-green-200; }
+.status-CANCELLED   { @apply bg-red-100 text-red-800 border-red-200; }
+
+.status-PENDING     { @apply bg-gray-100 text-gray-800 border-gray-200; }
+.status-ARRIVED     { @apply bg-blue-100 text-blue-800 border-blue-200; }
+.status-DELIVERED   { @apply bg-green-100 text-green-800 border-green-200; }
+.status-PARTIAL     { @apply bg-yellow-100 text-yellow-800 border-yellow-200; }
+.status-FAILED      { @apply bg-red-100 text-red-800 border-red-200; }
+.status-SKIPPED     { @apply bg-gray-100 text-gray-500 border-gray-200; }

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e3a8a"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="48" fill="url(#g)"/>
+  <g fill="white">
+    <path d="M40 90h110v80H40z"/>
+    <path d="M150 120h28l28 28v22h-56z"/>
+    <circle cx="72" cy="188" r="18" fill="#1f2937"/>
+    <circle cx="72" cy="188" r="9" fill="white"/>
+    <circle cx="174" cy="188" r="18" fill="#1f2937"/>
+    <circle cx="174" cy="188" r="9" fill="white"/>
+  </g>
+  <text x="128" y="70" font-family="Arial" font-size="20" font-weight="bold" fill="white" text-anchor="middle">SAP</text>
+</svg>
