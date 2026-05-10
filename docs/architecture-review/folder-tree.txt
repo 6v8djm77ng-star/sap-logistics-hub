@@ -1,0 +1,280 @@
+﻿sap-logistics-hub/
++---app
+|   +---create-shortcuts.ps1
+|   +---icon.svg
+|   +---install-desktop-app.ps1
+|   +---start-app.ps1
+|   +---stop-app.ps1
+|   ---update-app.ps1
++---backend
+|   +---scripts
+|   |   ---testContentCopyAgent.js
+|   +---src
+|   |   +---agents
+|   |   |   +---tools
+|   |   |   |   ---financialTools.js
+|   |   |   +---ceoBrief.js
+|   |   |   +---runtime.js
+|   |   |   ---store.js
+|   |   +---config
+|   |   |   +---env.js
+|   |   |   ---sapFields.js
+|   |   +---db
+|   |   |   +---logisticsDb.js
+|   |   |   ---migrate.js
+|   |   +---demo
+|   |   |   +---demoData.js
+|   |   |   +---demoServer.js
+|   |   |   +---liveSimulation.js
+|   |   |   +---loadingPlanner.js
+|   |   |   +---persistentStore.js
+|   |   |   +---routeOptimizer.js
+|   |   |   +---sapBridge.js
+|   |   |   ---sapWriter.js
+|   |   +---lib
+|   |   |   +---intelligence
+|   |   |   |   +---__tests__
+|   |   |   |   |   ---eventSchema.test.js
+|   |   |   |   +---aiCostGuard.js
+|   |   |   |   +---alertGuard.js
+|   |   |   |   +---eventBus.js
+|   |   |   |   +---eventBusFactory.js
+|   |   |   |   +---eventBusHttp.js
+|   |   |   |   +---eventBusNoop.js
+|   |   |   |   +---eventSchema.js
+|   |   |   |   +---eventStore.js
+|   |   |   |   ---index.js
+|   |   |   ---featureFlags.js
+|   |   +---middleware
+|   |   |   +---auth.js
+|   |   |   +---auth.test.js
+|   |   |   ---errorHandler.js
+|   |   +---routes
+|   |   |   +---addresses.js
+|   |   |   +---agents.js
+|   |   |   +---analytics.js
+|   |   |   +---audit.js
+|   |   |   +---auth.js
+|   |   |   +---customers.js
+|   |   |   +---davoMix.js
+|   |   |   +---driver.js
+|   |   |   +---drivers.js
+|   |   |   +---failures.js
+|   |   |   +---intelligenceEvents.js
+|   |   |   +---orders.js
+|   |   |   +---picking.js
+|   |   |   +---reports.js
+|   |   |   +---returns.js
+|   |   |   +---runs.js
+|   |   |   +---sap.js
+|   |   |   +---settings.js
+|   |   |   +---tracking.js
+|   |   |   +---trackPublic.js
+|   |   |   +---users.js
+|   |   |   ---zones.js
+|   |   +---services
+|   |   |   +---reports
+|   |   |   |   +---driverManifest.js
+|   |   |   |   +---exceptions.js
+|   |   |   |   ---pickingList.js
+|   |   |   +---sap
+|   |   |   |   +---financialReader.js
+|   |   |   |   +---serviceLayer.js
+|   |   |   |   ---sqlReader.js
+|   |   |   +---addressNormalizer.js
+|   |   |   +---addressNormalizer.test.js
+|   |   |   +---analytics.js
+|   |   |   +---auditLog.js
+|   |   |   +---customerComms.js
+|   |   |   +---davoMix.js
+|   |   |   +---davoMixWeeklyReport.js
+|   |   |   +---deliveryNotes.js
+|   |   |   +---deliveryRuns.js
+|   |   |   +---failures.js
+|   |   |   +---fileStorage.js
+|   |   |   +---fileStorage.test.js
+|   |   |   +---gpsTracking.js
+|   |   |   +---health.js
+|   |   |   +---notifications.js
+|   |   |   +---offlineQueue.README.md
+|   |   |   +---orderUnification.js
+|   |   |   +---returnRequests.js
+|   |   |   +---sapDiagnostic.js
+|   |   |   +---sapSampleData.js
+|   |   |   +---systemSettings.js
+|   |   |   +---timeWindows.js
+|   |   |   +---timeWindows.test.js
+|   |   |   +---trackingTokens.js
+|   |   |   ---wavePicking.js
+|   |   +---sockets
+|   |   |   ---index.js
+|   |   +---utils
+|   |   |   ---logger.js
+|   |   +---workers
+|   |   |   +---ceoBriefScheduler.js
+|   |   |   +---cleanupWorker.js
+|   |   |   +---dailyDigestWorker.js
+|   |   |   +---davoMixReportScheduler.js
+|   |   |   ---sapSyncWorker.js
+|   |   ---server.js
+|   +---.env
+|   +---.env.bak.20260505
+|   +---.env.example
+|   +---.env.example.intelligence-additions
+|   +---.gitignore
+|   +---create-logistics-db.js
+|   +---davo-attach-analysis.js
+|   +---davo-buyer-breakdown.js
+|   +---davo-buyer-breakdown.json
+|   +---davo-mix-analysis.js
+|   +---Dockerfile
+|   +---package.json
+|   +---package-lock.json
+|   +---server.log
+|   ---test-sap-connection.js
++---database
+|   ---migrations
+|       +---001_initial_schema.sql
+|       +---002_seed_data.sql
+|       +---003_gps_tracking.sql
+|       +---004_failures_and_portal.sql
+|       +---005_system_settings.sql
+|       +---006_oig_company_mapping.sql
+|       +---007_time_windows.sql
+|       +---008_agent_runs.sql
+|       +---009_intelligence_events.sql
+|       +---009_rollback.sql
+|       +---010_insights.sql
+|       +---010_rollback.sql
+|       +---011_alerts.sql
+|       +---011_rollback.sql
+|       +---012_ai_cost_budget.sql
+|       +---012_rollback.sql
+|       ---PENDING.md
++---docs
+|   +---architecture-review
+|   |   ---screenshots
+|   +---features
+|   |   +---roadmap.md
+|   |   ---WHAT_SHIPPED_TONIGHT.md
+|   +---AUDIT_REPORT.md
+|   +---PRODUCTION.md
+|   ---SAP_INTEGRATION.md
++---frontend
+|   +---src
+|   |   +---components
+|   |   |   +---AddressEditDialog.jsx
+|   |   |   +---AddStopDialog.jsx
+|   |   |   +---AssignDriverDialog.jsx
+|   |   |   +---BarcodeScanner.jsx
+|   |   |   +---CustomerHoursDialog.jsx
+|   |   |   +---CustomerSearchInput.jsx
+|   |   |   +---DashboardLayout.jsx
+|   |   |   +---DepartureApprovalDialog.jsx
+|   |   |   +---FailureReportDialog.jsx
+|   |   |   +---MobileLinkDialog.jsx
+|   |   |   +---MoveStopDialog.jsx
+|   |   |   +---NavigateButton.jsx
+|   |   |   +---NewReturnDialog.jsx
+|   |   |   +---NotifyEtaButton.jsx
+|   |   |   +---PodCapture.jsx
+|   |   |   +---RefreshButton.jsx
+|   |   |   +---SignaturePad.jsx
+|   |   |   +---StatusPill.jsx
+|   |   |   ---VoiceCommandButton.jsx
+|   |   +---hooks
+|   |   |   +---useGeofence.js
+|   |   |   +---useGpsTracking.js
+|   |   |   ---useVoiceCommands.js
+|   |   +---pages
+|   |   |   +---driver
+|   |   |   |   +---AutoLoginPage.jsx
+|   |   |   |   +---DriverLoginPage.jsx
+|   |   |   |   +---DriverManifestPage.jsx
+|   |   |   |   ---DriverRunsPage.jsx
+|   |   |   +---AdminAutoLoginPage.jsx
+|   |   |   +---AnalyticsPage.jsx
+|   |   |   +---AnomaliesPage.jsx
+|   |   |   +---CashOnDeliveryPage.jsx
+|   |   |   +---CustomerPolicyPage.jsx
+|   |   |   +---CustomerProfitabilityPage.jsx
+|   |   |   +---DailyClosurePage.jsx
+|   |   |   +---DashboardPage.jsx
+|   |   |   +---DavoMixPage.jsx
+|   |   |   +---DocumentsPage.jsx
+|   |   |   +---DriverLeaderboardPage.jsx
+|   |   |   +---DriversPage.jsx
+|   |   |   +---ExceptionsPage.jsx
+|   |   |   +---FailuresPage.jsx
+|   |   |   +---LiveMapPage.jsx
+|   |   |   +---LiveTrackingPage.jsx
+|   |   |   +---LoginPage.jsx
+|   |   |   +---MobileShortLinkPage.jsx
+|   |   |   +---OpenOrdersPage.jsx
+|   |   |   +---PickerAutoLoginPage.jsx
+|   |   |   +---PickersPage.jsx
+|   |   |   +---PickingPage.jsx
+|   |   |   +---PlannerPage.jsx
+|   |   |   +---ReturnsPage.jsx
+|   |   |   +---RunDetailsPage.jsx
+|   |   |   +---RunsPage.jsx
+|   |   |   +---SettingsPage.jsx
+|   |   |   +---StockPredictionPage.jsx
+|   |   |   +---TrackingPage.jsx
+|   |   |   +---UsersPage.jsx
+|   |   |   +---WallboardPage.jsx
+|   |   |   +---WarehousePage.jsx
+|   |   |   +---WeeklyReportPage.jsx
+|   |   |   ---ZonesPage.jsx
+|   |   +---services
+|   |   |   +---api.js
+|   |   |   +---offlineQueue.js
+|   |   |   ---socket.js
+|   |   +---stores
+|   |   |   ---auth.js
+|   |   +---utils
+|   |   +---App.jsx
+|   |   +---index.css
+|   |   ---main.jsx
+|   +---.gitignore
+|   +---Dockerfile
+|   +---index.html
+|   +---nginx.conf
+|   +---package.json
+|   +---package-lock.json
+|   +---postcss.config.js
+|   +---tailwind.config.js
+|   ---vite.config.js
++---mobile
+|   ---src
+|       +---components
+|       +---hooks
+|       +---pages
+|       +---services
+|       ---utils
++---remote-app
+|   +---HOW-TO-INSTALL.txt
+|   +---Install.bat
+|   +---Install.ps1
+|   +---README.txt
+|   +---SAP Logistics - Admin.url
+|   +---SAP Logistics - Driver.url
+|   +---SAP Logistics Hub.url
+|   +---Server-Setup.bat
+|   ---test-aviad-access.ps1
++---.gitignore
++---backup.ps1
++---cf-tunnel.log
++---docker-compose.yml
++---Dockerfile
++---ecosystem.config.cjs
++---install.ps1
++---MORNING_NOTES.md
++---NIGHT_WORK_PLAN.md
++---open-firewall.ps1
++---QUICK_START.md
++---README.md
++---README_USAGE.md
++---remote-app.zip
++---rename-run-to-route.js
+---start-dev.ps1

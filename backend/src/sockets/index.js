@@ -12,13 +12,35 @@ import { env } from '../config/env.js';
 import { apiLogger } from '../utils/logger.js';
 
 export function initSocketServer(httpServer) {
+  // Same allow-list as the Express CORS gate (server.js). A stolen JWT used to
+  // be acceptable from any origin (cors:'*'); now the WebSocket is bound to the
+  // same approved origins as the REST API.
+  // Server-to-server / native clients (no Origin header) are still allowed,
+  // matching server.js behavior.
+  const allowedOrigins = env.CORS_ORIGINS.split(',').map((o) => o.trim()).filter(Boolean);
+
   const io = new Server(httpServer, {
-    cors: { origin: '*' }, // tighten for production
+    cors: {
+      origin: (origin, cb) => {
+        if (!origin) return cb(null, true);
+        if (allowedOrigins.includes(origin)) return cb(null, true);
+        apiLogger.warn('Socket.IO CORS blocked', { origin });
+        return cb(new Error('Origin not allowed by Socket.IO CORS'));
+      },
+      credentials: true,
+    },
     transports: ['websocket', 'polling'],
   });
 
-  // Auth middleware
+  // Auth middleware — JWT first, then defense-in-depth Origin check (browsers
+  // can lie about Origin only with extension-level access; this is belt-and-
+  // suspenders so a non-browser client with a stolen JWT can't subscribe).
   io.use((socket, next) => {
+    const origin = socket.handshake.headers.origin;
+    if (origin && !allowedOrigins.includes(origin)) {
+      apiLogger.warn('Socket.IO handshake rejected: bad origin', { origin });
+      return next(new Error('Origin not allowed'));
+    }
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error('No auth token'));
     try {

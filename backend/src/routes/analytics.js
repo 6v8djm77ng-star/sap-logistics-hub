@@ -5,7 +5,11 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
-router.use(requireAuth);
+// All analytics endpoints expose KPI dashboards (revenue, deliveries, drivers,
+// zones, failures, SAP health). Restrict the whole router to ADMIN/PLANNER —
+// the previous per-endpoint approach gated only /summary and left the rest
+// open to any authed user including DRIVER (security-analysis F6).
+router.use(requireAuth, requireRole('ADMIN', 'PLANNER'));
 
 function dateRange(req) {
   const toDate = req.query.toDate || format(new Date(), 'yyyy-MM-dd');

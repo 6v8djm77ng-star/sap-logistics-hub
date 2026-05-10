@@ -139,7 +139,3 @@ export const driversApi = {
   updateZones: (id, zoneIds) => api.patch(`/drivers/${id}/zones`, { zoneIds }).then((r) => r.data),
 };
 
-export const contentCopyApi = {
-  // 60-second timeout because LLM calls can take 20-40s.
-  run: (payload) => api.post('/agents/content-copy/run', payload, { timeout: 60000 }).then((r) => r.data),
-};

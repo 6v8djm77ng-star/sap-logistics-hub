@@ -42,7 +42,6 @@ import { startCleanupWorker, stopCleanupWorker } from './workers/cleanupWorker.j
 import { startCeoBriefScheduler, stopCeoBriefScheduler } from './workers/ceoBriefScheduler.js';
 import { startDavoMixReportScheduler, stopDavoMixReportScheduler } from './workers/davoMixReportScheduler.js';
 import agentsRoutes from './routes/agents.js';
-import contentCopyAgentRoutes from './routes/contentCopyAgent.js';
 import davoMixRoutes from './routes/davoMix.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -126,8 +125,6 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/sap', sapRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/addresses', addressesRoutes);
-// Content & Copy Agent — mount BEFORE /api/agents so the specific prefix wins.
-app.use('/api/agents/content-copy', contentCopyAgentRoutes);
 app.use('/api/agents', agentsRoutes);
 app.use('/api/davo-mix', davoMixRoutes);
 // Public tracking - no auth required

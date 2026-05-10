@@ -6,11 +6,14 @@ import { Router } from 'express';
 import * as sapSql from '../services/sap/sqlReader.js';
 import * as db from '../db/logisticsDb.js';
 import { normalizeAddress } from '../services/addressNormalizer.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
-router.use(requireAuth);
+// Customer search/details expose full SAP customer DB (names, addresses, 90d
+// item history). Restrict to ADMIN/PLANNER — drivers don't need this
+// (security-analysis F4).
+router.use(requireAuth, requireRole('ADMIN', 'PLANNER'));
 
 /**
  * GET /api/customers/search?q=...&company=A|B|ALL

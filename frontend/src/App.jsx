@@ -36,7 +36,6 @@ import CustomerProfitabilityPage from './pages/CustomerProfitabilityPage.jsx';
 import AnomaliesPage from './pages/AnomaliesPage.jsx';
 import StockPredictionPage from './pages/StockPredictionPage.jsx';
 import PickersPage from './pages/PickersPage.jsx';
-import ContentCopyPage from './pages/ContentCopyPage.jsx';
 import DavoMixPage from './pages/DavoMixPage.jsx';
 import DriverRunsPage from './pages/driver/DriverRunsPage.jsx';
 import DriverManifestPage from './pages/driver/DriverManifestPage.jsx';
@@ -127,7 +126,6 @@ export default function App() {
         <Route path="profitability" element={<CustomerProfitabilityPage />} />
         <Route path="anomalies" element={<AnomaliesPage />} />
         <Route path="stock-prediction" element={<StockPredictionPage />} />
-        <Route path="content-copy" element={<ContentCopyPage />} />
         <Route path="davo-mix" element={<DavoMixPage />} />
       </Route>
     </Routes>

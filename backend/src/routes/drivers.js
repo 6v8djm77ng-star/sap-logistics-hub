@@ -9,8 +9,12 @@ import { env } from '../config/env.js';
 const router = Router();
 router.use(requireAuth);
 
+// GET / returns every driver's contact info (phone, email, plate). Restrict to
+// ADMIN/PLANNER — previously open to any authed user including DRIVER
+// (security-analysis F7).
 router.get(
   '/',
+  requireRole('ADMIN', 'PLANNER'),
   asyncHandler(async (req, res) => {
     const drivers = await db.query(
       `SELECT d.DriverId, d.Code, d.FullName, d.Phone, d.Email, d.VehiclePlate,

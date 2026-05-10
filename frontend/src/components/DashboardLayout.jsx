@@ -36,8 +36,6 @@ import RefreshButton from './RefreshButton.jsx';
 
 const navItems = [
   { to: '/',           label: 'דשבורד',         icon: LayoutDashboard },
-  { to: '/content-copy', label: 'יצירת תוכן שיווקי', icon: Sparkles, highlight: true },
-  { to: '/davo-mix',     label: 'DAVO Mix Tracker',  icon: Target, highlight: true },
   { to: '/orders',     label: 'הזמנות SAP',     icon: Package, highlight: true },
   { to: '/live',       label: 'מעקב חי',        icon: Activity },
   { to: '/map',        label: 'מפת נהגים',      icon: Map },

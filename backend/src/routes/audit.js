@@ -1,10 +1,12 @@
 import { Router } from 'express';
 import { getAuditTrail } from '../services/auditLog.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
-router.use(requireAuth);
+// Audit trail includes password-reset markers, role changes, and edit history
+// for every entity. ADMIN-only (security-analysis F8).
+router.use(requireAuth, requireRole('ADMIN'));
 
 router.get(
   '/:entityType/:entityId',

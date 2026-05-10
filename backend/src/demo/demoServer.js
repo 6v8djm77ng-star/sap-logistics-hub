@@ -24,7 +24,6 @@ import { startSimulation } from './liveSimulation.js';
 import * as sapBridge from './sapBridge.js';
 import * as store from './persistentStore.js';
 import agentsRouter from '../routes/agents.js';
-import contentCopyAgentRoutes from '../routes/contentCopyAgent.js';
 
 // Initialize persistent store
 store.load();
@@ -3389,7 +3388,6 @@ import('fs').then(({ existsSync }) => {
 // Agents (LLM) - reuses src/routes/agents.js. Returns 503 if ANTHROPIC_API_KEY is missing.
 // Content & Copy Agent — DB-free, stateless. Mounted BEFORE /api/agents so the
 // more specific prefix wins before agentsRouter's middleware runs.
-app.use('/api/agents/content-copy', contentCopyAgentRoutes);
 app.use('/api/agents', agentsRouter);
 
 // 404 fallback for unknown API endpoints

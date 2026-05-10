@@ -93,3 +93,6 @@ uploads/
 *.keystore
 backend/certs/
 certs/
+
+# Operator snapshots (added 2026-05-10 during Phase 0 prerequisite remediation)
+backend/data/archive/

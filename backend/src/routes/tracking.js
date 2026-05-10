@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import * as gps from '../services/gpsTracking.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
@@ -38,9 +38,12 @@ router.post(
 
 /**
  * Planner view - all active drivers' current positions.
+ * Restricted to ADMIN/PLANNER: a DRIVER token has no business seeing other
+ * drivers' live GPS (security-analysis F3).
  */
 router.get(
   '/drivers',
+  requireRole('ADMIN', 'PLANNER'),
   asyncHandler(async (req, res) => {
     const locations = await gps.getAllDriverLocations();
     res.json({ locations });
@@ -49,9 +52,11 @@ router.get(
 
 /**
  * Historical trail for a driver's run.
+ * Restricted to ADMIN/PLANNER (security-analysis F3).
  */
 router.get(
   '/drivers/:id/trail',
+  requireRole('ADMIN', 'PLANNER'),
   asyncHandler(async (req, res) => {
     const trail = await gps.getDriverTrail(Number(req.params.id), req.query);
     res.json({ trail });

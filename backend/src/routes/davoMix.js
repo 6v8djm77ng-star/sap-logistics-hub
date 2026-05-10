@@ -9,7 +9,9 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
-router.use(requireAuth);
+// DAVO Mix exposes revenue, top buyers by CardCode, attach rates, and per-buyer
+// breakdowns. Restrict to ADMIN/PLANNER (security-analysis F5).
+router.use(requireAuth, requireRole('ADMIN', 'PLANNER'));
 
 router.get('/summary', asyncHandler(async (req, res) => {
   const days = Number(req.query.days) || 90;

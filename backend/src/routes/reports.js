@@ -2,11 +2,15 @@ import { Router } from 'express';
 import { generateDriverManifestPdf } from '../services/reports/driverManifest.js';
 import { generatePickingListExcel } from '../services/reports/pickingList.js';
 import { getExceptionsReport } from '../services/reports/exceptions.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { asyncHandler } from '../middleware/errorHandler.js';
 
 const router = Router();
-router.use(requireAuth);
+// Manifest PDFs and picking XLSX expose full customer addresses, phones, and
+// route detail. Restrict to ADMIN/PLANNER/WAREHOUSE (security-analysis F9).
+// NOTE: per-driver manifests for the driver's *own* run still need a
+// non-shared download path — see deferred items in PR description.
+router.use(requireAuth, requireRole('ADMIN', 'PLANNER', 'WAREHOUSE'));
 
 /**
  * GET /api/reports/runs/:id/manifest.pdf
