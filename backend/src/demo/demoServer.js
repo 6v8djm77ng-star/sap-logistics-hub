@@ -87,6 +87,45 @@ app.use((req, res, next) => {
   next();
 });
 
+// =====================================================================
+// EMERGENCY MITIGATION (Wave A) — added 2026-05-10
+// Closes anonymous public-internet exposure of admin / customer / driver /
+// SAP-write CRUD on this demoServer. See docs/architecture-review/
+// emergency-mitigation-plan.md and external-reachability-report.md.
+// Inert under future server.js cutover (server.js has its own auth chain
+// via middleware/auth.js).
+// Rollback: git revert <wave-a-sha>; pm2 restart sap-logistics
+// =====================================================================
+function requireAuthBasic(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
+function adminOnly(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    if (payload.role !== 'ADMIN') {
+      return res.status(403).json({ error: 'Admin role required' });
+    }
+    req.user = payload;
+    return next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
+
 // Auth endpoints - now use persistent store
 app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body;
@@ -178,7 +217,8 @@ app.post('/api/auth/mobile-link', async (req, res) => {
         name: payload.name,
       },
       JWT_SECRET,
-      { expiresIn: '30d' }
+      // Wave A: reduced TTL 30d → 1h (mobile-link is meant for immediate scan).
+      { expiresIn: '1h' }
     );
     // Store short id → token mapping
     let shortId;
@@ -324,6 +364,9 @@ app.get('/api/zones/cities', (_req, res) => {
 // By default individual customers (single-branch) are excluded — they get the
 // default doc type (INVOICE) automatically and don't need configuration.
 // Pass ?includeIndividuals=true to see them too.
+//
+// Wave A mitigation: all /api/customers/* routes require any valid Bearer token.
+app.use('/api/customers', requireAuthBasic);
 app.get('/api/customers/policies', async (req, res) => {
   try {
     const policies = store.listCustomerDocPolicies();
@@ -409,6 +452,10 @@ app.get('/api/sap/writer/status', async (_req, res) => {
   res.json(getWriterStatus());
 });
 
+// Wave A mitigation: SAP write endpoints require ADMIN even though
+// SAP_WRITE_ENABLED is currently UNSET. Belt-and-suspenders for the day
+// the env flag flips.
+app.use('/api/sap/write', adminOnly);
 app.post('/api/sap/write/delivery-note/:id', async (req, res) => {
   try {
     const { writeDeliveryNote } = await import('./sapWriter.js');
@@ -1097,24 +1144,27 @@ app.delete('/api/zones/:id', (req, res) => {
 
 // Drivers
 // Drivers - full CRUD with persistent storage
+// Wave A mitigation: GET requires any valid Bearer (planners read driver list);
+// mutations require ADMIN.
+app.use('/api/drivers', requireAuthBasic);
 app.get('/api/drivers', (_req, res) => {
   res.json({ drivers: store.getDrivers() });
 });
 
-app.post('/api/drivers', (req, res) => {
+app.post('/api/drivers', adminOnly, (req, res) => {
   const newDriver = store.addDriver(req.body);
   io.emit('driver:created', newDriver);
   res.status(201).json(newDriver);
 });
 
-app.patch('/api/drivers/:id', (req, res) => {
+app.patch('/api/drivers/:id', adminOnly, (req, res) => {
   const updated = store.updateDriver(req.params.id, req.body);
   if (!updated) return res.status(404).json({ error: 'Driver not found' });
   io.emit('driver:updated', updated);
   res.json(updated);
 });
 
-app.patch('/api/drivers/:id/zones', (req, res) => {
+app.patch('/api/drivers/:id/zones', adminOnly, (req, res) => {
   const zoneCodes = (req.body.zoneIds || []).map((id) => {
     const zone = data.zones.find((z) => z.ZoneId === id);
     return zone?.Code;
@@ -1124,7 +1174,7 @@ app.patch('/api/drivers/:id/zones', (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/drivers/:id', (req, res) => {
+app.delete('/api/drivers/:id', adminOnly, (req, res) => {
   const ok = store.deleteDriver(req.params.id);
   if (!ok) return res.status(404).json({ error: 'Driver not found' });
   io.emit('driver:deleted', { DriverId: Number(req.params.id) });
@@ -1132,9 +1182,12 @@ app.delete('/api/drivers/:id', (req, res) => {
 });
 
 // Users - full CRUD with persistence
-app.get('/api/users', (_req, res) => res.json({ users: store.getUsers() }));
+// Wave A mitigation: all admin-CRUD handlers require ADMIN. /me/* paths
+// (change-password registered earlier at line ~263, subscriptions below)
+// stay on requireAuthBasic so any authed user can self-serve.
+app.get('/api/users', adminOnly, (_req, res) => res.json({ users: store.getUsers() }));
 
-app.post('/api/users', async (req, res) => {
+app.post('/api/users', adminOnly, async (req, res) => {
   try {
     const newUser = await store.addUser(req.body);
     res.status(201).json(newUser);
@@ -1143,7 +1196,7 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-app.patch('/api/users/:id', async (req, res) => {
+app.patch('/api/users/:id', adminOnly, async (req, res) => {
   try {
     const updated = await store.updateUser(req.params.id, req.body);
     if (!updated) return res.status(404).json({ error: 'User not found' });
@@ -1153,7 +1206,7 @@ app.patch('/api/users/:id', async (req, res) => {
   }
 });
 
-app.post('/api/users/:id/reset-password', async (req, res) => {
+app.post('/api/users/:id/reset-password', adminOnly, async (req, res) => {
   const { password } = req.body;
   if (!password || password.length < 4) {
     return res.status(400).json({ error: 'סיסמה קצרה מדי (מינימום 4 תווים)' });
@@ -1163,7 +1216,7 @@ app.post('/api/users/:id/reset-password', async (req, res) => {
   res.json({ ok: true });
 });
 
-app.delete('/api/users/:id', (req, res) => {
+app.delete('/api/users/:id', adminOnly, (req, res) => {
   try {
     const auth = req.headers.authorization;
     let requesterId = null;
@@ -1181,11 +1234,11 @@ app.delete('/api/users/:id', (req, res) => {
   }
 });
 
-app.get('/api/users/me/subscriptions', (_req, res) => res.json({ subscriptions: [
+app.get('/api/users/me/subscriptions', requireAuthBasic, (_req, res) => res.json({ subscriptions: [
   { SubscriptionId: 1, EventType: 'STOP_FAILED_HIGH', Channel: 'EMAIL', IsActive: true },
   { SubscriptionId: 2, EventType: 'DAILY_DIGEST', Channel: 'EMAIL', IsActive: true },
 ]}));
-app.put('/api/users/me/subscriptions', (_req, res) => res.json({ ok: true }));
+app.put('/api/users/me/subscriptions', requireAuthBasic, (_req, res) => res.json({ ok: true }));
 
 // Runs
 // Runs - backed by persistent store (no demo data - build from real SAP orders)
@@ -3299,6 +3352,20 @@ app.get('/m/admin/:shortId', (req, res, next) => {
       </body></html>
     `);
   }
+  // Wave A mitigation: single-use enforcement. The mobile-link is meant to be
+  // scanned once on the operator's phone, not re-shared. After first redemption,
+  // subsequent fetches return 410 Gone. Token TTL was also reduced 30d → 1h.
+  if (entry.usedAt) {
+    return res.status(410).type('html').send(`
+      <!doctype html><html lang="he" dir="rtl"><meta charset="utf-8">
+      <title>הקישור כבר נוצל</title>
+      <body style="font-family:sans-serif;text-align:center;padding:40px">
+        <h1 style="color:#dc2626">⚠ הקישור כבר נוצל</h1>
+        <p>בקש קישור חדש מהמחשב.</p>
+      </body></html>
+    `);
+  }
+  entry.usedAt = Date.now();
   const token = entry.token;
   // Decode JWT payload for the user object
   const parts = token.split('.');
