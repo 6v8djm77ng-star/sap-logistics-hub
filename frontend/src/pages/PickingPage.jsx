@@ -140,6 +140,25 @@ export default function PickingPage() {
     onError: (err) => toast.error(err.response?.data?.error || 'שגיאה ביצירת גל'),
   });
 
+  // ------------------------------------------------------------------
+  // Pallet-mode controls — moved here from the planner's RunDetailsPage
+  // because the decision of HOW to organize the picked goods belongs to
+  // the warehouse / logistics manager, not to the route planner.
+  // PATCH endpoints (run + stops) are unchanged.
+  // ------------------------------------------------------------------
+  const palletModeMutation = useMutation({
+    mutationFn: (palletMode) =>
+      api.patch(`/runs/${runId}`, { palletMode }).then((r) => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] }),
+    onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בעדכון מצב ליקוט'),
+  });
+
+  const palletLabelMutation = useMutation({
+    mutationFn: ({ stopId, palletLabel }) =>
+      api.patch(`/stops/${stopId}`, { palletLabel }).then((r) => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] }),
+  });
+
   // Per-allocation (per-row) pick / reset
   const pickAllocationMutation = useMutation({
     mutationFn: ({ allocId, qty }) => pickingApi.pickAllocation(allocId, qty),
@@ -350,6 +369,13 @@ export default function PickingPage() {
           </button>
         </div>
       </div>
+
+      <PalletModePanel
+        wave={wave}
+        onChangeMode={(m) => palletModeMutation.mutate(m)}
+        onChangeLabel={(stopId, palletLabel) => palletLabelMutation.mutate({ stopId, palletLabel })}
+        modeChanging={palletModeMutation.isPending}
+      />
 
       {/* Barcode scanner */}
       {scannerOpen && (
@@ -617,6 +643,109 @@ export default function PickingPage() {
           {wave.QcApprovedBy && (
             <p className="text-xs text-green-600 mt-1">אושר על ידי {wave.QcApprovedBy}</p>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// אופן הכנת משלוח — three-state mode panel + (when BY_PALLET) per-stop
+// pallet-label editor. Lives on the picking page because the decision
+// belongs to the warehouse manager, not the route planner.
+// Pulls the unique stops out of the existing wave allocations — no extra
+// request to /api/runs/:id is needed.
+// ----------------------------------------------------------------------------
+function PalletModePanel({ wave, onChangeMode, onChangeLabel, modeChanging }) {
+  const mode = wave.PalletMode || 'SINGLE';
+  const options = [
+    { key: 'SINGLE',      label: 'ריכוז אחד',  hint: 'ליקוט מאוחד לכל הקו (ברירת מחדל)' },
+    { key: 'BY_PALLET',   label: 'לפי משטח',   hint: 'סימון ידני של מספר משטח לכל עצירה' },
+    { key: 'BY_CUSTOMER', label: 'לפי לקוח',   hint: 'ריכוז נפרד לכל לקוח' },
+  ];
+
+  // Build the unique-stop list straight from the wave's allocations.
+  // We keep insertion order based on StopOrder so the panel mirrors the
+  // run's stop sequence.
+  const uniqueStops = (() => {
+    const seen = new Map();
+    for (const line of wave.lines || []) {
+      for (const a of line.allocations || []) {
+        if (!a.StopId || seen.has(a.StopId)) continue;
+        seen.set(a.StopId, {
+          StopId: a.StopId,
+          StopOrder: a.StopOrder ?? 99,
+          BranchName: a.BranchName || a.SapCardName || '(ללא שם)',
+          City: a.City || '',
+          PalletLabel: a.PalletLabel || '',
+        });
+      }
+    }
+    return [...seen.values()].sort((a, b) => (a.StopOrder || 0) - (b.StopOrder || 0));
+  })();
+
+  return (
+    <div className="mb-4 bg-white border rounded-xl p-3">
+      <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span className="font-medium text-gray-700">אופן הכנת משלוח:</span>
+        <div className="inline-flex rounded-lg border border-gray-300 overflow-hidden">
+          {options.map((o) => {
+            const active = mode === o.key;
+            return (
+              <button
+                key={o.key}
+                type="button"
+                disabled={modeChanging || active}
+                onClick={() => onChangeMode(o.key)}
+                title={o.hint}
+                className={`px-3 py-1.5 text-xs transition-colors ${
+                  active
+                    ? 'bg-brand-600 text-white font-medium cursor-default'
+                    : 'bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50'
+                }`}
+              >
+                {o.label}
+              </button>
+            );
+          })}
+        </div>
+        <span className="text-xs text-gray-500">
+          {mode === 'SINGLE' && 'הליקוט מוצג כרשימה אחת לפי סדר נסיעה'}
+          {mode === 'BY_PALLET' && 'סמן לכל עצירה מספר משטח — הליקוט יתקבץ לפי משטח'}
+          {mode === 'BY_CUSTOMER' && 'הליקוט יתקבץ לפי לקוח (לא נדרש מספר משטח)'}
+        </span>
+      </div>
+
+      {/* Pallet-label editor — only when BY_PALLET. */}
+      {mode === 'BY_PALLET' && uniqueStops.length > 0 && (
+        <div className="mt-3 pt-3 border-t border-gray-100">
+          <div className="text-xs text-gray-500 mb-2">שיוך משטחים לעצירות:</div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2">
+            {uniqueStops.map((s) => (
+              <div key={s.StopId} className="flex items-center gap-2 text-sm">
+                <span className="w-6 h-6 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center text-xs font-semibold shrink-0">
+                  {s.StopOrder}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <div className="truncate font-medium text-gray-900" title={s.BranchName}>{s.BranchName}</div>
+                  {s.City && <div className="text-[10px] text-gray-500">{s.City}</div>}
+                </div>
+                <input
+                  key={`${s.StopId}-${s.PalletLabel}`}
+                  type="text"
+                  defaultValue={s.PalletLabel}
+                  maxLength={8}
+                  placeholder="P1"
+                  className="w-16 px-2 py-1 border border-amber-300 bg-amber-50 rounded text-xs font-mono text-center focus:outline-none focus:border-amber-500"
+                  onBlur={(e) => {
+                    const v = e.target.value.trim();
+                    if (v !== s.PalletLabel) onChangeLabel(s.StopId, v);
+                  }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+                />
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>
