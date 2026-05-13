@@ -169,11 +169,13 @@ app.post('/api/auth/picker-login', (req, res) => {
   });
 });
 
-// Pickers CRUD - mirrors drivers
-app.get('/api/pickers', (_req, res) => {
+// Pickers CRUD - mirrors drivers. Wave A: any authenticated user may read,
+// only ADMIN may mutate. Registered above the global Wave A block, so the
+// gate is applied inline here.
+app.get('/api/pickers', requireAuthBasic, (_req, res) => {
   res.json({ pickers: store.getPickers() });
 });
-app.post('/api/pickers', (req, res) => {
+app.post('/api/pickers', adminOnly, (req, res) => {
   try {
     const newPicker = store.addPicker(req.body);
     res.status(201).json(newPicker);
@@ -181,12 +183,12 @@ app.post('/api/pickers', (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-app.patch('/api/pickers/:id', (req, res) => {
+app.patch('/api/pickers/:id', adminOnly, (req, res) => {
   const updated = store.updatePicker(req.params.id, req.body);
   if (!updated) return res.status(404).json({ error: 'Picker not found' });
   res.json(updated);
 });
-app.delete('/api/pickers/:id', (req, res) => {
+app.delete('/api/pickers/:id', adminOnly, (req, res) => {
   const ok = store.deletePicker(req.params.id);
   if (!ok) return res.status(404).json({ error: 'Picker not found' });
   res.json({ ok: true });
@@ -319,6 +321,42 @@ app.post('/api/users/me/change-password', async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
+
+// =====================================================================
+// WAVE A FULL GATE — 2026-05-13
+// Closes anonymous access to all sensitive /api routes registered below
+// this block. Public endpoints already registered above this point keep
+// their own per-handler checks:
+//   - /api/auth/{login,driver-login,picker-login}   (passwordless or rate-limited)
+//   - /api/auth/mobile-link/:shortId                 (short-id → token lookup)
+//   - /api/auth/me, /api/users/me/change-password    (verify token inline)
+// Public endpoints registered AFTER this block:
+//   - /health                                         (top-level, not under /api)
+//   - /api/public/track/:token                        (customer tracking by signed token)
+// =====================================================================
+const WAVE_A_SENSITIVE_PREFIXES = [
+  '/api/orders', '/api/runs', '/api/run-orders', '/api/stops',
+  '/api/picking', '/api/returns', '/api/reports', '/api/analytics',
+  '/api/failures', '/api/davo-mix', '/api/addresses', '/api/tracking',
+  '/api/cod', '/api/notify', '/api/delivery-notes', '/api/invoices',
+  '/api/documents', '/api/driver', '/api/customers', '/api/drivers',
+  '/api/zones', '/api/pickers', '/api/audit', '/api/sap',
+];
+for (const prefix of WAVE_A_SENSITIVE_PREFIXES) {
+  app.use(prefix, requireAuthBasic);
+}
+// /api/users — admin-only for CRUD; /me/* paths (own profile) stay user-scoped.
+app.use('/api/users', (req, res, next) => {
+  if (req.path === '/me' || req.path.startsWith('/me/')) {
+    return requireAuthBasic(req, res, next);
+  }
+  return adminOnly(req, res, next);
+});
+app.use('/api/settings', adminOnly);
+app.use('/api/demo', adminOnly);
+// /api/sap/write is further restricted below (existing line); /api/sap above
+// already required auth — this adds the admin role check.
+app.use('/api/sap/write', adminOnly);
 
 // Health
 app.get('/health', async (_req, res) => {
@@ -2152,10 +2190,20 @@ app.post('/api/driver/orders/:runOrderId/deliver', (req, res) => {
   });
 });
 
-// Customer tracking (public)
+// Customer tracking (public). Wave A hardening: validate token format and
+// age before exposing any stop data. The legacy demo behaviour returned an
+// arbitrary in-transit stop for ANY token string, leaking PII (address,
+// branch name, GPS) to anyone who hit the URL. Tokens are issued by
+// /api/runs/stops/:stopId/tracking-link in the form `demo-token-<stopId>-<ms>`.
 app.get('/api/public/track/:token', (req, res) => {
-  // Demo: return tracking info for a random in-transit stop
-  const stop = data.stops.find((s) => s.Status === 'ARRIVED' || s.Status === 'PENDING');
+  const m = String(req.params.token || '').match(/^demo-token-(\d+)-(\d{10,})$/);
+  if (!m) return res.status(404).json({ error: 'Invalid or expired tracking link' });
+  const stopId = Number(m[1]);
+  const issuedAtMs = Number(m[2]);
+  if (!Number.isFinite(issuedAtMs) || Date.now() - issuedAtMs > 48 * 3600 * 1000) {
+    return res.status(404).json({ error: 'Invalid or expired tracking link' });
+  }
+  const stop = data.stops.find((s) => s.StopId === stopId);
   if (!stop) return res.status(404).json({ error: 'Not found' });
   const run = data.runs.find((r) => r.RunId === stop.RunId);
   res.json({

@@ -97,7 +97,7 @@ Write-Host "  - SAP Logistics - Admin    (admin login)"      -ForegroundColor Gr
 Write-Host ""
 Write-Host "Login credentials:" -ForegroundColor White
 Write-Host "  Username: admin" -ForegroundColor Gray
-Write-Host "  Password: admin123" -ForegroundColor Gray
+Write-Host "  Password: ask the system owner (not documented here)" -ForegroundColor Gray
 Write-Host ""
 Write-Host "If a shortcut does not work, contact the system owner" -ForegroundColor Yellow
 Write-Host "and ask to verify port 4000 is open on the server." -ForegroundColor Yellow

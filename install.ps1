@@ -190,8 +190,8 @@ if (Test-Path "frontend\dist") {
 Write-Host ""
 Write-Host "👤 כניסה ראשונה:" -ForegroundColor Cyan
 Write-Host "   משתמש: admin" -ForegroundColor White
-Write-Host "   סיסמה: admin123" -ForegroundColor White
-Write-Host "   🔐 שנה את הסיסמה מיד בממשק!" -ForegroundColor Yellow
+Write-Host "   סיסמה: בקש ממנהל המערכת. הסיסמה אינה מתועדת בקוד." -ForegroundColor White
+Write-Host "   🔐 אם זוהי התקנה ראשונה - אפס את הסיסמה דרך הממשק מיד אחרי הכניסה." -ForegroundColor Yellow
 Write-Host ""
 Write-Host "🔌 לחיבור SAP:" -ForegroundColor Cyan
 Write-Host "   1. התחבר כ-admin" -ForegroundColor White
