@@ -10,23 +10,29 @@
  * This is purely cosmetic - makes stakeholders see the system breathing.
  */
 
+// Main warehouse: הגנן 8, מודיעין מכבים-רעות (Lig'ad industrial zone).
+// Driver routes start from here. Update if the warehouse address changes.
+const WAREHOUSE = { lat: 31.8952, lng: 35.0024 };
+
 // Realistic movement paths between stops (rough polylines)
 const PATHS = {
+  // All paths start at the warehouse (הגנן 8 מודיעין) and lead toward the
+  // delivery zone. Lat/lng pairs are rough polylines, not real road geometry.
   telaviv: [
-    [32.1156, 34.8008], [32.1100, 34.7950], [32.1050, 34.7900],
-    [32.0950, 34.7850], [32.0850, 34.7800], [32.0775, 34.7748],
+    [31.8952, 35.0024], [31.9500, 34.9500], [32.0000, 34.9000],
+    [32.0500, 34.8500], [32.0850, 34.8000], [32.1156, 34.8008],
   ],
   jerusalem: [
-    [32.0775, 34.7748], [32.0500, 34.8200], [31.9500, 35.0000],
-    [31.8500, 35.1500], [31.8100, 35.2000], [31.7816, 35.2179],
+    [31.8952, 35.0024], [31.8500, 35.1500], [31.8100, 35.2000],
+    [31.7816, 35.2179],
   ],
   sharon: [
-    [32.0853, 34.7818], [32.1200, 34.8000], [32.1400, 34.8200],
-    [32.1500, 34.8300], [32.1624, 34.8442],
+    [31.8952, 35.0024], [32.0000, 34.9500], [32.1200, 34.8800],
+    [32.1500, 34.8400], [32.1624, 34.8442],
   ],
   shfela: [
-    [32.0853, 34.7818], [32.0500, 34.7900], [32.0000, 34.7800],
-    [31.9800, 34.7900], [31.9730, 34.7925],
+    [31.8952, 35.0024], [31.9500, 34.9500], [31.9800, 34.8500],
+    [31.9730, 34.7925],
   ],
 };
 
@@ -56,12 +62,12 @@ function tick(io, data) {
     pathProgress[1] = (p1 + 1) % path.length;
   }
 
-  // Move driver 2 (slowly, warehouse area)
+  // Move driver 2 (slowly, warehouse area at הגנן 8 מודיעין)
   const p2 = pathProgress[2];
   const driver2 = data.driverLocations.find((d) => d.DriverId === 2);
   if (driver2) {
-    driver2.Latitude = 32.0853 + Math.sin(p2 / 10) * 0.005;
-    driver2.Longitude = 34.7818 + Math.cos(p2 / 10) * 0.005;
+    driver2.Latitude = WAREHOUSE.lat + Math.sin(p2 / 10) * 0.005;
+    driver2.Longitude = WAREHOUSE.lng + Math.cos(p2 / 10) * 0.005;
     driver2.UpdatedAt = new Date().toISOString();
     pathProgress[2] = p2 + 1;
   }

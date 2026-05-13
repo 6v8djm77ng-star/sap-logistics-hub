@@ -347,10 +347,15 @@ export async function optimizeStopOrder(runId) {
 
   // Naive: if no coords, keep existing order.
   if (stops.every((s) => s.Latitude && s.Longitude)) {
-    // Nearest-neighbor from warehouse (TODO: store warehouse coords in config)
+    // Nearest-neighbor starting from the main warehouse:
+    // הגנן 8, מודיעין מכבים-רעות (Lig'ad industrial zone).
+    // Override via env: WAREHOUSE_LAT, WAREHOUSE_LNG.
     const ordered = [];
     let remaining = [...stops];
-    let current = { Latitude: 32.0853, Longitude: 34.7818 }; // TLV placeholder
+    let current = {
+      Latitude: Number(process.env.WAREHOUSE_LAT) || 31.8952,
+      Longitude: Number(process.env.WAREHOUSE_LNG) || 35.0024,
+    };
 
     while (remaining.length > 0) {
       let nearestIdx = 0;

@@ -14,9 +14,14 @@ const driversApi = {
   delete: (id) => api.delete(`/drivers/${id}`).then((r) => r.data),
 };
 
+const zonesApi = {
+  list: () => api.get('/zones').then((r) => r.data.zones || []),
+};
+
 function DriverFormDialog({ driver, onClose }) {
   const queryClient = useQueryClient();
   const isEdit = !!driver;
+  const { data: allZones = [] } = useQuery({ queryKey: ['zones'], queryFn: zonesApi.list });
   const [form, setForm] = useState({
     code: driver?.Code || '',
     fullName: driver?.FullName || '',
@@ -27,6 +32,15 @@ function DriverFormDialog({ driver, onClose }) {
     zones: driver?.Zones || '',
     isActive: driver?.IsActive ?? true,
   });
+
+  const selectedZones = new Set((form.zones || '').split(',').map((z) => z.trim()).filter(Boolean));
+  const toggleZone = (code) => {
+    const next = new Set(selectedZones);
+    next.has(code) ? next.delete(code) : next.add(code);
+    setForm({ ...form, zones: [...next].join(',') });
+  };
+  const selectAllZones = () => setForm({ ...form, zones: allZones.map((z) => z.Code).join(',') });
+  const clearAllZones  = () => setForm({ ...form, zones: '' });
 
   const mutation = useMutation({
     mutationFn: () => isEdit ? driversApi.update(driver.DriverId, form) : driversApi.create(form),
@@ -107,26 +121,41 @@ function DriverFormDialog({ driver, onClose }) {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm font-medium mb-1">קיבולת (עצירות)</label>
-              <input
-                type="number"
-                value={form.vehicleCapacity}
-                onChange={(e) => setForm({ ...form, vehicleCapacity: Number(e.target.value) })}
-                className="w-full px-3 py-2 border rounded-lg text-sm"
-              />
+          <div>
+            <label className="block text-sm font-medium mb-1">קיבולת (עצירות)</label>
+            <input
+              type="number"
+              value={form.vehicleCapacity}
+              onChange={(e) => setForm({ ...form, vehicleCapacity: Number(e.target.value) })}
+              className="w-full px-3 py-2 border rounded-lg text-sm"
+            />
+          </div>
+
+          <div>
+            <div className="flex items-center justify-between mb-2">
+              <label className="block text-sm font-medium">אזורי הפצה ({selectedZones.size}/{allZones.length})</label>
+              <div className="flex gap-2 text-xs">
+                <button type="button" onClick={selectAllZones} className="px-2 py-0.5 border rounded hover:bg-gray-50">בחר הכל</button>
+                <button type="button" onClick={clearAllZones} className="px-2 py-0.5 border rounded hover:bg-gray-50">נקה</button>
+              </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">אזורים (מופרדים בפסיק)</label>
-              <input
-                type="text"
-                value={form.zones}
-                onChange={(e) => setForm({ ...form, zones: e.target.value })}
-                placeholder="NORTH,CENTER"
-                className="w-full px-3 py-2 border rounded-lg text-sm font-mono"
-              />
+            <div className="grid grid-cols-2 gap-1.5 max-h-44 overflow-y-auto p-2 border rounded-lg">
+              {allZones.length === 0 ? (
+                <div className="col-span-2 text-xs text-gray-500 text-center py-2">טוען אזורים...</div>
+              ) : allZones.map((z) => (
+                <label key={z.Code} className="flex items-center gap-2 text-sm px-1.5 py-1 hover:bg-gray-50 rounded cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={selectedZones.has(z.Code)}
+                    onChange={() => toggleZone(z.Code)}
+                  />
+                  <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: z.ColorHex || '#999' }} />
+                  <span className="flex-1 truncate">{z.Name}</span>
+                  <span className="text-[10px] font-mono text-gray-400">{z.Code}</span>
+                </label>
+              ))}
             </div>
+            <p className="text-xs text-gray-500 mt-1">סמן את האזורים שהנהג מורשה לעבוד בהם. ניתן לבחור הכל לפתיחה מלאה.</p>
           </div>
 
           <label className="flex items-center gap-2 mt-2">
@@ -165,6 +194,8 @@ export default function DriversPage() {
     queryKey: ['drivers'],
     queryFn: driversApi.list,
   });
+  const { data: allZones = [] } = useQuery({ queryKey: ['zones'], queryFn: zonesApi.list });
+  const zoneByCode = Object.fromEntries(allZones.map((z) => [z.Code, z]));
 
   const deleteMutation = useMutation({
     mutationFn: (id) => driversApi.delete(id),
@@ -238,7 +269,25 @@ export default function DriversPage() {
                 )}
                 {d.Zones && (
                   <div className="text-gray-600 text-xs">
-                    אזורים: <span className="font-mono">{d.Zones}</span>
+                    <div className="text-gray-500 mb-1">
+                      אזורים ({d.Zones.split(',').filter(Boolean).length}{allZones.length ? '/' + allZones.length : ''}):
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {d.Zones.split(',').map((c) => c.trim()).filter(Boolean).map((code) => {
+                        const z = zoneByCode[code];
+                        return (
+                          <span
+                            key={code}
+                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] border"
+                            style={{ borderColor: z?.ColorHex || '#ccc', color: z?.ColorHex || '#666' }}
+                            title={code}
+                          >
+                            <span className="inline-block w-1.5 h-1.5 rounded-full" style={{ background: z?.ColorHex || '#999' }} />
+                            {z?.Name || code}
+                          </span>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
                 {d.Email && (
