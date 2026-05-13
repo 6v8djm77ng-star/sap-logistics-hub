@@ -96,3 +96,21 @@ certs/
 
 # Operator snapshots (added 2026-05-10 during Phase 0 prerequisite remediation)
 backend/data/archive/
+
+# Sandbox runtime (added 2026-05-10 during Task 3)
+# - .env.sandbox: contains its own JWT_SECRET + ANTHROPIC_API_KEY (never commit)
+# - node_modules/: deps installed by operator manually
+# - mock-data/: may contain real customer data once operator backfills from SAP
+backend-sandbox/.env.sandbox
+backend-sandbox/.env.sandbox.local
+backend-sandbox/node_modules/
+backend-sandbox/mock-data/*.real.json
+# (Mock data placeholders ARE checked in. Operator-replaced live snapshots
+#  should use *.real.json suffix to be ignored.)
+
+# Live operational store — contains bcrypt password hashes, customer PII,
+# driver phone numbers, and customerDeliveryProfiles loaded from operator
+# xlsx files. Never commit. Use backend/data/store.example.json as the
+# tracked schema reference instead. Added 2026-05-13.
+backend/data/store.json
+backend/data/store.backup.*.json

@@ -1,0 +1,161 @@
+{
+  "_comment": "STORE SCHEMA REFERENCE — sanitized. This file is checked into git as a schema reference for operators bootstrapping a fresh environment. The real backend/data/store.json is git-ignored because it contains password hashes, customer PII, and driver phone numbers. Copy this file to store.json and run scripts/load_customer_profiles.py + the bootstrap migration to populate live data.",
+  "_lastSchemaUpdate": "2026-05-13",
+
+  "drivers": [
+    {
+      "DriverId": 1,
+      "Code": "DRV-01",
+      "FullName": "Example Driver",
+      "Phone": "050-0000001",
+      "Email": "",
+      "VehiclePlate": "00-000-00",
+      "VehicleCapacity": 14,
+      "IsActive": true,
+      "Zones": "NORTH,SHARON,CENTER,JERUSALEM,SHFELA,SOUTH-1,SOUTH-2,EILAT,NORTHWEST"
+    }
+  ],
+  "nextDriverId": 2,
+
+  "users": [
+    {
+      "UserId": 1,
+      "Username": "admin",
+      "FullName": "Example Admin",
+      "Email": "admin@example.local",
+      "Phone": "050-0000000",
+      "Role": "ADMIN",
+      "IsActive": true,
+      "PreferredLanguage": "he",
+      "PasswordHash": "REPLACE_WITH_BCRYPT_HASH",
+      "LastLoginAt": null,
+      "CreatedAt": "2026-01-01T00:00:00.000Z",
+      "_comment": "Generate a real hash before booting: node -e \"console.log(require('bcryptjs').hashSync('your-pw', 10))\""
+    }
+  ],
+  "nextUserId": 2,
+
+  "zones": [
+    { "ZoneId": 1, "Code": "NORTH",     "Name": "צפון",         "Description": "חיפה, קריות, גליל",        "ColorHex": "#2563eb", "SortOrder": 1, "IsActive": true },
+    { "ZoneId": 2, "Code": "SHARON",    "Name": "שרון",         "Description": "נתניה, הרצליה, רעננה",      "ColorHex": "#0891b2", "SortOrder": 2, "IsActive": true },
+    { "ZoneId": 3, "Code": "CENTER",    "Name": "מרכז",         "Description": "תל אביב, רמת גן, גבעתיים", "ColorHex": "#059669", "SortOrder": 3, "IsActive": true },
+    { "ZoneId": 4, "Code": "JERUSALEM", "Name": "ירושלים",      "Description": "ירושלים והסביבה",           "ColorHex": "#ca8a04", "SortOrder": 4, "IsActive": true },
+    { "ZoneId": 5, "Code": "SHFELA",    "Name": "שפלה",         "Description": "רחובות, ראשון, רמלה, לוד", "ColorHex": "#dc2626", "SortOrder": 5, "IsActive": true },
+    { "ZoneId": 6, "Code": "SOUTH-1",   "Name": "דרום - אשדוד", "Description": "אשדוד, אשקלון, קרית גת",   "ColorHex": "#9333ea", "SortOrder": 6, "IsActive": true },
+    { "ZoneId": 7, "Code": "SOUTH-2",   "Name": "דרום - ב\"ש",   "Description": "באר שבע והדרום",            "ColorHex": "#db2777", "SortOrder": 7, "IsActive": true },
+    { "ZoneId": 8, "Code": "EILAT",     "Name": "אילת",         "Description": "אילת",                      "ColorHex": "#2563eb", "SortOrder": 8, "IsActive": true },
+    { "ZoneId": 9, "Code": "NORTHWEST", "Name": "צפון מערבי",   "Description": "חוף הים מחדרה עד נהריה",   "ColorHex": "#0891b2", "SortOrder": 9, "IsActive": true }
+  ],
+  "nextZoneId": 10,
+
+  "pickers": [
+    {
+      "PickerId": 1,
+      "Code": "PICK-01",
+      "FullName": "Example Picker",
+      "Phone": "",
+      "IsActive": true,
+      "CreatedAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "nextPickerId": 2,
+
+  "customerDeliveryProfiles": [
+    {
+      "_comment": "Example: retail chain customer outside Eilat — gets a delivery note per order.",
+      "CardCode": "EXAMPLE-001",
+      "Company": "OIG",
+      "Name": "רשת אלקטרה דוגמה - סניף מרכז",
+      "City": "תל אביב",
+      "Street": "רחוב הדוגמה 1",
+      "Zone": "CENTER",
+      "SubZone": "",
+      "ZoneNameRaw": "מרכז",
+      "DeliveryDays": ["שני", "חמישי"],
+      "Issue": "",
+      "DocPolicy": {
+        "perOrderDeliveryNote": "yes",
+        "perOrderInvoice": "no",
+        "aggregateDeliveryNote": "no",
+        "aggregateInvoice": "no",
+        "notes": "רשת שיווק — תעודת משלוח לכל הזמנה",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "classifiedBy": "auto_v1"
+      },
+      "Status": "ACTIVE",
+      "StatusReason": "",
+      "StatusAt": "2026-01-01T00:00:00.000Z"
+    },
+    {
+      "_comment": "Example: private (non-chain) customer — gets an invoice per order.",
+      "CardCode": "EXAMPLE-002",
+      "Company": "UNICO",
+      "Name": "חנות חשמל דוגמה",
+      "City": "רחובות",
+      "Street": "רחוב הדוגמה 2",
+      "Zone": "SHFELA",
+      "SubZone": "",
+      "ZoneNameRaw": "שפלה",
+      "DeliveryDays": ["שלישי"],
+      "Issue": "",
+      "DocPolicy": {
+        "perOrderDeliveryNote": "no",
+        "perOrderInvoice": "yes",
+        "aggregateDeliveryNote": "no",
+        "aggregateInvoice": "no",
+        "notes": "לקוח פרטי — חשבונית לכל הזמנה",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "classifiedBy": "auto_v1"
+      },
+      "Status": "ACTIVE",
+      "StatusReason": "",
+      "StatusAt": "2026-01-01T00:00:00.000Z"
+    },
+    {
+      "_comment": "Example: Eilat (free-trade zone) — always TAX INVOICE per order regardless of customer kind.",
+      "CardCode": "EXAMPLE-003",
+      "Company": "OIG",
+      "Name": "לקוח אילת דוגמה",
+      "City": "אילת",
+      "Street": "רחוב הדוגמה 3",
+      "Zone": "EILAT",
+      "SubZone": "",
+      "ZoneNameRaw": "אילת",
+      "DeliveryDays": ["שני", "חמישי"],
+      "Issue": "",
+      "DocPolicy": {
+        "perOrderDeliveryNote": "no",
+        "perOrderInvoice": "yes",
+        "aggregateDeliveryNote": "no",
+        "aggregateInvoice": "no",
+        "notes": "אזור סחר חופשי — חשבונית מס חובה (כלל אזורי)",
+        "updatedAt": "2026-01-01T00:00:00.000Z",
+        "classifiedBy": "auto_v1"
+      },
+      "Status": "ACTIVE",
+      "StatusReason": "",
+      "StatusAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+
+  "runs": [],
+  "nextRunId": 1,
+  "stops": [],
+  "nextStopId": 1,
+  "runOrders": [],
+  "nextRunOrderId": 1,
+  "waves": [],
+  "nextWaveId": 1,
+  "waveLines": [],
+  "nextWaveLineId": 1,
+  "waveAllocations": [],
+  "nextWaveAllocationId": 1,
+  "deliveryNotes": [],
+  "nextDeliveryNoteId": 1,
+  "invoices": [],
+  "nextInvoiceId": 1,
+  "lineDeliveries": [],
+  "nextLineDeliveryId": 1,
+  "cityZoneOverrides": {},
+  "customerDocPolicies": {}
+}
