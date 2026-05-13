@@ -393,6 +393,9 @@ export function addRun(data) {
     CreatedAt: new Date().toISOString(),
     StopCount: 0,
     OrderCount: 0,
+    // Default picking mode: one consolidated pick-list. Planner can flip to
+    // BY_PALLET or BY_CUSTOMER from the Run details page.
+    PalletMode: 'SINGLE',
   };
   s.runs.push(newRun);
   save();
@@ -414,6 +417,15 @@ export function updateRun(id, updates) {
     }
   }
   if (updates.notes !== undefined) run.Notes = updates.notes;
+  if (updates.palletMode !== undefined) {
+    const allowed = ['SINGLE', 'BY_PALLET', 'BY_CUSTOMER'];
+    if (!allowed.includes(updates.palletMode)) {
+      const err = new Error('PalletMode must be one of ' + allowed.join(', '));
+      err.status = 400;
+      throw err;
+    }
+    run.PalletMode = updates.palletMode;
+  }
   save();
   return run;
 }
@@ -1223,9 +1235,14 @@ export function updateStop(stopId, updates) {
     contactPhone: 'ContactPhone', deliveryNotes: 'DeliveryNotes',
     deliveryWindowStart: 'DeliveryWindowStart', deliveryWindowEnd: 'DeliveryWindowEnd',
     notes: 'Notes', status: 'Status',
+    stopOrder: 'StopOrder',
   };
   for (const [from, to] of Object.entries(map)) {
     if (updates[from] !== undefined) stop[to] = updates[from];
+  }
+  if (updates.palletLabel !== undefined) {
+    const v = String(updates.palletLabel || '').trim().slice(0, 8);
+    stop.PalletLabel = v;
   }
   save();
   return stop;
@@ -1472,15 +1489,22 @@ export function getWave(waveId) {
     docToCustomer.set(`${ord.CompanyCode}:${ord.SapDocEntry}`, {
       city: stop.City || '',
       branchName: stop.BranchName || ord.SapCardName || '',
+      stopId: stop.StopId,
+      stopOrder: stop.StopOrder || 0,
+      palletLabel: stop.PalletLabel || '',
     });
   }
   const enrich = (a) => {
-    if (a.City && a.BranchName) return a;
     const cust = docToCustomer.get(`${a.CompanyCode}:${a.SapDocEntry}`) || {};
     return {
       ...a,
       City: a.City || cust.city || '',
       BranchName: a.BranchName || cust.branchName || a.SapCardName || '',
+      // Pallet-mode picking: surface the planner's manual pallet assignment +
+      // a stable stop id, so PickingPage can group rows by stop or by label.
+      StopId: cust.stopId || null,
+      StopOrder: cust.stopOrder || null,
+      PalletLabel: cust.palletLabel || '',
     };
   };
 
@@ -1526,7 +1550,14 @@ export function getWave(waveId) {
   const completed = lines.filter((l) => l.Status === 'COMPLETED').length;
   const picked = lines.reduce((sum, l) => sum + Number(l.PickedQuantity || 0), 0);
   const needed = lines.reduce((sum, l) => sum + Number(l.TotalQuantity || 0), 0);
-  return { ...wave, lines, CompletedLines: completed, TotalPicked: picked, TotalNeeded: needed };
+  return {
+    ...wave,
+    lines,
+    CompletedLines: completed,
+    TotalPicked: picked,
+    TotalNeeded: needed,
+    PalletMode: run?.PalletMode || 'SINGLE',
+  };
 }
 
 export function getWaveForRun(runId) {

@@ -69,6 +69,23 @@ export default function RunDetailsPage() {
     },
   });
 
+  // Pallet mode: how the warehouse should physically organize the picking for
+  // this run. SINGLE = one consolidated pick-list (default); BY_PALLET = the
+  // planner labels each stop with a pallet code (P1/P2/...) and picking is
+  // grouped by that label; BY_CUSTOMER = each stop is its own pallet/group.
+  const palletModeMutation = useMutation({
+    mutationFn: (palletMode) =>
+      api.patch(`/runs/${id}`, { palletMode }).then((r) => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['run', id] }),
+    onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בעדכון מצב משטח'),
+  });
+
+  const palletLabelMutation = useMutation({
+    mutationFn: ({ stopId, palletLabel }) =>
+      api.patch(`/stops/${stopId}`, { palletLabel }).then((r) => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['run', id] }),
+  });
+
   // Loading plan (LIFO)
   const [loadingPlan, setLoadingPlan] = useState(null);
   const fetchLoadingPlan = useMutation({
@@ -167,6 +184,11 @@ export default function RunDetailsPage() {
             <span className="text-gray-500">·</span>
             <span className="text-gray-500">{stops.length} עצירות</span>
           </div>
+          <PalletModeToggle
+            value={run.PalletMode || 'SINGLE'}
+            onChange={(m) => palletModeMutation.mutate(m)}
+            disabled={palletModeMutation.isPending}
+          />
         </div>
 
         <div className="flex gap-2 flex-wrap">
@@ -387,6 +409,13 @@ export default function RunDetailsPage() {
                 <div className="w-8 h-8 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center font-semibold shrink-0">
                   {stop.StopOrder || idx + 1}
                 </div>
+                {(run.PalletMode === 'BY_PALLET' || run.PalletMode === 'BY_CUSTOMER') && (
+                  <PalletLabelInput
+                    stopId={stop.StopId}
+                    value={stop.PalletLabel || ''}
+                    onSave={(palletLabel) => palletLabelMutation.mutate({ stopId: stop.StopId, palletLabel })}
+                  />
+                )}
                 <div className="flex-1">
                   <div className="font-medium">
                     {stop.Street || ''} {stop.BuildingNumber || ''}
@@ -568,6 +597,76 @@ export default function RunDetailsPage() {
           onClose={() => setShowAssignDriver(false)}
         />
       )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// 3-state toggle for how the warehouse should pick & arrange this run:
+//   SINGLE      — one consolidated list (default, for אסובלו)
+//   BY_PALLET   — manager labels each stop with a pallet code; picking is
+//                 grouped by label (for נתנאל)
+//   BY_CUSTOMER — each customer is its own pallet/group (for קבלן הפצה)
+// ----------------------------------------------------------------------------
+function PalletModeToggle({ value, onChange, disabled }) {
+  const options = [
+    { key: 'SINGLE',      label: 'ריכוז אחד',  hint: 'ליקוט מאוחד לכל הקו (ברירת מחדל)' },
+    { key: 'BY_PALLET',   label: 'לפי משטח',   hint: 'סימון ידני של מספר משטח לכל עצירה' },
+    { key: 'BY_CUSTOMER', label: 'לפי לקוח',   hint: 'ריכוז נפרד לכל לקוח / משטח' },
+  ];
+  return (
+    <div className="mt-3 flex items-center gap-2 text-xs">
+      <span className="text-gray-500">מצב ליקוט:</span>
+      <div className="inline-flex rounded-lg border border-gray-300 overflow-hidden">
+        {options.map((o) => {
+          const active = value === o.key;
+          return (
+            <button
+              key={o.key}
+              type="button"
+              disabled={disabled || active}
+              onClick={() => onChange(o.key)}
+              title={o.hint}
+              className={`px-3 py-1.5 transition-colors ${
+                active
+                  ? 'bg-brand-600 text-white font-medium cursor-default'
+                  : 'bg-white text-gray-700 hover:bg-gray-50 disabled:opacity-50'
+              }`}
+            >
+              {o.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------------------
+// Per-stop pallet label input. Free text up to 8 chars (P1, A, 1, ...).
+// Saves on blur or Enter — no Save button to keep the row compact.
+// ----------------------------------------------------------------------------
+function PalletLabelInput({ stopId, value, onSave }) {
+  // Uncontrolled input — keyed by stopId so React replaces it whenever the
+  // upstream value changes (e.g. after a save reload). Saves on blur/Enter.
+  return (
+    <div className="flex items-center gap-1">
+      <span className="text-[10px] text-gray-500">משטח:</span>
+      <input
+        key={`${stopId}-${value}`}
+        type="text"
+        defaultValue={value}
+        maxLength={8}
+        placeholder="P1"
+        className="w-14 px-1.5 py-0.5 border border-amber-300 bg-amber-50 rounded text-xs font-mono text-center focus:outline-none focus:border-amber-500"
+        onBlur={(e) => {
+          const v = e.target.value.trim();
+          if (v !== (value || '')) onSave(v);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') e.currentTarget.blur();
+        }}
+      />
     </div>
   );
 }

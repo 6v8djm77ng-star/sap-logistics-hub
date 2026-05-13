@@ -263,9 +263,26 @@ export default function PickingPage() {
   const totalPicked = lines.reduce((s, l) => s + Number(l.PickedQuantity || 0), 0);
   const totalNeeded = lines.reduce((s, l) => s + Number(l.TotalQuantity || 0), 0);
 
-  const visibleLines = hideCompleted
-    ? lines.filter((l) => l.Status !== 'COMPLETED')
+  // Group key per line, mirroring the picker-page banner logic. Used to
+  // re-sort lines so all rows belonging to the same pallet/customer sit
+  // together regardless of city order.
+  const groupKey = (l) => {
+    const first = l.allocations?.[0];
+    if (wave.PalletMode === 'BY_PALLET')   return first?.PalletLabel || 'zzz_no_pallet';
+    if (wave.PalletMode === 'BY_CUSTOMER') return String(first?.StopOrder || first?.StopId || 'zzz') + '|' + (first?.BranchName || '');
+    return l.PrimaryCity || 'zzz';
+  };
+  const sortedLines = (wave.PalletMode && wave.PalletMode !== 'SINGLE')
+    ? [...lines].sort((a, b) => {
+        const aDone = a.Status === 'COMPLETED' || a.Status === 'SHORTAGE';
+        const bDone = b.Status === 'COMPLETED' || b.Status === 'SHORTAGE';
+        if (aDone !== bDone) return aDone ? 1 : -1;
+        return String(groupKey(a)).localeCompare(String(groupKey(b)), 'he');
+      })
     : lines;
+  const visibleLines = hideCompleted
+    ? sortedLines.filter((l) => l.Status !== 'COMPLETED')
+    : sortedLines;
 
   return (
     <div className="p-4 md:p-6 max-w-5xl mx-auto">
@@ -388,19 +405,40 @@ export default function PickingPage() {
             (l) => l.Status !== 'COMPLETED' && l.Status !== 'SHORTAGE'
           );
           const isCurrent = isPending && idx === firstPendingIdx;
-          // Show a city banner whenever the city changes between consecutive lines
-          const prevCity = idx > 0 ? (visibleLines[idx - 1].PrimaryCity || '') : null;
-          const showCityHeader = (line.PrimaryCity || '') && line.PrimaryCity !== prevCity;
-          // Count items going to this city
-          const cityItemCount = visibleLines.filter((l) => (l.PrimaryCity || '') === line.PrimaryCity).length;
+          // Group banner: changes meaning per PalletMode.
+          //   SINGLE      → group by city (current behavior)
+          //   BY_PALLET   → group by the pallet label the planner set
+          //   BY_CUSTOMER → group by customer (BranchName / StopId)
+          const groupKeyOf = (l) => {
+            const first = l.allocations?.[0];
+            if (wave.PalletMode === 'BY_PALLET')   return first?.PalletLabel || '(ללא משטח)';
+            if (wave.PalletMode === 'BY_CUSTOMER') return first?.BranchName || first?.SapCardName || '(ללא לקוח)';
+            return l.PrimaryCity || '';
+          };
+          const groupIconAndLabel = (l) => {
+            const key = groupKeyOf(l);
+            if (wave.PalletMode === 'BY_PALLET')   return { icon: <Package size={16} className="text-amber-700" />, label: 'משטח ' + key, color: 'amber' };
+            if (wave.PalletMode === 'BY_CUSTOMER') return { icon: <MapPin size={16} className="text-purple-700" />, label: key, color: 'purple' };
+            return { icon: <MapPin size={16} className="text-brand-700" />, label: key, color: 'brand' };
+          };
+          const currentGroup = groupKeyOf(line);
+          const prevGroup = idx > 0 ? groupKeyOf(visibleLines[idx - 1]) : null;
+          const showGroupHeader = currentGroup && currentGroup !== prevGroup;
+          const groupItemCount = visibleLines.filter((l) => groupKeyOf(l) === currentGroup).length;
+          const gInfo = groupIconAndLabel(line);
+          const headerColors = {
+            brand:  'bg-brand-100  border-brand-600  text-brand-700  text-brand-900',
+            amber:  'bg-amber-100  border-amber-600  text-amber-700  text-amber-900',
+            purple: 'bg-purple-100 border-purple-600 text-purple-700 text-purple-900',
+          }[gInfo.color] || '';
 
           return (
             <div key={line.WaveLineId}>
-              {showCityHeader && (
-                <div className="sticky top-0 z-10 -mx-1 px-3 py-2 mb-2 mt-3 bg-brand-100 border-r-4 border-brand-600 rounded-r-lg flex items-center gap-2">
-                  <MapPin size={16} className="text-brand-700" />
-                  <span className="font-bold text-brand-900">{line.PrimaryCity}</span>
-                  <span className="text-xs text-brand-700">· {cityItemCount} פריטים</span>
+              {showGroupHeader && (
+                <div className={`sticky top-0 z-10 -mx-1 px-3 py-2 mb-2 mt-3 border-r-4 rounded-r-lg flex items-center gap-2 ${headerColors}`}>
+                  {gInfo.icon}
+                  <span className="font-bold">{gInfo.label}</span>
+                  <span className="text-xs">· {groupItemCount} פריטים</span>
                 </div>
               )}
               <div

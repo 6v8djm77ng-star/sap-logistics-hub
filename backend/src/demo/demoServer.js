@@ -11,6 +11,7 @@
 import express from 'express';
 import http from 'http';
 import path from 'path';
+import fsSync from 'fs';
 import cors from 'cors';
 import compression from 'compression';
 import jwt from 'jsonwebtoken';
@@ -342,6 +343,7 @@ const WAVE_A_SENSITIVE_PREFIXES = [
   '/api/cod', '/api/notify', '/api/delivery-notes', '/api/invoices',
   '/api/documents', '/api/driver', '/api/customers', '/api/customer-profiles',
   '/api/drivers', '/api/zones', '/api/pickers', '/api/audit', '/api/sap',
+  '/api/system',
 ];
 for (const prefix of WAVE_A_SENSITIVE_PREFIXES) {
   app.use(prefix, requireAuthBasic);
@@ -1330,10 +1332,14 @@ app.post('/api/runs/:id/duplicate', (req, res) => {
 });
 
 app.patch('/api/runs/:id', (req, res) => {
-  const updated = store.updateRun(req.params.id, req.body);
-  if (!updated) return res.status(404).json({ error: 'Not found' });
-  io.emit('run:updated', updated);
-  res.json(updated);
+  try {
+    const updated = store.updateRun(req.params.id, req.body);
+    if (!updated) return res.status(404).json({ error: 'Not found' });
+    io.emit('run:updated', updated);
+    res.json(updated);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
 });
 
 app.patch('/api/runs/:id/status', (req, res) => {
@@ -1755,17 +1761,20 @@ app.post('/api/runs/stops/:stopId/tracking-link', (req, res) => {
 // ----------------------------------------------------------------------------
 function buildPublicBase(req) {
   // Try the cf-tunnel URL first (so external customers can click the link),
-  // fall back to whatever host the request came on.
+  // fall back to whatever host the request came on. Earlier code used CJS
+  // require() which silently throws under "type": "module" — we now use the
+  // already-imported `fs` (existsSync etc. via dynamic import is too heavy
+  // for a per-request path). fs is bound at module scope via fsSync.
   try {
-    const fs = require('fs');
-    const path = require('path');
     const cfLog = path.resolve(__dirname, '..', '..', 'logs', 'cf-tunnel-error.log');
-    if (fs.existsSync(cfLog)) {
-      const txt = fs.readFileSync(cfLog, 'utf8');
+    if (fsSync.existsSync(cfLog)) {
+      const txt = fsSync.readFileSync(cfLog, 'utf8');
       const matches = txt.match(/https:\/\/[a-z-]+\.trycloudflare\.com/g);
       if (matches && matches.length) return matches[matches.length - 1];
     }
-  } catch {}
+  } catch (err) {
+    console.warn('[buildPublicBase] cf-tunnel log read failed:', err.message);
+  }
   if (process.env.PUBLIC_URL) return process.env.PUBLIC_URL;
   return `${req.protocol || 'http'}://${req.get('host') || `localhost:${PORT}`}`;
 }
@@ -3436,6 +3445,14 @@ app.get('/api/reports/waves/:id/picking.pdf', (req, res) => {
 
 // Audit
 app.get('/api/audit/:entityType/:entityId', (_req, res) => res.json({ trail: [] }));
+
+// System — exposes the live public base URL so the frontend can build
+// QR/install links that work outside the operator's laptop. The frontend
+// uses this when window.location.host is localhost, where naively
+// concatenating the host yields a link that nobody else can reach.
+app.get('/api/system/public-base', (req, res) => {
+  res.json({ base: buildPublicBase(req) });
+});
 
 // ----------------------------------------------------------------------------
 // Customer Delivery Profiles — master data loaded from OIG + UNICO xlsx.
