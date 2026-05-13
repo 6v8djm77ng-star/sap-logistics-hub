@@ -2036,3 +2036,88 @@ export function getDocumentStats({ runDate } = {}) {
     },
   };
 }
+
+// =====================================================================
+// Customer Delivery Profiles — loaded from OIG + UNICO master xlsx via
+// scripts/load_customer_profiles.py. Each profile carries the canonical
+// zone, optional sub-zone, and the customer's weekly delivery days.
+// =====================================================================
+function _profiles() {
+  return load().customerDeliveryProfiles || [];
+}
+
+/** Return all profiles, optionally filtered. */
+export function getCustomerProfiles({ zone, day, company, issue } = {}) {
+  let rows = _profiles();
+  if (zone)    rows = rows.filter((p) => p.Zone === zone);
+  if (company) rows = rows.filter((p) => p.Company === company);
+  if (day)     rows = rows.filter((p) => Array.isArray(p.DeliveryDays) && p.DeliveryDays.includes(day));
+  if (issue === 'true')  rows = rows.filter((p) => !!p.Issue);
+  if (issue === 'false') rows = rows.filter((p) => !p.Issue);
+  return rows;
+}
+
+/** Find a single profile by CardCode (+ optional Company disambiguation). */
+export function getCustomerProfile(cardCode, company) {
+  const key = String(cardCode || '').trim();
+  if (!key) return null;
+  const rows = _profiles().filter((p) => String(p.CardCode) === key);
+  if (rows.length === 0) return null;
+  if (company) {
+    const exact = rows.find((p) => p.Company === company);
+    if (exact) return exact;
+  }
+  return rows[0];
+}
+
+/** Update the DocPolicy of a single profile. Returns the updated profile or null. */
+const ALLOWED_POLICY_VALUES = new Set(['yes', 'no', 'na', '']);
+const POLICY_KEYS = ['perOrderDeliveryNote', 'perOrderInvoice', 'aggregateDeliveryNote', 'aggregateInvoice'];
+
+export function setCustomerProfilePolicy(cardCode, company, patch) {
+  const key = String(cardCode || '').trim();
+  if (!key) return null;
+  const data = load();
+  const rows = (data.customerDeliveryProfiles || []).filter((p) => String(p.CardCode) === key);
+  if (rows.length === 0) return null;
+  const target = (company && rows.find((p) => p.Company === company)) || rows[0];
+
+  if (!target.DocPolicy) {
+    target.DocPolicy = { perOrderDeliveryNote: '', perOrderInvoice: '', aggregateDeliveryNote: '', aggregateInvoice: '', notes: '' };
+  }
+  for (const k of POLICY_KEYS) {
+    if (k in (patch || {})) {
+      const v = String(patch[k] || '').toLowerCase();
+      if (!ALLOWED_POLICY_VALUES.has(v)) {
+        const err = new Error(`Invalid value for ${k}: ${patch[k]}. Allowed: yes/no/na/empty`);
+        err.status = 400;
+        throw err;
+      }
+      target.DocPolicy[k] = v;
+    }
+  }
+  if (typeof patch?.notes === 'string') {
+    target.DocPolicy.notes = patch.notes.slice(0, 500);
+  }
+  target.DocPolicy.updatedAt = new Date().toISOString();
+  save();
+  return target;
+}
+
+/** Summary counts by zone / day / issue rate, for the planning dashboard. */
+export function getCustomerProfileStats() {
+  const rows = _profiles();
+  const byZone = {};
+  const byDay  = {};
+  const byCompany = {};
+  let issues = 0;
+  for (const p of rows) {
+    if (p.Issue) { issues++; continue; }
+    byZone[p.Zone] = (byZone[p.Zone] || 0) + 1;
+    byCompany[p.Company] = (byCompany[p.Company] || 0) + 1;
+    for (const d of (p.DeliveryDays || [])) {
+      byDay[d] = (byDay[d] || 0) + 1;
+    }
+  }
+  return { total: rows.length, withIssues: issues, byZone, byDay, byCompany };
+}

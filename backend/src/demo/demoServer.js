@@ -339,8 +339,8 @@ const WAVE_A_SENSITIVE_PREFIXES = [
   '/api/picking', '/api/returns', '/api/reports', '/api/analytics',
   '/api/failures', '/api/davo-mix', '/api/addresses', '/api/tracking',
   '/api/cod', '/api/notify', '/api/delivery-notes', '/api/invoices',
-  '/api/documents', '/api/driver', '/api/customers', '/api/drivers',
-  '/api/zones', '/api/pickers', '/api/audit', '/api/sap',
+  '/api/documents', '/api/driver', '/api/customers', '/api/customer-profiles',
+  '/api/drivers', '/api/zones', '/api/pickers', '/api/audit', '/api/sap',
 ];
 for (const prefix of WAVE_A_SENSITIVE_PREFIXES) {
   app.use(prefix, requireAuthBasic);
@@ -1794,7 +1794,30 @@ app.get('/api/orders/open', async (req, res) => {
         company: company || null,
         search: search || null,
       });
-      return res.json({ orders, count: orders.length, source: 'sap' });
+      // Enrich each order with the customer's delivery profile:
+      //   - suggestedZone     → canonical store zone (e.g. CENTER, EILAT)
+      //   - suggestedSubZone  → 'קרוב'/'רחוק'/'תל אביב' or ''
+      //   - scheduledDays     → e.g. ['שני','חמישי']
+      //   - profileIssue      → reason if the profile is incomplete in SAP
+      // Filtering by zone/day is up to the caller (?zone=, ?day=) and applied
+      // after enrichment so unmatched orders still surface.
+      const enriched = orders.map((o) => {
+        const cardCode = String(o.CardCode || '').trim();
+        const companyCode = (o.CompanyCode || o.Company || '').toString();
+        const companyKey = companyCode === 'A' ? 'OIG' : companyCode === 'B' ? 'UNICO' : null;
+        const profile = cardCode ? store.getCustomerProfile(cardCode, companyKey) : null;
+        return {
+          ...o,
+          suggestedZone:    profile?.Zone || '',
+          suggestedSubZone: profile?.SubZone || '',
+          scheduledDays:    profile?.DeliveryDays || [],
+          profileIssue:     profile?.Issue || (profile ? '' : 'no_profile'),
+        };
+      });
+      let out = enriched;
+      if (req.query.zone) out = out.filter((o) => o.suggestedZone === req.query.zone);
+      if (req.query.day)  out = out.filter((o) => (o.scheduledDays || []).includes(req.query.day));
+      return res.json({ orders: out, count: out.length, source: 'sap', enrichedFromProfiles: true });
     } catch (err) {
       console.warn('[sap] open orders failed:', err.message);
     }
@@ -3339,6 +3362,49 @@ app.get('/api/reports/waves/:id/picking.pdf', (req, res) => {
 
 // Audit
 app.get('/api/audit/:entityType/:entityId', (_req, res) => res.json({ trail: [] }));
+
+// ----------------------------------------------------------------------------
+// Customer Delivery Profiles — master data loaded from OIG + UNICO xlsx.
+// Lets the planner filter customers by zone, by weekly delivery day, and
+// look up the canonical zone/day for any SAP CardCode.
+// (Already gated by the Wave A /api/customers block above — auth required.)
+// ----------------------------------------------------------------------------
+app.get('/api/customer-profiles', (req, res) => {
+  const { zone, day, company, issue, q } = req.query;
+  let rows = store.getCustomerProfiles({ zone, day, company, issue });
+  if (q) {
+    const needle = String(q).toLowerCase();
+    rows = rows.filter((p) =>
+      String(p.CardCode).toLowerCase().includes(needle) ||
+      (p.Name || '').toLowerCase().includes(needle) ||
+      (p.City || '').toLowerCase().includes(needle)
+    );
+  }
+  res.json({ profiles: rows, count: rows.length });
+});
+
+app.get('/api/customer-profiles/stats', (_req, res) => {
+  res.json(store.getCustomerProfileStats());
+});
+
+app.get('/api/customer-profiles/:cardCode', (req, res) => {
+  const profile = store.getCustomerProfile(req.params.cardCode, req.query.company);
+  if (!profile) return res.status(404).json({ error: 'Profile not found' });
+  res.json(profile);
+});
+
+// Update the document policy for one customer. Body: { perOrderDeliveryNote,
+// perOrderInvoice, aggregateDeliveryNote, aggregateInvoice, notes }
+// Values: 'yes' | 'no' | 'na' | '' (blank = not yet decided).
+app.patch('/api/customer-profiles/:cardCode/policy', (req, res) => {
+  try {
+    const updated = store.setCustomerProfilePolicy(req.params.cardCode, req.query.company, req.body || {});
+    if (!updated) return res.status(404).json({ error: 'Profile not found' });
+    res.json({ ok: true, profile: updated });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
 
 // Demo: reset all data to initial state (for starting a fresh demo)
 app.post('/api/demo/reset', async (_req, res) => {
