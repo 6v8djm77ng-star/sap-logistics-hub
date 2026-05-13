@@ -18,6 +18,7 @@ import rateLimit from 'express-rate-limit';
 import { Server as SocketServer } from 'socket.io';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
+import bidiFactory from 'bidi-js';
 import 'dotenv/config';
 import * as data from './demoData.js';
 import { startSimulation } from './liveSimulation.js';
@@ -604,25 +605,45 @@ app.get('/api/runs/:id/loading-plan', async (req, res) => {
 app.post('/api/runs/:id/optimize', async (req, res) => {
   try {
     const { optimizeRoute } = await import('./routeOptimizer.js');
+    const { resolveStopLatLng } = await import('./cityCoords.js');
     const runId = Number(req.params.id);
     const details = store.getRunDetails(runId);
     if (!details) return res.status(404).json({ error: 'Run not found' });
 
-    // Stops need lat/lng. Use the persisted geocode if any, otherwise skip.
-    const stops = (details.stops || []).filter((s) => s.Lat && s.Lng);
-    if (stops.length < 2) {
+    // Coordinates: prefer stored Latitude/Longitude, fall back to the
+    // city-centroid geocoder. (Earlier code looked for s.Lat/s.Lng which
+    // never existed — fields are Latitude/Longitude — and many stops have
+    // null coords anyway. The geocoder covers the ~40 most common
+    // Israeli cities, which is enough for nearest-neighbor ordering.)
+    const allStops = (details.stops || []);
+    const resolved = allStops
+      .map((s) => {
+        const r = resolveStopLatLng(s);
+        return r ? { id: s.StopId, lat: r.lat, lng: r.lng, source: r.source, city: s.City } : null;
+      })
+      .filter(Boolean);
+
+    if (resolved.length < 2) {
       return res.status(400).json({
-        error: 'דרושות לפחות 2 עצירות עם מיקום (lat/lng) כדי לבצע אופטימיזציה',
-        eligibleStops: stops.length,
+        error: 'דרושות לפחות 2 עצירות עם מיקום (מאוחסן או עיר מזוהה) כדי לבצע אופטימיזציה',
+        totalStops: allStops.length,
+        eligibleStops: resolved.length,
+        unresolvedCities: allStops
+          .filter((s) => !resolveStopLatLng(s))
+          .map((s) => s.City || '(ללא עיר)'),
       });
     }
 
     const result = await optimizeRoute(
-      stops.map((s) => ({ id: s.StopId, lat: Number(s.Lat), lng: Number(s.Lng) })),
+      resolved.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng })),
       req.body?.start
         ? { start: { lat: Number(req.body.start.lat), lng: Number(req.body.start.lng) } }
         : undefined
     );
+    // Tag whether we used stored coords or the fallback geocoder, so the
+    // operator knows if results are exact or approximate.
+    const usedFallback = resolved.some((s) => s.source === 'city');
+    result.coordSource = usedFallback ? 'city-centroid' : 'stored';
 
     // If client requested apply, reorder the stops in storage.
     if (req.body?.apply) {
@@ -1396,131 +1417,177 @@ app.delete('/api/run-orders/:runOrderId', (req, res) => {
  * and creates one run per zone with stops+orders.
  * Idempotent: skips orders already assigned to a run today.
  */
+// ------------------------------------------------------------------
+// Shared exclusion logic — runs the SAME 3 filters (low customer total,
+// too few lines, missing stock) used by /api/runs/auto-plan. Reused by
+// /api/runs/auto-plan/preview-exclusions so the planner can see exactly
+// who will and won't be planned, without creating any runs.
+// Returns { allOrders, plannableOrders, excludedOrders, filters,
+//           alreadyAssigned, existingRuns }.
+// ------------------------------------------------------------------
+async function computePlanExclusions(opts = {}) {
+  const runDate = opts.runDate || new Date().toISOString().slice(0, 10);
+
+  const existingRuns = store.getRuns().filter((r) => r.RunDate === runDate);
+  const existingRunIds = existingRuns.map((r) => r.RunId);
+  const existingStops = (store.load().stops || []).filter((s) => existingRunIds.includes(s.RunId));
+  const existingStopIds = existingStops.map((s) => s.StopId);
+  const alreadyAssigned = new Set(
+    (store.load().runOrders || [])
+      .filter((o) => existingStopIds.includes(o.StopId))
+      .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
+  );
+
+  if (!sapLive) {
+    const err = new Error('SAP לא מחובר - לא ניתן לבצע תכנון אוטומטי');
+    err.status = 400;
+    throw err;
+  }
+  const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 });
+
+  const MIN_CUSTOMER_TOTAL = Number(opts.minCustomerTotal ?? 3000);
+  const MIN_LINES_PER_ORDER = Number(opts.minLinesPerOrder ?? 2);
+  const requireStock = opts.requireStock !== false;
+
+  // (a) Customer-total aggregation across companies (CardName-based).
+  const customerTotals = new Map();
+  const norm = (s) => String(s || '').trim().toLowerCase();
+  for (const o of allOrders) {
+    const k = norm(o.CardName);
+    customerTotals.set(k, (customerTotals.get(k) || 0) + Number(o.DocTotal || 0));
+  }
+
+  // (b) Per-order lines + stock availability.
+  let stockMap = new Map();
+  let linesByOrder = new Map();
+  if (requireStock) {
+    const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
+    const allLines = await sapBridge.getBulkOrderLines(refs).catch((e) => {
+      console.warn('[plan-exclusions] getBulkOrderLines failed:', e.message);
+      return [];
+    });
+    for (const ln of allLines) {
+      const k = `${ln.CompanyCode}:${ln.DocEntry}`;
+      if (!linesByOrder.has(k)) linesByOrder.set(k, []);
+      linesByOrder.get(k).push(ln);
+    }
+    const PICKING_WAREHOUSES = (process.env.PICKING_WAREHOUSES || '01,02,03,10,20')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    for (const code of ['A', 'B']) {
+      const itemCodes = [...new Set(allLines.filter((l) => l.CompanyCode === code).map((l) => l.ItemCode))];
+      if (itemCodes.length === 0) continue;
+      for (let i = 0; i < itemCodes.length; i += 200) {
+        const batch = itemCodes.slice(i, i + 200);
+        const stock = await sapBridge.getItemsStock(code, batch).catch(() => []);
+        for (const s of stock) {
+          if (!PICKING_WAREHOUSES.includes(String(s.WarehouseCode))) continue;
+          const sk = `${code}:${s.ItemCode}`;
+          stockMap.set(sk, (stockMap.get(sk) || 0) + Number(s.Available || 0));
+        }
+      }
+    }
+  }
+
+  // (c) Apply the 3 filters.
+  const plannableOrders = [];
+  const excludedOrders = [];
+  for (const o of allOrders) {
+    const reasons = [];
+    const custTotal = customerTotals.get(norm(o.CardName)) || 0;
+    if (custTotal < MIN_CUSTOMER_TOTAL) {
+      reasons.push({ type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL });
+    }
+    const ordLinesCount = Number(o.LinesCount || 0);
+    if (MIN_LINES_PER_ORDER > 0 && ordLinesCount > 0 && ordLinesCount < MIN_LINES_PER_ORDER) {
+      reasons.push({ type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER });
+    }
+    if (requireStock) {
+      const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
+      const missing = [];
+      for (const ln of lns) {
+        const avail = stockMap.get(`${o.CompanyCode}:${ln.ItemCode}`) || 0;
+        const needed = Number(ln.OpenQty || ln.Quantity || 0);
+        if (avail < needed) {
+          missing.push({ itemCode: ln.ItemCode, itemName: ln.ItemName, needed, available: avail });
+        }
+      }
+      if (missing.length > 0) reasons.push({ type: 'missing_stock', items: missing });
+    }
+    if (reasons.length > 0) {
+      excludedOrders.push({
+        companyCode: o.CompanyCode,
+        docEntry: o.DocEntry,
+        docNum: o.DocNum,
+        cardCode: o.CardCode,
+        cardName: o.CardName,
+        docTotal: Number(o.DocTotal || 0),
+        customerTotal: custTotal,
+        shipToAddress: o.ShipToAddress,
+        custCity: o.CustCity,
+        reasons,
+      });
+    } else {
+      plannableOrders.push(o);
+    }
+  }
+
+  return {
+    runDate,
+    allOrders,
+    plannableOrders,
+    excludedOrders,
+    filters: {
+      minCustomerTotal: MIN_CUSTOMER_TOTAL,
+      minLinesPerOrder: MIN_LINES_PER_ORDER,
+      requireStock,
+    },
+    alreadyAssigned,
+    existingRuns,
+  };
+}
+
+// Preview-only: shows the planner exactly who would be excluded if they
+// ran auto-plan right now. Does NOT mutate any data — no runs are
+// created. Same filters as /api/runs/auto-plan so there is one source of
+// truth for the exclusion rule.
+app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
+  try {
+    const result = await computePlanExclusions({
+      runDate: req.query.runDate,
+      minCustomerTotal: req.query.minCustomerTotal,
+      minLinesPerOrder: req.query.minLinesPerOrder,
+      requireStock: req.query.requireStock !== 'false',
+    });
+    const e = result.excludedOrders;
+    res.json({
+      runDate: result.runDate,
+      excludedOrders: e,
+      summary: {
+        totalOrders: result.allOrders.length,
+        ordersPlannable: result.plannableOrders.length,
+        ordersExcluded: e.length,
+        excludedLowTotal:     e.filter((o) => o.reasons.some((r) => r.type === 'low_total')).length,
+        excludedTooFewLines:  e.filter((o) => o.reasons.some((r) => r.type === 'too_few_lines')).length,
+        excludedMissingStock: e.filter((o) => o.reasons.some((r) => r.type === 'missing_stock')).length,
+      },
+      filters: result.filters,
+      preview: true,
+    });
+  } catch (err) {
+    console.error('[preview-exclusions] failed:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
 app.post('/api/runs/auto-plan', async (req, res) => {
   try {
-    const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
-
-    // Already assigned orders today - don't duplicate
-    const existingRuns = store.getRuns().filter((r) => r.RunDate === runDate);
-    const existingRunIds = existingRuns.map((r) => r.RunId);
-    const existingStops = (store.load().stops || []).filter((s) => existingRunIds.includes(s.RunId));
-    const existingStopIds = existingStops.map((s) => s.StopId);
-    const alreadyAssigned = new Set(
-      (store.load().runOrders || [])
-        .filter((o) => existingStopIds.includes(o.StopId))
-        .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
-    );
-
-    // Get real open SAP orders
-    if (!sapLive) {
-      return res.status(400).json({ error: 'SAP לא מחובר - לא ניתן לבצע תכנון אוטומטי' });
-    }
-    const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 });
-
-    // ------------------------------------------------------------------
-    // Pre-filter: customer minimum 3000 NIS (across both companies)
-    // and all line items must be in stock.
-    // Excluded orders are returned in the response for manual handling.
-    // ------------------------------------------------------------------
-    const MIN_CUSTOMER_TOTAL = Number(req.body.minCustomerTotal ?? 3000);
-    // Minimum lines per order - skip "single-item" orders that don't justify a delivery run
-    const MIN_LINES_PER_ORDER = Number(req.body.minLinesPerOrder ?? 2);
-    const requireStock = req.body.requireStock !== false; // default ON
-
-    // (a) Sum customer total across both companies. Use CardName as
-    // a customer key because CardCode often differs between OIG / Unico
-    // for the same physical customer. Trim + lowercase to be safe.
-    const customerTotals = new Map();
-    const norm = (s) => String(s || '').trim().toLowerCase();
-    for (const o of allOrders) {
-      const k = norm(o.CardName);
-      customerTotals.set(k, (customerTotals.get(k) || 0) + Number(o.DocTotal || 0));
-    }
-
-    // (b) Pull line items for every candidate order, then check stock.
-    let stockMap = new Map();   // 'A:itemCode' -> available qty
-    let linesByOrder = new Map(); // 'A:docEntry' -> [lines]
-    if (requireStock) {
-      const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
-      const allLines = await sapBridge.getBulkOrderLines(refs).catch((e) => {
-        console.warn('[auto-plan] getBulkOrderLines failed:', e.message);
-        return [];
-      });
-      for (const ln of allLines) {
-        const k = `${ln.CompanyCode}:${ln.DocEntry}`;
-        if (!linesByOrder.has(k)) linesByOrder.set(k, []);
-        linesByOrder.get(k).push(ln);
-      }
-      // Get stock per company for the union of items.
-      // We sum across all "picking" warehouses (configurable via env) -
-      // currently 01 (main), 02, 03, 10, 20. Warehouse 99 (returns) is excluded.
-      const PICKING_WAREHOUSES = (process.env.PICKING_WAREHOUSES || '01,02,03,10,20')
-        .split(',').map((s) => s.trim()).filter(Boolean);
-      for (const code of ['A', 'B']) {
-        const itemCodes = [...new Set(allLines.filter((l) => l.CompanyCode === code).map((l) => l.ItemCode))];
-        if (itemCodes.length === 0) continue;
-        for (let i = 0; i < itemCodes.length; i += 200) {
-          const batch = itemCodes.slice(i, i + 200);
-          const stock = await sapBridge.getItemsStock(code, batch).catch(() => []);
-          for (const s of stock) {
-            // Only count stock from picking warehouses
-            if (!PICKING_WAREHOUSES.includes(String(s.WarehouseCode))) continue;
-            const sk = `${code}:${s.ItemCode}`;
-            stockMap.set(sk, (stockMap.get(sk) || 0) + Number(s.Available || 0));
-          }
-        }
-      }
-    }
-
-    // (c) Split into "to plan" and "excluded".
-    const orders = [];           // these go to auto-planning
-    const excludedOrders = [];   // shown to the user separately
-    for (const o of allOrders) {
-      const reasons = [];
-      const custTotal = customerTotals.get(norm(o.CardName)) || 0;
-      if (custTotal < MIN_CUSTOMER_TOTAL) {
-        reasons.push({ type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL });
-      }
-      // Min lines per order (e.g. avoid solo-item orders that aren't worth a delivery)
-      const ordLinesCount = Number(o.LinesCount || 0);
-      if (MIN_LINES_PER_ORDER > 0 && ordLinesCount > 0 && ordLinesCount < MIN_LINES_PER_ORDER) {
-        reasons.push({ type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER });
-      }
-      if (requireStock) {
-        const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
-        const missing = [];
-        for (const ln of lns) {
-          const avail = stockMap.get(`${o.CompanyCode}:${ln.ItemCode}`) || 0;
-          const needed = Number(ln.OpenQty || ln.Quantity || 0);
-          if (avail < needed) {
-            missing.push({
-              itemCode: ln.ItemCode,
-              itemName: ln.ItemName, // already populated by getBulkOrderLines
-              needed, available: avail,
-            });
-          }
-        }
-        if (missing.length > 0) {
-          reasons.push({ type: 'missing_stock', items: missing });
-        }
-      }
-      if (reasons.length > 0) {
-        excludedOrders.push({
-          companyCode: o.CompanyCode,
-          docEntry: o.DocEntry,
-          docNum: o.DocNum,
-          cardCode: o.CardCode,
-          cardName: o.CardName,
-          docTotal: Number(o.DocTotal || 0),
-          customerTotal: custTotal,
-          shipToAddress: o.ShipToAddress,
-          custCity: o.CustCity,
-          reasons,
-        });
-      } else {
-        orders.push(o);
-      }
-    }
+    const plan = await computePlanExclusions({
+      runDate: req.body.runDate,
+      minCustomerTotal: req.body.minCustomerTotal,
+      minLinesPerOrder: req.body.minLinesPerOrder,
+      requireStock: req.body.requireStock,
+    });
+    const { runDate, plannableOrders: orders, excludedOrders, alreadyAssigned, existingRuns, filters } = plan;
 
     // Group by zone
     const byZone = {}; // zoneCode → { zone, orders: [...] }
@@ -1619,15 +1686,11 @@ app.post('/api/runs/auto-plan', async (req, res) => {
         excludedLowTotal: excludedOrders.filter((o) => o.reasons.some((r) => r.type === 'low_total')).length,
         excludedMissingStock: excludedOrders.filter((o) => o.reasons.some((r) => r.type === 'missing_stock')).length,
       },
-      filters: {
-        minCustomerTotal: MIN_CUSTOMER_TOTAL,
-        minLinesPerOrder: MIN_LINES_PER_ORDER,
-        requireStock,
-      },
+      filters,
     });
   } catch (err) {
     console.error('[auto-plan] failed:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 // Create a new picking wave - pulls real SAP order lines + aggregates
@@ -1776,11 +1839,33 @@ app.get('/api/notify/eta/:stopId', (req, res) => {
 });
 
 // Orders - use real SAP when available
-app.get('/api/orders/unified', async (_req, res) => {
+app.get('/api/orders/unified', async (req, res) => {
   if (sapLive) {
     try {
-      const groups = await sapBridge.getOpenOrdersUnified({ limit: 30 });
-      return res.json({ groups, count: groups.length, source: 'sap' });
+      const groups = await sapBridge.getOpenOrdersUnified({ limit: 200 });
+      // Enrich each group with the dominant customer's delivery profile so
+      // the planner can group/highlight by zone and weekly schedule.
+      const enriched = groups.map((g) => {
+        const firstOrder = g.orders?.[0];
+        const cardCode = firstOrder ? String(firstOrder.cardCode || '').trim() : '';
+        const company = firstOrder
+          ? (firstOrder.companyCode === 'A' ? 'OIG'
+             : firstOrder.companyCode === 'B' ? 'UNICO' : null)
+          : null;
+        const profile = cardCode ? store.getCustomerProfile(cardCode, company) : null;
+        return {
+          ...g,
+          suggestedZone:    profile?.Zone || '',
+          suggestedSubZone: profile?.SubZone || '',
+          scheduledDays:    profile?.DeliveryDays || [],
+          docPolicy:        profile?.DocPolicy || null,
+          profileStatus:    profile?.Status || (profile ? '' : 'no_profile'),
+        };
+      });
+      let out = enriched;
+      if (req.query.zone) out = out.filter((g) => g.suggestedZone === req.query.zone);
+      if (req.query.day)  out = out.filter((g) => (g.scheduledDays || []).includes(req.query.day));
+      return res.json({ groups: out, count: out.length, source: 'sap', enrichedFromProfiles: true });
     } catch (err) { console.warn('[sap] unified failed:', err.message); }
   }
   res.json({ groups: data.unifiedGroups, count: data.unifiedGroups.length, source: 'demo' });
@@ -3237,39 +3322,28 @@ app.get('/api/reports/waves/:id/picking.xlsx', (req, res) => {
 
 // Printable picking list PDF - checklist format
 /**
- * Reverse Hebrew text for proper RTL rendering in PDFKit.
- * PDFKit doesn't natively handle BiDi - so we manually reverse Hebrew runs.
- * Mixed Hebrew/English text: reverses Hebrew chunks but keeps English/numbers in order.
+ * Convert logical-order text to visual-order for PDFKit, which does not
+ * support the Unicode Bidirectional Algorithm natively (it draws glyphs
+ * left-to-right regardless of script direction).
+ *
+ * Implementation: full Unicode Bidi via `bidi-js`. Replaces the earlier
+ * manual reverse() which split on whitespace/punct heuristically and
+ * produced unreadable output for mixed Hebrew + Latin + digits + slashes
+ * (the common case for delivery notes: customer name + DN number + city).
+ *
+ * The base direction is auto-detected: if any Hebrew is present, the
+ * paragraph is treated as RTL; otherwise LTR. This matches operator
+ * intent: a customer name like "סלון גאולה" in an RTL paragraph, a
+ * machine-generated id like "RUN-2026-05-13-06" stays LTR.
  */
+const _bidi = bidiFactory();
+
 function rtlText(text) {
   if (!text) return '';
   const str = String(text);
-  // Hebrew range: U+0590 to U+05FF
-  // Strategy: split into runs of Hebrew/non-Hebrew, reverse Hebrew runs, join back reversed
-  const runs = [];
-  let current = '';
-  let isHebrew = null;
-  for (const ch of str) {
-    const code = ch.codePointAt(0);
-    const charIsHebrew = code >= 0x0590 && code <= 0x05FF;
-    const charIsSpaceOrPunct = /[\s\-.,():"'\/]/.test(ch);
-    if (isHebrew === null) {
-      isHebrew = charIsHebrew;
-      current = ch;
-    } else if (charIsHebrew === isHebrew || charIsSpaceOrPunct) {
-      current += ch;
-    } else {
-      runs.push({ text: current, isHebrew });
-      current = ch;
-      isHebrew = charIsHebrew;
-    }
-  }
-  if (current) runs.push({ text: current, isHebrew });
-
-  // For RTL display: reverse the order of runs AND reverse Hebrew text within each run
-  const result = runs.reverse().map((r) =>
-    r.isHebrew ? r.text.split('').reverse().join('') : r.text
-  ).join('');
+  const baseDir = /[֐-׿]/.test(str) ? 'rtl' : 'ltr';
+  const levels = _bidi.getEmbeddingLevels(str, baseDir);
+  const result = _bidi.getReorderedString(str, levels);
   return result;
 }
 

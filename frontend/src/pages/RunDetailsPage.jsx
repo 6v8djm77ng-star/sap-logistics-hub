@@ -7,10 +7,10 @@ import { toast } from 'sonner';
 import StatusPill from '../components/StatusPill.jsx';
 import AddressEditDialog from '../components/AddressEditDialog.jsx';
 import AddStopDialog from '../components/AddStopDialog.jsx';
-import AssignDriverDialog from '../components/AssignDriverDialog.jsx';
 import MoveStopDialog from '../components/MoveStopDialog.jsx';
 import NotifyEtaButton from '../components/NotifyEtaButton.jsx';
 import DepartureApprovalDialog from '../components/DepartureApprovalDialog.jsx';
+import AssignDriverDialog from '../components/AssignDriverDialog.jsx';
 import {
   ChevronRight, Zap, Route, Package, Printer, Clock, Phone,
   Edit, Plus, Trash2, ArrowUp, ArrowDown, X, User, Search, ArrowRightLeft,
@@ -36,10 +36,10 @@ export default function RunDetailsPage() {
   const queryClient = useQueryClient();
   const [editingAddressId, setEditingAddressId] = useState(null);
   const [showAddStop, setShowAddStop] = useState(false);
-  const [showAssignDriver, setShowAssignDriver] = useState(false);
   const [movingStop, setMovingStop] = useState(null);
   const [search, setSearch] = useState('');
   const [showDepartureApproval, setShowDepartureApproval] = useState(false);
+  const [showAssignDriver, setShowAssignDriver] = useState(false);
 
   const { data: run, isLoading } = useQuery({
     queryKey: ['run', id],
@@ -555,17 +555,17 @@ export default function RunDetailsPage() {
           onClose={() => setShowAddStop(false)}
         />
       )}
-      {showAssignDriver && (
-        <AssignDriverDialog
-          run={run}
-          onClose={() => setShowAssignDriver(false)}
-        />
-      )}
       {movingStop && (
         <MoveStopDialog
           stop={movingStop}
           currentRun={run}
           onClose={() => setMovingStop(null)}
+        />
+      )}
+      {showAssignDriver && (
+        <AssignDriverDialog
+          run={run}
+          onClose={() => setShowAssignDriver(false)}
         />
       )}
     </div>
