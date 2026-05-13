@@ -24,6 +24,7 @@ import WeeklyReportPage from './pages/WeeklyReportPage.jsx';
 import DailyClosurePage from './pages/DailyClosurePage.jsx';
 import DocumentsPage from './pages/DocumentsPage.jsx';
 import CustomerPolicyPage from './pages/CustomerPolicyPage.jsx';
+import CustomerDocPolicyPage from './pages/CustomerDocPolicyPage.jsx';
 import DriverLoginPage from './pages/driver/DriverLoginPage.jsx';
 import AutoLoginPage from './pages/driver/AutoLoginPage.jsx';
 import PickerAutoLoginPage from './pages/PickerAutoLoginPage.jsx';
@@ -120,6 +121,7 @@ export default function App() {
         <Route path="closure" element={<DailyClosurePage />} />
         <Route path="documents" element={<DocumentsPage />} />
         <Route path="customer-policy" element={<CustomerPolicyPage />} />
+        <Route path="customer-doc-policy" element={<CustomerDocPolicyPage />} />
         <Route path="pickers" element={<PickersPage />} />
         <Route path="leaderboard" element={<DriverLeaderboardPage />} />
         <Route path="cod" element={<CashOnDeliveryPage />} />
