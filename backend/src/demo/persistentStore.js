@@ -192,6 +192,81 @@ export function getPickerByCode(code) {
   return list.find((p) => p.Code === code);
 }
 
+// Set or rotate a picker's login PIN. Hashed with bcrypt; the picker can
+// always reset it from an admin / Picker management screen. We keep it
+// optional so existing pickers that pre-date this field can still log in
+// (the login handler treats them as "pin not yet set" and asks the picker
+// to set one on next login).
+export function setPickerPin(pickerId, pin) {
+  const store = load();
+  const picker = store.pickers?.find((p) => p.PickerId === Number(pickerId));
+  if (!picker) return false;
+  const pinStr = String(pin || '').trim();
+  if (!/^\d{4,8}$/.test(pinStr)) {
+    const err = new Error('PIN חייב להיות 4-8 ספרות');
+    err.code = 'BAD_PIN_FORMAT';
+    throw err;
+  }
+  picker.PinHash = bcrypt.hashSync(pinStr, 10);
+  picker.PinSetAt = new Date().toISOString();
+  save();
+  return true;
+}
+
+// Returns true if the picker has a stored PIN and the provided value
+// matches. Returns null when no PIN is set yet (so the login handler can
+// decide whether to allow grace-period login).
+export function verifyPickerPin(picker, pin) {
+  if (!picker?.PinHash) return null;
+  return bcrypt.compareSync(String(pin || ''), picker.PinHash);
+}
+
+// Admin-only: clear a picker's PIN so they can log in code-only on next
+// attempt and be forced to set a fresh PIN. Use when a picker forgets
+// their PIN and someone at the office needs to unlock them.
+export function clearPickerPin(pickerId) {
+  const store = load();
+  const picker = store.pickers?.find((p) => p.PickerId === Number(pickerId));
+  if (!picker) return false;
+  delete picker.PinHash;
+  delete picker.PinSetAt;
+  save();
+  return true;
+}
+
+export function clearDriverPin(driverId) {
+  const store = load();
+  const driver = store.drivers?.find((d) => d.DriverId === Number(driverId));
+  if (!driver) return false;
+  delete driver.PinHash;
+  delete driver.PinSetAt;
+  save();
+  return true;
+}
+
+// Same shape for drivers (the demoServer also has a passwordless code-only
+// driver-login that issues a long-lived token).
+export function setDriverPin(driverId, pin) {
+  const store = load();
+  const driver = store.drivers?.find((d) => d.DriverId === Number(driverId));
+  if (!driver) return false;
+  const pinStr = String(pin || '').trim();
+  if (!/^\d{4,8}$/.test(pinStr)) {
+    const err = new Error('PIN חייב להיות 4-8 ספרות');
+    err.code = 'BAD_PIN_FORMAT';
+    throw err;
+  }
+  driver.PinHash = bcrypt.hashSync(pinStr, 10);
+  driver.PinSetAt = new Date().toISOString();
+  save();
+  return true;
+}
+
+export function verifyDriverPin(driver, pin) {
+  if (!driver?.PinHash) return null;
+  return bcrypt.compareSync(String(pin || ''), driver.PinHash);
+}
+
 // ============================================================================
 // Users
 // ============================================================================

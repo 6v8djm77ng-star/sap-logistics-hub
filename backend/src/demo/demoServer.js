@@ -160,21 +160,48 @@ app.post('/api/auth/login', async (req, res) => {
   res.json({ token, user: { id: user.UserId, username: user.Username, name: user.FullName, role: user.Role } });
 });
 
+// Driver login — code + optional PIN. Drivers that have a PinHash MUST send
+// the matching PIN; drivers that don't have one yet keep the legacy
+// code-only flow but the response carries mustSetPin so the mobile UI can
+// force PIN setup on first login. Token is 12h (one shift), not 30d.
 app.post('/api/auth/driver-login', (req, res) => {
-  const { code } = req.body;
+  const { code, pin } = req.body;
   const driver = store.getDrivers().find((d) => d.Code === code);
   if (!driver) return res.status(401).json({ error: 'קוד נהג או סיסמה שגויים' });
-  const token = jwt.sign({ sub: `driver-${driver.DriverId}`, driverId: driver.DriverId, role: 'DRIVER', name: driver.FullName }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ token, driver: { id: driver.DriverId, code: driver.Code, name: driver.FullName, phone: driver.Phone } });
+  const pinCheck = store.verifyDriverPin(driver, pin);
+  if (pinCheck === false) {
+    return res.status(401).json({ error: 'PIN שגוי', code: 'BAD_PIN' });
+  }
+  // pinCheck === null  → no PIN configured, allow legacy login but force
+  //                       setup on the client side.
+  // pinCheck === true  → PIN matched, allow.
+  const mustSetPin = pinCheck === null;
+  const token = jwt.sign(
+    { sub: `driver-${driver.DriverId}`, driverId: driver.DriverId, role: 'DRIVER', name: driver.FullName },
+    JWT_SECRET,
+    { expiresIn: '12h' },
+  );
+  res.json({
+    token,
+    mustSetPin,
+    driver: { id: driver.DriverId, code: driver.Code, name: driver.FullName, phone: driver.Phone },
+  });
 });
 
-// Picker passwordless login - by code only (used on warehouse handheld terminals)
+// Picker login — same dual flow as driver-login. Token shrunk from 30d to 12h
+// (a warehouse shift) so a leaked handheld doesn't keep API access for a
+// month.
 app.post('/api/auth/picker-login', (req, res) => {
-  const { code } = req.body;
+  const { code, pin } = req.body;
   const picker = store.getPickerByCode(code);
   if (!picker || !picker.IsActive) {
     return res.status(401).json({ error: 'קוד מלקט שגוי או לא פעיל' });
   }
+  const pinCheck = store.verifyPickerPin(picker, pin);
+  if (pinCheck === false) {
+    return res.status(401).json({ error: 'PIN שגוי', code: 'BAD_PIN' });
+  }
+  const mustSetPin = pinCheck === null;
   const token = jwt.sign(
     {
       sub: `picker-${picker.PickerId}`,
@@ -185,12 +212,60 @@ app.post('/api/auth/picker-login', (req, res) => {
       pickerCode: picker.Code,
     },
     JWT_SECRET,
-    { expiresIn: '30d' }
+    { expiresIn: '12h' }
   );
   res.json({
     token,
+    mustSetPin,
     picker: { id: picker.PickerId, code: picker.Code, name: picker.FullName, phone: picker.Phone },
   });
+});
+
+// Set / rotate the PIN. Auth: the picker / driver must already hold a valid
+// JWT for THIS picker / driver — i.e. you can only change your own PIN.
+app.post('/api/auth/picker-set-pin', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+  let payload;
+  try { payload = jwt.verify(auth.slice(7), JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
+  if (!payload.pickerId) return res.status(403).json({ error: 'Only pickers can set a picker PIN' });
+  try {
+    const ok = store.setPickerPin(payload.pickerId, req.body?.pin);
+    if (!ok) return res.status(404).json({ error: 'Picker not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message, code: err.code });
+  }
+});
+app.post('/api/auth/driver-set-pin', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Authentication required' });
+  let payload;
+  try { payload = jwt.verify(auth.slice(7), JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
+  if (!payload.driverId) return res.status(403).json({ error: 'Only drivers can set a driver PIN' });
+  try {
+    const ok = store.setDriverPin(payload.driverId, req.body?.pin);
+    if (!ok) return res.status(404).json({ error: 'Driver not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message, code: err.code });
+  }
+});
+
+// Admin-only: unlock a picker / driver who forgot their PIN. Clears
+// PinHash so the next login goes through the legacy code-only path and
+// the client forces a fresh PIN setup via mustSetPin=true.
+app.post('/api/pickers/:id/clear-pin', adminOnly, (req, res) => {
+  const ok = store.clearPickerPin(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Picker not found' });
+  res.json({ ok: true });
+});
+app.post('/api/drivers/:id/clear-pin', adminOnly, (req, res) => {
+  const ok = store.clearDriverPin(req.params.id);
+  if (!ok) return res.status(404).json({ error: 'Driver not found' });
+  res.json({ ok: true });
 });
 
 // Pickers CRUD - mirrors drivers. Wave A: any authenticated user may read,
@@ -308,10 +383,30 @@ app.post('/api/auth/mobile-link', async (req, res) => {
   }
 });
 
+// Wave A security follow-up — mobile-link entries carry a createdAt and
+// the underlying JWT has a 1h TTL, but nothing was enforcing the 1h on
+// the *map entry itself*. A stale entry that lingered after a server
+// restart could in theory leak. Now we check createdAt+1h on every
+// resolve and sweep periodically.
+const SHORT_LINK_TTL_MS = 60 * 60 * 1000;
+function isShortLinkExpired(entry) {
+  if (!entry?.createdAt) return false;
+  return Date.now() - entry.createdAt > SHORT_LINK_TTL_MS;
+}
+setInterval(() => {
+  for (const [shortId, entry] of mobileShortLinks.entries()) {
+    if (isShortLinkExpired(entry)) mobileShortLinks.delete(shortId);
+  }
+}, 5 * 60 * 1000).unref();
+
 // Resolve a short id → JWT, then redirect-style: respond with the token in body.
 app.get('/api/auth/mobile-link/:shortId', (req, res) => {
   const entry = mobileShortLinks.get(req.params.shortId);
   if (!entry) return res.status(404).json({ error: 'Short link not found or expired' });
+  if (isShortLinkExpired(entry)) {
+    mobileShortLinks.delete(req.params.shortId);
+    return res.status(410).json({ error: 'Short link expired' });
+  }
   res.json({ token: entry.token });
 });
 
@@ -3611,7 +3706,8 @@ app.patch('/api/addresses/:id', (_req, res) => res.json({ ok: true }));
 // Doing this at the HTTP layer means stale PWAs won't intercept it.
 app.get('/m/admin/:shortId', (req, res, next) => {
   const entry = mobileShortLinks.get(req.params.shortId);
-  if (!entry) {
+  if (!entry || isShortLinkExpired(entry)) {
+    if (entry) mobileShortLinks.delete(req.params.shortId);
     return res.status(404).type('html').send(`
       <!doctype html><html lang="he" dir="rtl"><meta charset="utf-8">
       <title>קישור לא תקין</title>
