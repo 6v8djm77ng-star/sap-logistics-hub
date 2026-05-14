@@ -35,7 +35,7 @@ const pickingApi = {
  * Pick-by-Light highlight is per-row, not per-card, so the picker sees
  * exactly which row to handle next.
  */
-function PickedAllocations({ allocations, onPick, onReset }) {
+function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
   if (!allocations?.length) return null;
   // Find the FIRST allocation that is not yet fully picked - that's the
   // current row to highlight (Pick-by-Light per row).
@@ -110,6 +110,22 @@ function PickedAllocations({ allocations, onPick, onReset }) {
                 <RotateCcw size={9} />אפס
               </button>
             )}
+            {isDone && a.RunOrderId && onApproveOrder && !a.QcApproved && (
+              <button
+                onClick={() => onApproveOrder(a)}
+                className="inline-flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded text-[10px] font-bold hover:bg-emerald-700 mr-1"
+                title="אשר את ההזמנה והפק מסמך לפי מדיניות הלקוח"
+              >
+                <Check size={10} /> אשר הזמנה
+              </button>
+            )}
+            {a.QcApproved && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded text-[10px] font-medium" title="ההזמנה אושרה ומסמכים הופקו">
+                <Check size={10} /> מאושרת
+                {a.DeliveryNoteId && <span className="text-emerald-700 mr-1">·ת.משלוח</span>}
+                {a.InvoiceId && <span className="text-emerald-700">·חשבונית</span>}
+              </span>
+            )}
           </div>
         );
       })}
@@ -157,6 +173,48 @@ export default function PickingPage() {
     mutationFn: ({ stopId, palletLabel }) =>
       api.patch(`/stops/${stopId}`, { palletLabel }).then((r) => r.data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] }),
+  });
+
+  // Per-order QC approve — Feature C, DRY-RUN. Creates the SAP documents the
+  // customer's DocPolicy asks for (delivery note, tax invoice, or both),
+  // stored locally as PENDING_EXPORT. Empty-policy → 422 with a link to
+  // /customer-doc-policy. Idempotent re-clicks are a no-op.
+  const approveOrderMutation = useMutation({
+    mutationFn: (alloc) =>
+      api.post(`/orders/${alloc.RunOrderId}/qc-approve`).then((r) => r.data),
+    onSuccess: (result, alloc) => {
+      const parts = [];
+      if (result.deliveryNote) parts.push('תעודת משלוח ' + result.deliveryNote.DocNumber);
+      if (result.invoice)      parts.push('חשבונית '       + result.invoice.DocNumber);
+      const msg = result.idempotent
+        ? 'הזמנה ' + alloc.SapDocNum + ' כבר אושרה'
+        : 'אושר: ' + (parts.join(' + ') || '(ללא מסמך)');
+      toast.success(msg, { duration: 4000 });
+      queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] });
+    },
+    onError: (err) => {
+      const data = err.response?.data || {};
+      if (data.code === 'NO_POLICY') {
+        toast.error(
+          (t) => (
+            <div className="flex flex-col gap-1">
+              <div>{data.error || 'מדיניות חסרה'}</div>
+              <a
+                href="/customer-doc-policy"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs underline text-blue-200 hover:text-white"
+              >
+                ← פתח דף מדיניות מסמכים
+              </a>
+            </div>
+          ),
+          { duration: 8000 },
+        );
+      } else {
+        toast.error(data.error || 'שגיאה באישור ההזמנה');
+      }
+    },
   });
 
   // Per-allocation (per-row) pick / reset
@@ -523,6 +581,7 @@ export default function PickingPage() {
                     allocations={line.allocations}
                     onPick={(allocId, qty) => pickAllocationMutation.mutate({ allocId, qty })}
                     onReset={(allocId) => resetAllocationMutation.mutate(allocId)}
+                    onApproveOrder={(a) => approveOrderMutation.mutate(a)}
                   />
 
                   {line.Notes && (

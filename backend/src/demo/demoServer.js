@@ -2636,6 +2636,41 @@ app.get('/api/picking/:id', (req, res) => {
 // This is the "per-row" picking the warehouse worker uses when an item
 // is split across multiple customers in the same wave.
 // QC Review endpoints - approve/reject after picking complete
+// Per-order QC approve — feature C, stage 1.
+// Generates the SAP documents this specific order needs (per DocPolicy)
+// in DRY-RUN (store-only, status=PENDING_EXPORT). Used by the per-order
+// "אשר הזמנה" button in PickingPage. Idempotent.
+app.post('/api/orders/:runOrderId/qc-approve', (req, res) => {
+  const auth = req.headers.authorization;
+  let approvedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { approvedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  try {
+    const result = store.generateDocsForRunOrder(req.params.runOrderId, {
+      approvedBy,
+      method: 'AUTO_QC_PER_ORDER',
+    });
+    io.emit('order:qc-approved', { runOrderId: Number(req.params.runOrderId) });
+    res.json({
+      ok: true,
+      idempotent: !!result.idempotent,
+      deliveryNote: result.deliveryNote
+        ? { DeliveryNoteId: result.deliveryNote.DeliveryNoteId, DocNumber: result.deliveryNote.DocNumber }
+        : null,
+      invoice: result.invoice
+        ? { InvoiceId: result.invoice.InvoiceId, DocNumber: result.invoice.DocNumber }
+        : null,
+    });
+  } catch (err) {
+    const payload = { error: err.message };
+    if (err.code) payload.code = err.code;
+    if (err.cardCode) payload.cardCode = err.cardCode;
+    if (err.cardName) payload.cardName = err.cardName;
+    res.status(err.status || 500).json(payload);
+  }
+});
+
 app.post('/api/picking/:waveId/qc-approve', (req, res) => {
   const auth = req.headers.authorization;
   let approvedBy = null;

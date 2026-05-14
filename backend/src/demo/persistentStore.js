@@ -1492,6 +1492,13 @@ export function getWave(waveId) {
       stopId: stop.StopId,
       stopOrder: stop.StopOrder || 0,
       palletLabel: stop.PalletLabel || '',
+      // Surfaced so the picking UI can call POST /api/orders/:id/qc-approve
+      // and so it can mark the row as "already approved" without an extra
+      // request to /api/runs/:runId.
+      runOrderId: ord.RunOrderId,
+      qcApproved: !!ord.QcApproved,
+      deliveryNoteId: ord.DeliveryNoteId || null,
+      invoiceId: ord.InvoiceId || null,
     });
   }
   const enrich = (a) => {
@@ -1505,6 +1512,10 @@ export function getWave(waveId) {
       StopId: cust.stopId || null,
       StopOrder: cust.stopOrder || null,
       PalletLabel: cust.palletLabel || '',
+      RunOrderId: cust.runOrderId || null,
+      QcApproved: !!cust.qcApproved,
+      DeliveryNoteId: cust.deliveryNoteId || null,
+      InvoiceId: cust.invoiceId || null,
     };
   };
 
@@ -1958,6 +1969,157 @@ export function generateInvoicesForRun(runId) {
     if (inv) invoices.push(inv);
   }
   return invoices;
+}
+
+// ============================================================================
+// Feature C — Per-order document orchestrator.
+// Replaces the wave-level + CardName-based legacy flow with one that reads
+// DocPolicy from customerDeliveryProfiles (keyed by CardCode + Company) and
+// generates exactly the documents the policy asks for, idempotently.
+//
+// Decisions locked with the operator:
+//   - Mode is DRY-RUN — documents land in store.deliveryNotes / store.invoices
+//     with Status='PENDING_EXPORT'. No SAP write yet.
+//   - Empty policy = blocked (throws 422). Operator must fill via
+//     /customer-doc-policy before approving.
+//   - Eilat tax-invoice rule is already encoded in policy.perOrderInvoice='yes'
+//     for the 78 Eilat customers; no special-case here.
+//   - perOrder vs aggregate at this stage: per-order only. Aggregate logic
+//     (CONSOLIDATED_PER_ROUTE) is a follow-up phase.
+//   - Shortage handling is a follow-up phase. For now, the DN amount is the
+//     full order amount (matches existing generateDeliveryNotesForStop).
+// ============================================================================
+
+function _findOrderById(runOrderId) {
+  const s = ensureDocsStore();
+  return s.runOrders.find((o) => o.RunOrderId === Number(runOrderId));
+}
+
+function _findStopOfOrder(order) {
+  const s = ensureDocsStore();
+  return s.stops.find((st) => st.StopId === order.StopId);
+}
+
+function _policyForOrder(order) {
+  if (!order) return null;
+  const profiles = (load().customerDeliveryProfiles || []);
+  const cardCode = String(order.SapCardCode || '').trim();
+  const company = order.CompanyCode === 'A' ? 'OIG'
+                : order.CompanyCode === 'B' ? 'UNICO' : null;
+  let p = profiles.find((x) => String(x.CardCode) === cardCode && x.Company === company);
+  if (!p) p = profiles.find((x) => String(x.CardCode) === cardCode);
+  return p?.DocPolicy || null;
+}
+
+function _hasAnyPerOrderPolicy(policy) {
+  if (!policy) return false;
+  return policy.perOrderDeliveryNote === 'yes' || policy.perOrderInvoice === 'yes';
+}
+
+/**
+ * Generate the SAP documents one order needs, based on its customer's
+ * DocPolicy. Returns { deliveryNote, invoice, skipped } on success, or
+ * throws an Error with .status=422 if the policy is empty.
+ * Idempotent: re-running on an order that already has docs returns the
+ * existing ones unchanged.
+ */
+export function generateDocsForRunOrder(runOrderId, options = {}) {
+  const s = ensureDocsStore();
+  const order = _findOrderById(runOrderId);
+  if (!order) {
+    const err = new Error('Order not found'); err.status = 404; throw err;
+  }
+  const stop = _findStopOfOrder(order);
+  if (!stop) {
+    const err = new Error('Stop not found for order'); err.status = 404; throw err;
+  }
+
+  // Idempotency — return any docs already linked to this order.
+  if (order.DeliveryNoteId || order.InvoiceId) {
+    const existing = {
+      deliveryNote: order.DeliveryNoteId
+        ? s.deliveryNotes.find((d) => d.DeliveryNoteId === order.DeliveryNoteId) || null : null,
+      invoice: order.InvoiceId
+        ? s.invoices.find((i) => i.InvoiceId === order.InvoiceId) || null : null,
+      skipped: false,
+      idempotent: true,
+    };
+    if (!options.regenerate) return existing;
+  }
+
+  const policy = _policyForOrder(order);
+  if (!_hasAnyPerOrderPolicy(policy)) {
+    const err = new Error(
+      'מדיניות מסמכים חסרה ללקוח ' + (order.SapCardName || order.SapCardCode) +
+      '. הגדר ב-/customer-doc-policy לפני אישור.'
+    );
+    err.status = 422;
+    err.code = 'NO_POLICY';
+    err.cardCode = order.SapCardCode;
+    err.cardName = order.SapCardName;
+    throw err;
+  }
+
+  const result = { deliveryNote: null, invoice: null, skipped: false, idempotent: false };
+
+  // Create a single-order DN scoped to THIS order (not all orders at the stop).
+  // We piggyback on the existing DN shape so downstream code (PDFs, /api/delivery-notes)
+  // keeps working unchanged.
+  if (policy.perOrderDeliveryNote === 'yes' || policy.perOrderInvoice === 'yes') {
+    const dn = {
+      DeliveryNoteId: s.nextDeliveryNoteId++,
+      DocNumber: `DN-${stop.StopId}-${order.CompanyCode}-${String(s.nextDeliveryNoteId).padStart(4, '0')}`,
+      StopId: stop.StopId,
+      RunId: stop.RunId,
+      RunOrderId: order.RunOrderId,
+      CompanyCode: order.CompanyCode,
+      CompanyName: order.CompanyName,
+      SapCardCode: order.SapCardCode,
+      SapCardName: order.SapCardName,
+      SourceOrders: [{
+        RunOrderId: order.RunOrderId,
+        SapDocEntry: order.SapDocEntry,
+        SapDocNum: order.SapDocNum,
+        OrderTotal: order.OrderTotal,
+        LinesCount: order.LinesCount,
+      }],
+      TotalAmount: Number(order.OrderTotal || 0),
+      LineCount: Number(order.LinesCount || 0),
+      Status: 'PENDING_EXPORT',
+      SapDeliveryDocEntry: null,
+      SapDeliveryDocNum: null,
+      ExportedAt: null,
+      SentToSapAt: null,
+      ConfirmedAt: null,
+      ErrorMessage: null,
+      Notes: stop.Notes || null,
+      Address: {
+        Street: stop.Street, BuildingNumber: stop.BuildingNumber, City: stop.City,
+        BranchName: stop.BranchName,
+      },
+      DeliveryDate: new Date().toISOString().slice(0, 10),
+      CreatedAt: new Date().toISOString(),
+      Method: options.method || 'AUTO_QC_PER_ORDER',
+    };
+    s.deliveryNotes.push(dn);
+    order.DeliveryNoteId = dn.DeliveryNoteId;
+    result.deliveryNote = dn;
+
+    // perOrderInvoice='yes' → also emit a tax invoice from this DN.
+    if (policy.perOrderInvoice === 'yes') {
+      const inv = generateInvoiceFromDeliveryNote(dn.DeliveryNoteId, { method: 'AUTO_QC_PER_ORDER' });
+      if (inv) {
+        order.InvoiceId = inv.InvoiceId;
+        result.invoice = inv;
+      }
+    }
+  }
+
+  order.QcApproved = true;
+  order.QcApprovedAt = new Date().toISOString();
+  order.QcApprovedBy = options.approvedBy || null;
+  save();
+  return result;
 }
 
 export function markDocsExported(docIds, type = 'deliveryNote') {
