@@ -4,6 +4,11 @@ node_modules/
 dist/
 .DS_Store
 
+# OSRM container data — large binary OSM extract + processed graphs.
+# Regenerable from infra/osrm/docker-compose.yml + Geofabrik download.
+infra/osrm/data/*
+!infra/osrm/data/.gitkeep
+
 # ── Phase-1 baseline additions ─────────────────────────────────────
 
 # Real env files (every variant — NEVER commit)

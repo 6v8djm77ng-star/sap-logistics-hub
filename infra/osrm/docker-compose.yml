@@ -1,0 +1,99 @@
+# Self-hosted OSRM (Open Source Routing Machine) for road-distance
+# optimization. Two services:
+#
+#   osrm-prepare  — one-shot. Reads israel-and-palestine-latest.osm.pbf
+#                   from ./data, builds the routing graphs (extract,
+#                   partition, customize). Idempotent — skips work if
+#                   israel.osrm.partition already exists.
+#
+#   osrm          — long-running. Serves the OSRM HTTP API on
+#                   127.0.0.1:5000. Depends on osrm-prepare finishing
+#                   successfully. Bound to localhost only (no LAN/public
+#                   exposure — OSRM has no auth, network isolation is
+#                   the security boundary).
+#
+# Usage:
+#   1. Drop israel-and-palestine-latest.osm.pbf into ./data/
+#      (downloaded from https://download.geofabrik.de/asia/)
+#   2. docker compose up -d
+#   3. First start runs osrm-prepare (~10-15 min, peak RAM ~2-3GB).
+#      Subsequent starts skip prepare and just start the osrm service.
+#   4. Verify: curl http://localhost:5000/route/v1/driving/34.78,32.08;35.21,31.77
+#
+# Update OSM data (every few months):
+#   1. Download fresh PBF into ./data/, overwriting the old one
+#   2. Delete ./data/israel.osrm* (the processed files)
+#   3. docker compose up -d osrm-prepare
+#   4. docker compose restart osrm
+
+services:
+  # Stage 1: One-time graph preparation. Idempotent.
+  osrm-prepare:
+    # Tag note: v5.27.x was retired from Docker Hub. As of 2026-05 only
+    # `latest` and pre-5.25 tags are available. We pin to `latest` and
+    # rely on docker-compose's image-id caching to keep both services on
+    # the same image once pulled. Re-pin to a specific tag once OSRM
+    # publishes a new stable release.
+    image: osrm/osrm-backend:latest
+    container_name: osrm-prepare
+    volumes:
+      - ./data:/data
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        cd /data
+        if [ ! -f israel.osrm.partition ]; then
+          if [ ! -f israel-and-palestine-latest.osm.pbf ]; then
+            echo "FATAL: /data/israel-and-palestine-latest.osm.pbf is missing."
+            echo "Download from https://download.geofabrik.de/asia/israel-and-palestine-latest.osm.pbf"
+            exit 1
+          fi
+          echo "==> osrm-extract (car.lua profile) — ~3-5 min"
+          osrm-extract -p /opt/car.lua israel-and-palestine-latest.osm.pbf
+          # Normalize filenames so the routed service can find them.
+          for f in israel-and-palestine-latest.osrm*; do
+            mv "$$f" "$${f/israel-and-palestine-latest/israel}"
+          done
+          echo "==> osrm-partition (MLD) — ~2-4 min"
+          osrm-partition israel.osrm
+          echo "==> osrm-customize (MLD) — ~2-4 min"
+          osrm-customize israel.osrm
+          echo "==> done. Graphs ready for osrm-routed."
+        else
+          echo "==> Graphs already built (found israel.osrm.partition). Skipping."
+        fi
+    restart: "no"
+
+  # Stage 2: Serve the OSRM HTTP API.
+  osrm:
+    # Tag note: v5.27.x was retired from Docker Hub. As of 2026-05 only
+    # `latest` and pre-5.25 tags are available. We pin to `latest` and
+    # rely on docker-compose's image-id caching to keep both services on
+    # the same image once pulled. Re-pin to a specific tag once OSRM
+    # publishes a new stable release.
+    image: osrm/osrm-backend:latest
+    container_name: osrm
+    depends_on:
+      osrm-prepare:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/data
+    # max-table-size 1000 → up to 1000 stops per /table request (we'll
+    # never approach that — a typical run has 10-30 stops).
+    command: osrm-routed --algorithm mld --max-table-size 1000 /data/israel.osrm
+    ports:
+      # CRITICAL: bind to 127.0.0.1 only. OSRM has no auth — exposing
+      # this port to LAN/internet would let anyone hit the routing API.
+      - "127.0.0.1:5000:5000"
+    restart: unless-stopped
+    healthcheck:
+      # /nearest is the cheapest read endpoint. The coords are roughly
+      # Tel Aviv center; if OSRM cannot match a Tel Aviv coord to the
+      # graph, something is broken.
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/nearest/v1/driving/34.78,32.08"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

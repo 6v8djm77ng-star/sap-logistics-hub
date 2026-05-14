@@ -1,0 +1,5 @@
+# OSM data and processed graphs — large binary files, regenerable from
+# the docker-compose.yml + a fresh PBF download. Never commit these to
+# git (they would bloat the repo and go stale quickly).
+data/*
+!data/.gitkeep
