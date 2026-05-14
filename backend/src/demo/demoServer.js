@@ -16,6 +16,7 @@ import cors from 'cors';
 import compression from 'compression';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
 import { Server as SocketServer } from 'socket.io';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
@@ -165,10 +166,39 @@ function adminOnly(req, res, next) {
   }
 }
 
+// Zod schemas for every auth endpoint. Reject unknown / malformed payloads
+// at the front door instead of trusting `req.body.x` to be a string.
+const LoginSchema = z.object({
+  username: z.string().min(1).max(100),
+  password: z.string().min(1).max(200),
+});
+const CodeLoginSchema = z.object({
+  code: z.string().min(1).max(50),
+  pin: z.string().min(0).max(20).optional(),
+});
+const SetPinSchema = z.object({
+  pin: z.string().regex(/^\d{4,8}$/, 'PIN חייב להיות 4-8 ספרות'),
+});
+
+function parseBody(schema, body, res) {
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    const issue = parsed.error.issues?.[0];
+    res.status(400).json({
+      error: issue?.message || 'נתוני קלט לא תקינים',
+      code: 'BAD_INPUT',
+      path: issue?.path?.join('.') || null,
+    });
+    return null;
+  }
+  return parsed.data;
+}
+
 // Auth endpoints - now use persistent store
 app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
-  const user = await store.verifyUserPassword(username, password);
+  const data = parseBody(LoginSchema, req.body, res);
+  if (!data) return;
+  const user = await store.verifyUserPassword(data.username, data.password);
   if (!user) return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
   store.updateLastLogin(user.UserId);
   const token = jwt.sign({ sub: user.UserId, username: user.Username, role: user.Role, name: user.FullName }, JWT_SECRET, { expiresIn: '8h' });
@@ -180,7 +210,9 @@ app.post('/api/auth/login', async (req, res) => {
 // code-only flow but the response carries mustSetPin so the mobile UI can
 // force PIN setup on first login. Token is 12h (one shift), not 30d.
 app.post('/api/auth/driver-login', (req, res) => {
-  const { code, pin } = req.body;
+  const data = parseBody(CodeLoginSchema, req.body, res);
+  if (!data) return;
+  const { code, pin } = data;
   const driver = store.getDrivers().find((d) => d.Code === code);
   if (!driver) return res.status(401).json({ error: 'קוד נהג או סיסמה שגויים' });
   const pinCheck = store.verifyDriverPin(driver, pin);
@@ -207,7 +239,9 @@ app.post('/api/auth/driver-login', (req, res) => {
 // (a warehouse shift) so a leaked handheld doesn't keep API access for a
 // month.
 app.post('/api/auth/picker-login', (req, res) => {
-  const { code, pin } = req.body;
+  const data = parseBody(CodeLoginSchema, req.body, res);
+  if (!data) return;
+  const { code, pin } = data;
   const picker = store.getPickerByCode(code);
   if (!picker || !picker.IsActive) {
     return res.status(401).json({ error: 'קוד מלקט שגוי או לא פעיל' });
@@ -245,8 +279,10 @@ app.post('/api/auth/picker-set-pin', (req, res) => {
   try { payload = jwt.verify(auth.slice(7), JWT_SECRET); }
   catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
   if (!payload.pickerId) return res.status(403).json({ error: 'Only pickers can set a picker PIN' });
+  const data = parseBody(SetPinSchema, req.body, res);
+  if (!data) return;
   try {
-    const ok = store.setPickerPin(payload.pickerId, req.body?.pin);
+    const ok = store.setPickerPin(payload.pickerId, data.pin);
     if (!ok) return res.status(404).json({ error: 'Picker not found' });
     res.json({ ok: true });
   } catch (err) {
@@ -260,8 +296,10 @@ app.post('/api/auth/driver-set-pin', (req, res) => {
   try { payload = jwt.verify(auth.slice(7), JWT_SECRET); }
   catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
   if (!payload.driverId) return res.status(403).json({ error: 'Only drivers can set a driver PIN' });
+  const data = parseBody(SetPinSchema, req.body, res);
+  if (!data) return;
   try {
-    const ok = store.setDriverPin(payload.driverId, req.body?.pin);
+    const ok = store.setDriverPin(payload.driverId, data.pin);
     if (!ok) return res.status(404).json({ error: 'Driver not found' });
     res.json({ ok: true });
   } catch (err) {
