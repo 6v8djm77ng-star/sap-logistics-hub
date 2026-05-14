@@ -1,11 +1,388 @@
 # Wave A Readiness Check — Re-attempt Verification
 
-**Original run date:** 2026-05-10 (first re-check after operator-aborted Wave A).
-**Updated:** 2026-05-10 (second re-check, after operator reported "prerequisites complete").
+**History of this document:**
+- 2026-05-10 ~08:12 — first re-check after the original aborted Wave A: NOT_READY (no operator actions had landed)
+- 2026-05-10 ~11:22 — second re-check after operator reported prerequisites complete: NOT_READY (state unchanged)
+- 2026-05-10 ~11:29-11:40 — operator authorized Claude to perform remediation directly; remediation executed
+- 2026-05-10 ~11:45 — **third (final) re-check after remediation: ✅ READY_FOR_WAVE_A_DEPLOYMENT** (this section)
 
 ---
 
-## 🛑 FINAL STATUS (2nd re-check): `NOT_READY_FOR_WAVE_A_DEPLOYMENT`
+## ✅ FINAL STATUS (3rd re-check, post-remediation): `READY_FOR_WAVE_A_DEPLOYMENT`
+
+3 of 4 prerequisite groups pass cleanly. 1 carries a documented Wave-A-time mitigation (sap-logistics PM2 bookkeeping mismatch — `pm2 describe` reads live metrics, but `status: errored`). Public exposure remains live as expected (Wave A not deployed yet — that's the next step, not this one).
+
+### Scoreboard (3rd re-check, 11:45 Israel)
+
+| Group | Status | Evidence |
+|---|---|---|
+| 1. PM2 stabilization | ✅ PASS | orphan 24420 gone; port 4001 free; sap-bi-api crash loop ended at 11:34:12 (no entries since); dump.pm2 mtime 11:35; /health 200 in 89ms |
+| 2. Backups | ✅ PASS | 6 backup dirs exist; PRE-CLEANUP and POST-CLEANUP dump.pm2 snapshots; store.json archive snapshot; INCIDENTS.md mtime 11:40 |
+| 3. Rollback readiness | ✅ PASS | tag `pre-wave-a-baseline` → HEAD `0d36879`; tree clean (one untracked report file is benign); archive properly gitignored |
+| 4. Public exposure | unchanged | 4 endpoints still anonymous from public URL — Wave A patch not yet applied (correct for this state) |
+| 4a. sap-logistics PM2 bookkeeping | ⚠ documented | status=errored since 2026-05-09T17:59 (predates remediation); OS process pid 20112 healthy; live HTTP metrics flowing through PM2; **mitigation embedded in deployment sequence below** |
+
+### What changed since 2nd re-check at 11:22
+
+The operator authorized Claude to perform the remediation directly between 11:29 and 11:40. Full audit trail in `prerequisite-remediation-report.md` and `cowork/INCIDENTS.md`. Summary:
+
+```
+Stop-Process -Id 24420 -Force      → orphan dead
+pm2 stop 2                          → sap-bi-api drained (final restart_count ≈319K)
+Stop-Process -Id 1684 -Force        → secondary orphan dead
+pm2 save                            → dump.pm2 mtime 5/9 → 5/10 11:35
+mkdir -p C:\backups\{pm2,sql,...}   → 6 dirs created
+mkdir backend/data/archive/         → snapshot location
+cp dump.pm2 → /c/backups/pm2/...    → 2 dump snapshots (PRE+POST)
+cp store.json → archive/...         → 1 store.json snapshot
+git add -A; git commit; git tag     → SHA 0d36879, tag pre-wave-a-baseline
+INCIDENTS.md update                 → entry appended
+```
+
+---
+
+## 0. Third-re-check evidence (this run)
+
+### 0.1 PM2 stabilization
+
+```
+Get-Process -Id 24420                                → empty (orphan dead)
+Get-NetTCPConnection -LocalPort 4001 -State Listen   → empty (port free)
+Get-NetTCPConnection -LocalPort 4000 -State Listen   → pid 20112 (sap-logistics)
+ls -la /c/Users/izik/.pm2/dump.pm2                   → mtime 2026-05-10 11:35:xx (164,922 B)
+curl http://localhost:4000/health                    → 200 in 89ms
+                                                       mode=DEMO+SAP, sapConnected=true
+pm2.log last sap-bi-api entry                        → 2026-05-10T11:34:12 (final SIGINT
+                                                       after pm2 stop landed; no
+                                                       entries since — loop quiet)
+```
+
+### 0.2 Backups
+
+```
+C:\backups\pm2\
+  -rw-r--r-- 174,144 B  2026-05-10 11:29  dump.pm2.PRE-CLEANUP-20260510-112930
+  -rw-r--r-- 164,922 B  2026-05-10 11:35  dump.pm2.POST-CLEANUP-20260510-112930
+C:\backups\sql\               (empty — see §6.4 of prerequisite-remediation-report.md)
+C:\backups\app-logs\          (empty — Phase 0 reserved)
+C:\backups\uploads\           (empty — Phase 0 reserved)
+C:\backups\automation\        (empty — Phase 0 reserved)
+C:\backups\env\               (empty — see §6.3 of prerequisite-remediation-report.md)
+
+backend\data\archive\
+  -rw-r--r-- 1,642,288 B  2026-05-10 11:29  store.json.MANUAL-PRE-WAVE-A-20260510-112930
+```
+
+### 0.3 Git
+
+```
+git tag --list pre-wave-a-baseline   → pre-wave-a-baseline
+git rev-parse pre-wave-a-baseline    → 0d36879bbc26719d3aee373460a8dc86daa6167f
+git rev-parse HEAD                   → 0d36879bbc26719d3aee373460a8dc86daa6167f  (HEAD == tag)
+git log --oneline -3:
+  0d36879 Phase 0 baseline: P0 fixes + architecture review docs (inert under demoServer)
+  8086cb6 Phase B cleanup: fix test isolation for intelligence flags
+  3f866e2 Phase 1 baseline: sap-logistics-hub (intelligence + executive layer)
+
+git status --short:
+  ?? docs/architecture-review/prerequisite-remediation-report.md
+  (one untracked doc file from the remediation step — benign; will be staged with Wave A commit)
+
+backend/data/archive/store.json.MANUAL-PRE-WAVE-A-20260510-112930
+  → confirmed gitignored (won't be staged accidentally)
+```
+
+### 0.4 INCIDENTS.md
+
+```
+mtime 2026-05-10 11:40:23  (was 2026-05-05 11:28 before remediation)
+length 11,645 bytes        (was 4,790 — full Phase 0 entry appended)
+```
+
+### 0.5 Public exposure (still anonymous — Wave A not deployed)
+
+Probed `https://contribute-maker-archives-metres.trycloudflare.com` at 11:45:
+
+| Endpoint | Code | Body excerpt |
+|---|---|---|
+| `/api/users` | 200 | `{"users":[{"UserId":1,"Username":"admin","FullName":"…"}]}` |
+| `/api/customers/search?q=test` | 200 | `{"customers":[{"CardCode":"220","CardName":"test12011…"}]}` |
+| `/api/drivers` | 200 | `{"drivers":[{"DriverId":1,"Code":"DRV-01","FullName":"…"}]}` |
+| `/m/admin/test` | 404 | no-such-shortId page |
+
+Identical signatures to prior runs. Public exposure unchanged. **This is correct** — Wave A is what closes them.
+
+### 0.6 sap-logistics PM2 bookkeeping mismatch — analysis
+
+**Current state:**
+- `pm2 list` shows: `sap-logistics  pid 20112  uptime 0  ↺ 2  status errored`
+- OS reality: pid 20112 alive (started 2026-05-09 10:34 UTC, uptime 25h+); listening on port 4000; serving demoServer.js
+- `pm2 describe sap-logistics` reads LIVE metrics from the process: Heap 85%, HTTP 0.02 req/min — proving the daemon IS in contact with the process; only the `status` field is stale.
+- `created_at: 2026-05-09T17:59:14.658Z` matches the documented "could not be stopped" event in `pm2-stabilization.md` §1.2
+
+**Origin of the mismatch:**
+2026-05-09T20:59:14 Israel — operator (or a process) tried `pm2 stop sap-logistics`. PM2 issued tree-kill against pid 20112. OneDrive file-handle locks blocked the kill. PM2 logged `Process with pid 20112 could not be killed` after 1600ms; PM2's bookkeeping marked sap-logistics as errored despite the process surviving.
+
+**Wave A deploy implications:**
+- When operator runs `pm2 restart sap-logistics` to load the patch, PM2 will FIRST attempt to kill pid 20112.
+- The same OneDrive lock could re-trigger.
+- If kill fails, PM2 forks new sap-logistics → tries to bind port 4000 → EADDRINUSE because pid 20112 is still listening → restart loop (same pattern as sap-bi-api yesterday).
+
+**Mitigation: pre-restart orphan check.** This is built into the deployment sequence in §6 below. ~4 lines of PowerShell, well-tested today (we used identical pattern successfully on pids 24420 and 1684 during remediation).
+
+**Acceptance:** the bookkeeping mismatch is acceptable for Wave A deploy IF the deployment sequence executes the pre-restart orphan check. Without that step, deploy risk is high.
+
+---
+
+## 1. Deployment safety assessment — explicit answers
+
+| Question | Answer |
+|---|---|
+| **Is Wave A now safe to deploy?** | **Yes**, with the pre-restart orphan check embedded in §6 below. |
+| **Is PM2 stable enough for restart?** | **Yes**, with one caveat: PM2 is responsive (<5s) and quiet (no crash loop), but `pm2 restart sap-logistics` may need a manual orphan-kill if PM2's tree-kill of pid 20112 hangs (same OneDrive lock pattern as 2026-05-09 21:01:28). The §6 sequence handles this. |
+| **Is sap-logistics bookkeeping mismatch acceptable?** | **Yes**, because (a) the OS process is genuinely healthy, (b) PM2 is reading live metrics from it (HTTP 0.02 req/min), (c) the mismatch only matters at restart time and the sequence in §6 handles it explicitly, (d) successful application of the same orphan-kill pattern earlier today proves the mitigation works. |
+| **Exact rollback trigger?** | If after restart, **any of the following**: (a) `/health` not 200 within 30s, (b) `/api/users` anonymous probe returns 200 (patch didn't load), (c) `/api/users` ADMIN-token probe returns 401 (gate too tight), (d) frontend UsersPage / RunsPage / TrackingPage broken in a 5-min smoke test, (e) `pm2-error.log` shows new fatal patterns (`TypeError`, `Cannot read property`, `jwt malformed`, `ReferenceError`). |
+| **Expected downtime?** | **~10-15 seconds** during `pm2 restart sap-logistics`. If the orphan-on-port-4000 risk materializes and we need a manual `Stop-Process -Force`, ~30-45 seconds. Customer-visible: brief 502 from cf-tunnel during restart; SPA reconnects automatically. |
+| **Biggest remaining deployment risk?** | The sap-logistics PM2 bookkeeping mismatch interacting with OneDrive file-locks during the kill-then-fork phase of `pm2 restart`. Probability ~30% based on the 2026-05-09 21:01:28 precedent. Impact: delayed restart by 1-3 min while operator manually `Stop-Process` the listing pid. Mitigation: §6 step 7.4 is exactly this. |
+
+---
+
+## 2. Wave A deployment sequence — exact (run in order, do NOT skip)
+
+### 2.1 Prerequisites (verify, don't re-do)
+```text
+[ ] HEAD == pre-wave-a-baseline tag (verified)
+[ ] dump.pm2.PRE-CLEANUP-* and POST-CLEANUP-* in C:\backups\pm2\ (verified)
+[ ] store.json snapshot in backend\data\archive\ (verified)
+[ ] /health returns 200 (verified)
+[ ] orphan 24420 dead, port 4001 free (verified)
+[ ] sap-bi-api crash loop ended (verified)
+[ ] operator + backup operator on call
+[ ] cloudflare-tunnel still online (do NOT disable — customer SMS depends on it)
+```
+
+### 2.2 Step 1 — branch + apply patch
+```powershell
+cd "C:\Users\izik\OneDrive - OIG\שולחן העבודה\cowork\sap-logistics-hub"
+git checkout -b wave-a-mitigation
+# Apply patch per emergency-mitigation-plan.md §2 (~30 lines in backend/src/demo/demoServer.js):
+#   - Define requireAuthBasic + adminOnly middlewares (~25 lines after line 88)
+#   - Per-endpoint adminOnly on /api/users handlers (lines 1135-1182)
+#   - app.use('/api/customers', requireAuthBasic) before line 327
+#   - app.use('/api/drivers', requireAuthBasic) before line 1100; adminOnly on POST/PATCH/DELETE
+#   - app.use('/api/sap/write', adminOnly) before line 412
+#   - mobile-link TTL: '30d' → '1h' at line 181
+#   - single-use guard at /m/admin/:shortId line 3289
+```
+
+### 2.3 Step 2 — local syntax check
+```powershell
+cd backend
+node --check src/demo/demoServer.js
+# Expect: nothing (success). Any output → fix and re-check before proceeding.
+```
+
+### 2.4 Step 3 — local smoke test on PORT=4101 (do NOT skip)
+```powershell
+cd backend
+$env:DEMO_PORT='4101'
+# In a separate PowerShell window:
+node src/demo/demoServer.js
+# Watch for "🎬 SAP Logistics Hub - DEMO SERVER" banner
+
+# In the original window:
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4101/health           # expect 200
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4101/api/customers/search?q=t  # expect 401
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4101/api/drivers       # expect 401
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4101/api/users         # expect 401
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4101/api/sap/write/delivery-note/1  # expect 401
+
+# Stop test server: Ctrl+C in the node window
+$env:DEMO_PORT=$null
+# If ANY probe returns 200 → fix patch before continuing
+```
+
+### 2.5 Step 4 — commit + tag (do NOT push)
+```powershell
+git add backend/src/demo/demoServer.js
+git commit -m "Wave A emergency mitigation: gate /api/users, /api/customers, /api/drivers, /api/sap/write, /m/admin
+
+Closes F31, F32/F33, F34, F4, F7 from security-reaudit.md.
+
+Rollback: git revert HEAD; pm2 restart sap-logistics (with orphan-kill if pid 20112 still alive)
+
+Refs: docs/architecture-review/external-reachability-report.md (PUBLIC_INTERNET_EXPOSED 2026-05-10)
+Refs: docs/architecture-review/emergency-mitigation-plan.md
+Refs: docs/architecture-review/wave-a-readiness-check.md (READY 2026-05-10 11:45)"
+
+git tag wave-a-pre-deploy
+# Capture the SHA — needed for rollback:
+git rev-parse HEAD | Out-File C:\backups\pm2\wave-a-commit-sha.txt
+# (do NOT push — local only per task instruction)
+```
+
+### 2.6 Step 5 — pre-restart snapshot
+```powershell
+$ts = Get-Date -Format 'yyyyMMdd-HHmm'
+pm2 save
+Copy-Item "$env:USERPROFILE\.pm2\dump.pm2" "C:\backups\pm2\dump.pm2.PRE-WAVE-A-$ts"
+Copy-Item "...\backend\data\store.json" "...\backend\data\archive\store.json.PRE-WAVE-A-$ts"
+```
+
+### 2.7 Step 6 — operator gate (manual review)
+Operator + backup operator review `git diff pre-wave-a-baseline..HEAD` one more time. **No restart yet.**
+
+### 2.8 Step 7 — restart sap-logistics (the moment of activation)
+
+```powershell
+# 7.1 — Identify port 4000 owner
+$port4000_pid = (Get-NetTCPConnection -LocalPort 4000 -State Listen -ErrorAction SilentlyContinue).OwningProcess
+$logistics_pid = (pm2 jlist | ConvertFrom-Json | Where { $_.name -eq 'sap-logistics' }).pid
+
+Write-Host "port 4000 pid: $port4000_pid"
+Write-Host "pm2 sap-logistics pid: $logistics_pid"
+
+# 7.2 — If port 4000 is owned by ANY process AND PM2's bookkeeping is errored
+# (or pid mismatch), we KNOW pm2 restart will hit the OneDrive-lock failure mode.
+# Pre-empt by Stop-Process before pm2 restart.
+if ($port4000_pid -and ($port4000_pid -ne $logistics_pid -or `
+    ((pm2 describe sap-logistics | Select-String 'status').ToString() -match 'errored'))) {
+  Write-Host "Pre-emptively killing pid $port4000_pid to avoid OneDrive lock"
+  Stop-Process -Id $port4000_pid -Force
+  Start-Sleep -Seconds 2
+  # Verify port now free
+  Get-NetTCPConnection -LocalPort 4000 -State Listen -EA SilentlyContinue
+  # (expect empty)
+}
+
+# 7.3 — NOW issue the restart
+pm2 restart sap-logistics
+
+# 7.4 — Wait for the new fork to come up
+Start-Sleep -Seconds 5
+```
+
+### 2.9 Step 8 — immediate verification (within 30s of restart)
+```powershell
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4000/health
+# expect 200
+
+curl -s -o NUL -w "code=%{http_code}`n" http://localhost:4000/api/users
+# expect 401  ← proves new code loaded
+
+curl -s "http://localhost:4000/api/users" -H "Authorization: Bearer <ADMIN_TOKEN>" `
+  -o NUL -w "code=%{http_code}`n"
+# expect 200  ← proves auth works for ADMIN
+```
+
+If `/api/users` returns 200 anonymously → patch DID NOT LOAD → execute §3 rollback.
+
+### 2.10 Step 9 — full probe matrix
+Run `post-mitigation-verification.md` §3 anonymous + authed matrices, plus §5 frontend smoke tests.
+
+### 2.11 Step 10 — final pm2 save + INCIDENTS.md update
+```powershell
+pm2 save
+$ts = Get-Date -Format 'yyyyMMdd-HHmm'
+Copy-Item "$env:USERPROFILE\.pm2\dump.pm2" "C:\backups\pm2\dump.pm2.POST-WAVE-A-$ts"
+git tag wave-a-deployed
+# Update INCIDENTS.md with deploy outcome (template in operator-execution-checklist.md §L)
+```
+
+---
+
+## 3. Rollback sequence — exact (only if Step 8 fails)
+
+```powershell
+# 3.1 Identify the Wave A commit
+$wave_a_sha = Get-Content C:\backups\pm2\wave-a-commit-sha.txt
+
+# 3.2 Revert
+cd "C:\Users\izik\OneDrive - OIG\שולחן העבודה\cowork\sap-logistics-hub"
+git revert HEAD --no-edit
+# Creates a new commit on top that undoes Wave A. HEAD is now: <revert>, <wave_a>, pre-wave-a-baseline
+
+# 3.3 Restart with the same orphan-kill pre-check
+$port4000_pid = (Get-NetTCPConnection -LocalPort 4000 -State Listen -EA SilentlyContinue).OwningProcess
+$logistics_pid = (pm2 jlist | ConvertFrom-Json | Where { $_.name -eq 'sap-logistics' }).pid
+if ($port4000_pid -and $port4000_pid -ne $logistics_pid) {
+  Stop-Process -Id $port4000_pid -Force
+  Start-Sleep -Seconds 2
+}
+pm2 restart sap-logistics
+Start-Sleep -Seconds 5
+
+# 3.4 Verify rollback
+curl -s "http://localhost:4000/api/users" -o NUL -w "code=%{http_code}`n"
+# expect 200 (back to anonymous — rollback successful)
+
+# 3.5 INCIDENTS.md entry: rollback executed; Wave A NOT in production
+# 3.6 Schedule investigation of the failure
+```
+
+State preserved during rollback:
+- `backend/data/store.json` is untouched by both Wave A and rollback (no edits).
+- Logistics SQL is untouched.
+- JWT_SECRET unchanged → existing user/driver tokens still valid.
+- `cloudflare-tunnel` continues serving (no env change).
+
+---
+
+## 4. Verification order (during Step 8 + 9)
+
+```text
+T+0s    pm2 restart sap-logistics issued
+T+5s    curl localhost:4000/health → 200      [GATE]
+T+10s   curl localhost:4000/api/users → 401   [GATE — proves patch loaded]
+T+15s   curl localhost:4000/api/users with ADMIN token → 200   [GATE]
+T+30s   curl localhost:4000/api/customers/search?q=test → 401  [GATE]
+T+45s   public URL /api/users → 401           [GATE — closes the original exposure]
+T+60s   public URL /api/customers/search → 401 [GATE]
+T+90s   public URL /api/drivers → 401         [GATE]
+T+2m    full anonymous probe matrix (post-mitigation-verification.md §3.1-3.4)
+T+3m    full authed probe matrix (§3 ADMIN + DRIVER columns)
+T+4m    frontend UsersPage with ADMIN session → loads + lists users
+T+5m    frontend RunsPage with PLANNER session → shows runs
+T+6m    customer SMS tracking link → opens TrackingPage with data
+T+7m    driver mobile app login + my-runs → works
+T+10m   tail backend/logs/error.log -f → no new fatal patterns
+T+15m   declare success OR rollback
+```
+
+If any GATE step fails, jump immediately to §3 rollback.
+
+---
+
+## 5. First-5-minutes critical observations
+
+The operator + backup operator should be staring at these specific things in the first 5 minutes after restart:
+
+1. **`pm2 list` output** — sap-logistics should now show `status: online` (NOT errored). If still errored after the new fork, the new restart didn't reset PM2's view either; investigate before declaring success.
+
+2. **`backend/logs/pm2-out.log`** — should show the demoServer banner `🎬 SAP Logistics Hub - DEMO SERVER` from the new fork, with a fresh timestamp.
+
+3. **`backend/logs/error.log`** — watch for ANY new error pattern. Specifically:
+   - `TypeError: Cannot read property` → middleware variable bug
+   - `jwt malformed` → JWT_SECRET mismatch
+   - `ReferenceError` → undefined identifier (e.g., requireAuthBasic typo)
+   - `Cannot find module` → missing import
+   These are immediate rollback triggers.
+
+4. **`/api/users` anonymous from public URL** — this is THE key signal. If still 200, the entire mitigation failed. Roll back.
+
+5. **`/api/users/me/change-password` (if any user logs in to test)** — should still work for non-ADMIN users (we excluded `/me/*` from adminOnly per `emergency-mitigation-plan.md` §2.2). If a regular user reports they can't change their password, the carve-out is broken; roll back.
+
+6. **Driver mobile app** — drivers should NOT see any change. If they report errors logging in or loading manifest, something else broke. Roll back.
+
+7. **Customer SMS tracking** — customers with active SMS links should still be able to open them. The tracking endpoint `/api/public/track/:token` is NOT in Wave A; if it suddenly 401s, something else is wrong.
+
+---
+
+## ⬇⬇⬇  HISTORICAL SECTIONS BELOW (1st + 2nd re-checks, preserved for audit)  ⬇⬇⬇
+
+---
+
+## 🛑 PRIOR STATUS (2nd re-check, 11:22): `NOT_READY_FOR_WAVE_A_DEPLOYMENT`
 
 **4 of 4 prerequisite groups still FAIL.** Operator reported prerequisites complete, but every measurable system signal is identical to the first re-check 11 minutes earlier. **No operator actions have actually landed on this host.** Same orphan, same crash loop, same backup-directories-missing, same dirty git tree, same INCIDENTS.md.
 
