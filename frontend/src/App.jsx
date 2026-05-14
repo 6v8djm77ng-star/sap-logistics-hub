@@ -41,6 +41,9 @@ import DavoMixPage from './pages/DavoMixPage.jsx';
 import DriverRunsPage from './pages/driver/DriverRunsPage.jsx';
 import DriverManifestPage from './pages/driver/DriverManifestPage.jsx';
 import ForceChangePasswordPage from './pages/ForceChangePasswordPage.jsx';
+import ForgotPasswordPage from './pages/ForgotPasswordPage.jsx';
+import ResetPasswordPage from './pages/ResetPasswordPage.jsx';
+import CompleteProfilePage from './pages/CompleteProfilePage.jsx';
 import { useEffect } from 'react';
 import { initAutoFlush } from './services/offlineQueue.js';
 
@@ -57,6 +60,17 @@ function RequireAuth({ children, roles }) {
   if (user.mustChangePassword && location.pathname !== '/force-change-password') {
     return <Navigate to="/force-change-password" replace />;
   }
+  // Phase 4b — hard gate: profile must be complete (FullName + Email +
+  // Phone) before reaching anything else. Drivers are exempt — their
+  // profile is admin-managed via the drivers list.
+  if (
+    user.profileCompleted === false &&
+    user.role !== 'DRIVER' &&
+    location.pathname !== '/complete-profile' &&
+    location.pathname !== '/force-change-password'
+  ) {
+    return <Navigate to="/complete-profile" replace />;
+  }
   if (roles && !roles.includes(user.role)) {
     return <Navigate to="/" replace />;
   }
@@ -72,11 +86,21 @@ export default function App() {
     <Routes>
       {/* Public */}
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
       <Route
         path="/force-change-password"
         element={
           <RequireAuth>
             <ForceChangePasswordPage />
+          </RequireAuth>
+        }
+      />
+      <Route
+        path="/complete-profile"
+        element={
+          <RequireAuth>
+            <CompleteProfilePage />
           </RequireAuth>
         }
       />

@@ -338,6 +338,72 @@ function _isProfileComplete(user) {
   return !!(user.FullName?.trim() && user.Email?.trim() && user.Phone?.trim());
 }
 
+// ============================================================================
+// Phase 4b — password reset tokens. Each entry: { Hash, UserId, ExpiresAt,
+// CreatedAt, Used }. We store the bcrypt hash, never the plaintext; the
+// plaintext only ever lives in the email body. TTL 30 min, single-use.
+// ============================================================================
+const RESET_TOKEN_TTL_MS = 30 * 60 * 1000;
+
+export function recordPasswordResetToken(userId, plainToken) {
+  const s = load();
+  if (!s.passwordResetTokens) s.passwordResetTokens = [];
+  // Invalidate any earlier tokens for the same user so a fresh request
+  // supersedes them. Otherwise an attacker could keep a leaked link warm
+  // by triggering /forgot-password again.
+  s.passwordResetTokens = s.passwordResetTokens.filter((t) =>
+    t.UserId !== Number(userId) || t.Used
+  );
+  s.passwordResetTokens.push({
+    Hash: bcrypt.hashSync(String(plainToken), 10),
+    UserId: Number(userId),
+    CreatedAt: new Date().toISOString(),
+    ExpiresAt: new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString(),
+    Used: false,
+  });
+  save();
+}
+
+export function consumePasswordResetToken(plainToken) {
+  const s = load();
+  if (!s.passwordResetTokens?.length) return null;
+  const now = Date.now();
+  // Scan active tokens — typically a handful at most.
+  for (const entry of s.passwordResetTokens) {
+    if (entry.Used) continue;
+    if (new Date(entry.ExpiresAt).getTime() < now) continue;
+    if (bcrypt.compareSync(String(plainToken), entry.Hash)) {
+      entry.Used = true;
+      entry.UsedAt = new Date().toISOString();
+      save();
+      return entry.UserId;
+    }
+  }
+  return null;
+}
+
+export function cleanupExpiredResetTokens() {
+  const s = load();
+  if (!s.passwordResetTokens?.length) return 0;
+  const now = Date.now();
+  const before = s.passwordResetTokens.length;
+  s.passwordResetTokens = s.passwordResetTokens.filter((t) => {
+    if (t.Used) return false;
+    if (new Date(t.ExpiresAt).getTime() < now) return false;
+    return true;
+  });
+  if (s.passwordResetTokens.length !== before) save();
+  return before - s.passwordResetTokens.length;
+}
+
+export function getUserByEmail(email) {
+  const target = String(email || '').trim().toLowerCase();
+  if (!target) return null;
+  return load().users.find((u) =>
+    u.IsActive && u.Email && u.Email.toLowerCase() === target
+  );
+}
+
 export function migrateUsersPhase4a() {
   const s = load();
   if (!s.users) return { updated: 0 };

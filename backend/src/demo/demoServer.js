@@ -17,6 +17,8 @@ import compression from 'compression';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
+import { randomBytes } from 'crypto';
+import { sendPasswordResetEmail } from '../services/passwordEmails.js';
 import { Server as SocketServer } from 'socket.io';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
@@ -113,6 +115,31 @@ const loginLimiter = rateLimit({
 app.use('/api/auth/login', loginLimiter);
 app.use('/api/auth/driver-login', loginLimiter);
 app.use('/api/auth/picker-login', loginLimiter);
+
+// Phase 4b — separate, tighter rate limit on the password-reset flow.
+// Forgot endpoint: 5 / 15 min so a leaked email list can't be sprayed.
+// Reset-with-token endpoint: 10 / 15 min to bound brute-force attempts.
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60_000, max: 5, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'יותר מדי בקשות איפוס. נסה שוב בעוד 15 דקות.' },
+});
+const resetWithTokenLimiter = rateLimit({
+  windowMs: 15 * 60_000, max: 10, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'יותר מדי ניסיונות איפוס. נסה שוב בעוד 15 דקות.' },
+});
+app.use('/api/auth/forgot-password', forgotPasswordLimiter);
+app.use('/api/auth/reset-password-with-token', resetWithTokenLimiter);
+
+// Phase 4b — periodic cleanup of expired/used reset tokens. Keeps the
+// store small and prevents stale entries lingering after restart.
+setInterval(() => {
+  try {
+    const removed = store.cleanupExpiredResetTokens();
+    if (removed) console.log(`[reset-tokens] cleaned ${removed} expired/used entries`);
+  } catch (err) {
+    console.warn('[reset-tokens] cleanup failed:', err.message);
+  }
+}, 10 * 60 * 1000).unref();
 
 // Simple logger
 app.use((req, res, next) => {
@@ -531,6 +558,121 @@ app.get('/api/auth/me', (req, res) => {
     } catch {}
   }
   res.status(401).json({ error: 'Not authenticated' });
+});
+
+// Phase 4b — forgot-password. Always returns 200 with a generic message,
+// even if the email isn't in the system, to avoid leaking which addresses
+// are valid (account enumeration). When a match exists, a single-use
+// 30-min reset token is recorded and the link is emailed (or logged when
+// SMTP isn't configured).
+const ForgotPasswordSchema = z.object({
+  email: z.string().trim().email('כתובת מייל לא תקינה').max(200),
+});
+app.post('/api/auth/forgot-password', async (req, res) => {
+  const data = parseBody(ForgotPasswordSchema, req.body, res);
+  if (!data) return;
+  const user = store.getUserByEmail(data.email);
+  // Always succeed from the client's point of view — even if no user.
+  // We still log the lookup attempt to the audit trail (success=false on
+  // misses) so an admin can spot enumeration sweeps.
+  if (!user) {
+    store.recordAudit({
+      action: 'password.reset.requested',
+      success: false, ip: req.ip,
+      details: { email: data.email, reason: 'no_match' },
+    });
+    return res.json({ ok: true, message: 'אם הכתובת קיימת במערכת, נשלח אליה קישור איפוס.' });
+  }
+  // Generate a 32-byte URL-safe token. Plain only ever exists in this
+  // request scope + the outgoing email body. Storage holds bcrypt hash.
+  const plainToken = randomBytes(32).toString('base64url');
+  store.recordPasswordResetToken(user.UserId, plainToken);
+  // Build the absolute reset URL. Same logic as mobile-link: prefer
+  // PUBLIC_URL, then the latest Cloudflare tunnel, then the request host.
+  let publicBase = process.env.PUBLIC_URL || null;
+  if (!publicBase) {
+    try {
+      const cfLog = path.resolve(__dirname, '..', '..', 'logs', 'cf-tunnel-error.log');
+      if (fsSync.existsSync(cfLog)) {
+        const txt = fsSync.readFileSync(cfLog, 'utf8');
+        const matches = txt.match(/https:\/\/[a-z-]+\.trycloudflare\.com/g);
+        if (matches?.length) publicBase = matches[matches.length - 1];
+      }
+    } catch {}
+  }
+  if (!publicBase) {
+    publicBase = `${req.protocol || 'http'}://${req.get('host') || `localhost:${PORT}`}`;
+  }
+  const resetLink = `${publicBase}/reset-password?token=${encodeURIComponent(plainToken)}`;
+  const emailResult = await sendPasswordResetEmail({
+    toEmail: user.Email,
+    userName: user.FullName,
+    resetLink,
+  });
+  store.recordAudit({
+    action: 'password.reset.requested',
+    targetUserId: user.UserId, targetUsername: user.Username,
+    success: true, ip: req.ip,
+    details: { emailMode: emailResult.mode },
+  });
+  res.json({
+    ok: true,
+    message: 'אם הכתובת קיימת במערכת, נשלח אליה קישור איפוס.',
+    // Dev-aid only: when SMTP is in log-only mode AND the env explicitly
+    // opts in, echo the link back so the admin can grab it from the UI.
+    // Off by default; flip RETURN_RESET_LINK_IN_RESPONSE=true to enable.
+    ...(emailResult.mode === 'log' && process.env.RETURN_RESET_LINK_IN_RESPONSE === 'true'
+      ? { _devResetLink: resetLink } : {}),
+  });
+});
+
+// Phase 4b — consume reset token + set new password. Token verified by
+// bcrypt against the store; single-use; clears MustChangePassword and
+// revokes every outstanding token for the user. Anti-enumeration: an
+// invalid / expired / used token returns the same 400 body regardless of
+// which case fired.
+const ResetWithTokenSchema = z.object({
+  token: z.string().min(20).max(200),
+  newPassword: z.string().min(1).max(200),
+});
+app.post('/api/auth/reset-password-with-token', async (req, res) => {
+  const data = parseBody(ResetWithTokenSchema, req.body, res);
+  if (!data) return;
+  const strength = validatePasswordStrength(data.newPassword);
+  if (!strength.ok) return res.status(400).json({ error: strength.error, code: strength.code });
+  const userId = store.consumePasswordResetToken(data.token);
+  if (!userId) {
+    store.recordAudit({
+      action: 'password.reset.consume',
+      success: false, ip: req.ip,
+      details: { reason: 'invalid_or_expired_token' },
+    });
+    return res.status(400).json({
+      error: 'קישור האיפוס לא תקין, פג תוקף או כבר נוצל. בקש קישור חדש.',
+      code: 'INVALID_RESET_TOKEN',
+    });
+  }
+  const user = store.getUserById(userId);
+  if (!user) return res.status(404).json({ error: 'משתמש לא נמצא' });
+  // Don't let the user reset back to the SAME password they currently have.
+  const sameAsCurrent = await store.isCurrentPassword(userId, data.newPassword);
+  if (sameAsCurrent) {
+    return res.status(400).json({
+      error: 'הסיסמה החדשה זהה לסיסמה הקיימת. בחר/י סיסמה שונה.',
+      code: 'PWD_SAME_AS_OLD',
+    });
+  }
+  // Self-service reset → clear MustChangePassword (the rotation itself
+  // is the rotation, no need to force another one).
+  await store.setUserPassword(userId, data.newPassword);
+  store.logoutSub(userId);
+  store.recordAudit({
+    action: 'password.change.forgot_token',
+    actorSub: userId, actorName: user.FullName,
+    targetUserId: userId, targetUsername: user.Username,
+    success: true, ip: req.ip,
+  });
+  res.json({ ok: true, username: user.Username });
 });
 
 // Invalidates all outstanding tokens for the caller's subject. Subsequent

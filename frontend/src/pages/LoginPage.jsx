@@ -76,6 +76,12 @@ export default function LoginPage() {
           </button>
         </form>
 
+        <div className="mt-4 text-center">
+          <a href="/forgot-password" className="text-sm text-gray-500 hover:text-brand-600">
+            שכחתי סיסמה
+          </a>
+        </div>
+
         <div className="mt-6 pt-6 border-t border-gray-200 text-center">
           <a href="/driver/login" className="text-sm text-brand-600 hover:underline">
             התחברות לנהג →
