@@ -19,6 +19,7 @@ import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { randomBytes } from 'crypto';
 import { sendPasswordResetEmail } from '../services/passwordEmails.js';
+import * as financialReader from '../services/sap/financialReader.js';
 import { Server as SocketServer } from 'socket.io';
 import { fileURLToPath } from 'url';
 import PDFDocument from 'pdfkit';
@@ -1325,6 +1326,128 @@ app.get('/api/analytics/anomalies', async (_req, res) => {
 //   - Margin = revenue − cost
 // Used by management to spot unprofitable customers.
 // ----------------------------------------------------------------------------
+
+// ============================================================================
+// MTD vs Prior-Year-MTD sales comparison
+// Source of truth: OINV.DocDate (actual invoices, not open orders).
+// On 2026-05-14 returns: current = 2026-05-01 → 2026-05-14, prior = 2025-05-01
+// → 2025-05-14. Feb 29 → Feb 28 clip for non-leap years. Auth via Wave A
+// gate on /api/analytics/* (requireAuthBasic).
+// ----------------------------------------------------------------------------
+function mtdYoYWindowsForToday(today = new Date()) {
+  const y = today.getUTCFullYear();
+  const m = today.getUTCMonth();
+  const d = today.getUTCDate();
+  const fmt = (dt) => dt.toISOString().slice(0, 10);
+  const currentStart = new Date(Date.UTC(y, m, 1));
+  const currentEnd = new Date(Date.UTC(y, m, d));
+  // Clip to last day of the prior-year same month (handles Feb 29 → Feb 28).
+  const priorMonthLastDay = new Date(Date.UTC(y - 1, m + 1, 0)).getUTCDate();
+  const priorStart = new Date(Date.UTC(y - 1, m, 1));
+  const priorEnd = new Date(Date.UTC(y - 1, m, Math.min(d, priorMonthLastDay)));
+  const monthName = currentStart.toLocaleDateString('he-IL', { month: 'long', timeZone: 'UTC' });
+  return {
+    current: { from: fmt(currentStart), to: fmt(currentEnd), label: `${monthName} ${y} (1-${d})` },
+    prior:   { from: fmt(priorStart),   to: fmt(priorEnd),   label: `${monthName} ${y - 1} (1-${Math.min(d, priorMonthLastDay)})` },
+  };
+}
+
+function aggregateDailyRows(rows) {
+  // rows from getDailySales: [{ DocDate, CompanyCode, OrderCount, Revenue, AvgOrderValue }]
+  // We re-aggregate to one totals object + per-company totals. We deliberately
+  // recompute avg from revenue/count rather than averaging AvgOrderValue,
+  // because averaging daily averages double-weights light days.
+  const byCompany = new Map(); // CompanyCode -> { revenue, invoiceCount }
+  let totalRevenue = 0;
+  let totalCount = 0;
+  for (const r of rows || []) {
+    const rev = Number(r.Revenue || 0);
+    const cnt = Number(r.OrderCount || 0);
+    totalRevenue += rev;
+    totalCount += cnt;
+    const code = String(r.CompanyCode || '');
+    if (!byCompany.has(code)) byCompany.set(code, { revenue: 0, invoiceCount: 0 });
+    const c = byCompany.get(code);
+    c.revenue += rev;
+    c.invoiceCount += cnt;
+  }
+  const safeAvg = (rev, cnt) => (cnt > 0 ? rev / cnt : 0);
+  const total = {
+    revenue: totalRevenue,
+    invoiceCount: totalCount,
+    avgInvoiceValue: safeAvg(totalRevenue, totalCount),
+  };
+  const companyTotals = (code) => {
+    const c = byCompany.get(code) || { revenue: 0, invoiceCount: 0 };
+    return { revenue: c.revenue, invoiceCount: c.invoiceCount, avgInvoiceValue: safeAvg(c.revenue, c.invoiceCount) };
+  };
+  return { total, byCompany: { A: companyTotals('A'), B: companyTotals('B') } };
+}
+
+function deltaOf(current, prior) {
+  // pct is null when prior=0 — avoids dividing by zero and lets the UI show
+  // a neutral marker instead of fake "+∞%".
+  const mk = (curV, priorV) => {
+    const abs = curV - priorV;
+    const pct = priorV !== 0 ? (abs / priorV) * 100 : null;
+    return { abs, pct };
+  };
+  return {
+    revenue:         mk(current.revenue,         prior.revenue),
+    invoiceCount:    mk(current.invoiceCount,    prior.invoiceCount),
+    avgInvoiceValue: mk(current.avgInvoiceValue, prior.avgInvoiceValue),
+  };
+}
+
+app.get('/api/analytics/sales-mtd-yoy', async (_req, res) => {
+  try {
+    const { current: curW, prior: prW } = mtdYoYWindowsForToday();
+    if (!sapLive) {
+      // 200 with a warning so the UI can still render the period labels and
+      // a zero-row table — same behaviour as customer-profitability.
+      const empty = { revenue: 0, invoiceCount: 0, avgInvoiceValue: 0 };
+      return res.json({
+        currentPeriod: curW, priorPeriod: prW,
+        totals: { current: empty, prior: empty, delta: deltaOf(empty, empty) },
+        byCompany: [
+          { companyCode: 'A', companyName: 'OIG',   current: empty, prior: empty, delta: deltaOf(empty, empty) },
+          { companyCode: 'B', companyName: 'UNICO', current: empty, prior: empty, delta: deltaOf(empty, empty) },
+        ],
+        source: 'OINV.DocDate',
+        warnings: ['SAP not connected'],
+      });
+    }
+    const [curRows, prRows] = await Promise.all([
+      financialReader.getDailySales({ fromDate: curW.from, toDate: curW.to }),
+      financialReader.getDailySales({ fromDate: prW.from, toDate: prW.to }),
+    ]);
+    const cur = aggregateDailyRows(curRows);
+    const pr  = aggregateDailyRows(prRows);
+    res.json({
+      currentPeriod: curW,
+      priorPeriod: prW,
+      totals: {
+        current: cur.total,
+        prior:   pr.total,
+        delta:   deltaOf(cur.total, pr.total),
+      },
+      byCompany: [
+        { companyCode: 'A', companyName: 'OIG',
+          current: cur.byCompany.A, prior: pr.byCompany.A,
+          delta: deltaOf(cur.byCompany.A, pr.byCompany.A) },
+        { companyCode: 'B', companyName: 'UNICO',
+          current: cur.byCompany.B, prior: pr.byCompany.B,
+          delta: deltaOf(cur.byCompany.B, pr.byCompany.B) },
+      ],
+      source: 'OINV.DocDate',
+      warnings: [],
+    });
+  } catch (err) {
+    console.error('[sales-mtd-yoy] failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/analytics/customer-profitability', async (req, res) => {
   try {
     const days = Math.min(365, Math.max(1, Number(req.query.days || 90)));
