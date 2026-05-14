@@ -10,8 +10,29 @@ import { format } from 'date-fns';
 import { useState } from 'react';
 import {
   Package, Zap, ChevronLeft, Clock, CheckCircle,
-  AlertTriangle, Warehouse, Plus, BarChart3,
+  AlertTriangle, Warehouse, Plus, BarChart3, Layers, Users,
 } from 'lucide-react';
+
+// Picking-mode badge: a one-line visual cue for the warehouse worker so they
+// know HOW to organize the run before opening the picking page itself.
+// SINGLE      = one consolidated picking list (no badge — default)
+// BY_PALLET   = manager set pallet labels per stop, pick groups by pallet
+// BY_CUSTOMER = pick groups per customer
+function PalletModeBadge({ mode }) {
+  if (!mode || mode === 'SINGLE') return null;
+  const cfg = mode === 'BY_PALLET'
+    ? { icon: Layers, label: 'לפי משטח', cls: 'bg-amber-100 text-amber-800 border-amber-300' }
+    : mode === 'BY_CUSTOMER'
+      ? { icon: Users,  label: 'לפי לקוח', cls: 'bg-purple-100 text-purple-800 border-purple-300' }
+      : null;
+  if (!cfg) return null;
+  const Icon = cfg.icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] rounded border ${cfg.cls}`}>
+      <Icon size={10} /> {cfg.label}
+    </span>
+  );
+}
 
 export default function WarehousePage() {
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
@@ -111,7 +132,10 @@ export default function WarehousePage() {
                   </div>
                   <Zap size={14} className="text-brand-600" />
                 </div>
-                <div className="text-sm text-gray-600">{r.ZoneName}</div>
+                <div className="text-sm text-gray-600 flex items-center gap-2">
+                  <span>{r.ZoneName}</span>
+                  <PalletModeBadge mode={r.PalletMode} />
+                </div>
                 <div className="text-xs text-gray-500 mt-1">
                   {r.StopCount} עצירות · {r.OrderCount} הזמנות
                 </div>
@@ -145,14 +169,15 @@ export default function WarehousePage() {
                       {w.Status === 'IN_PROGRESS' ? 'בתהליך' : 'ממתין'}
                     </span>
                   </div>
-                  <div className="text-sm text-gray-600 mb-2">
+                  <div className="text-sm text-gray-600 mb-2 flex items-center gap-2 flex-wrap">
                     {run && (
                       <span className="inline-flex items-center gap-1">
                         <span className="w-2 h-2 rounded-full" style={{ backgroundColor: run.ZoneColor }} />
                         {run.ZoneName}
                       </span>
                     )}
-                    {' '}· {w.RunNumber}
+                    <span>· {w.RunNumber}</span>
+                    <PalletModeBadge mode={run?.PalletMode} />
                   </div>
                   <div className="flex items-center justify-between text-xs text-gray-500">
                     <span>{w.TotalLines} פריטים</span>
