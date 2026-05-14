@@ -25,58 +25,139 @@ import {
   Tv,
   Trophy,
   Banknote,
-  DollarSign,
   Eye,
-  PackageX,
-  Sparkles,
-  Target,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 import clsx from 'clsx';
 import RefreshButton from './RefreshButton.jsx';
+import NextPageButton from './NextPageButton.jsx';
 
-const navItems = [
-  { to: '/',           label: 'דשבורד',         icon: LayoutDashboard },
-  { to: '/orders',     label: 'הזמנות SAP',     icon: Package, highlight: true },
-  { to: '/live',       label: 'מעקב חי',        icon: Activity },
-  { to: '/map',        label: 'מפת נהגים',      icon: Map },
-  { to: '/planner',    label: 'תכנון יומי',     icon: CalendarClock },
-  { to: '/warehouse',  label: 'ליקוט מחסן',     icon: Warehouse },
+// ─────────────────────────────────────────────────────────────────────
+// Sidebar sections
+//
+// The sidebar is split into three groups + one standalone item:
+//   1. workflowSection — the daily flow (1..13). NextPageButton walks
+//      this order. KEEP IN SYNC with WORKFLOW_ORDER in NextPageButton.jsx.
+//   2. reportsSection  — collapsible. Read-only analytics & failures.
+//   3. settingsSection — collapsible. Master data + admin.
+//   4. wallboardItem   — standalone at the bottom; used for the in-office
+//      big-screen display, not part of the daily flow.
+// ─────────────────────────────────────────────────────────────────────
+
+const workflowSection = [
+  { to: '/',           label: 'דשבורד',          icon: LayoutDashboard },
+  { to: '/orders',     label: 'הזמנות SAP',      icon: Package, highlight: true },
+  { to: '/planner',    label: 'תכנון יומי',       icon: CalendarClock },
   { to: '/runs',       label: 'מסלולי הפצה',     icon: Truck },
+  { to: '/warehouse',  label: 'ליקוט מחסן',      icon: Warehouse },
   { to: '/documents',  label: 'תעודות וחשבוניות', icon: FileText, highlight: true },
-  { to: '/customer-policy', label: 'מדיניות לקוחות', icon: Building2 },
-  { to: '/customer-doc-policy', label: 'מדיניות מסמכים', icon: FileText },
-  { to: '/returns',    label: 'חזרות',          icon: RotateCcw },
-  { to: '/failures',   label: 'ניהול כשלים',    icon: AlertOctagon, highlight: true },
-  { to: '/analytics',  label: 'ניתוח ביצועים',  icon: BarChart3 },
-  { to: '/weekly',     label: 'דוח שבועי',       icon: BarChart3 },
+  { to: '/map',        label: 'מפת נהגים',       icon: Map },
+  { to: '/live',       label: 'מעקב חי',         icon: Activity },
+  { to: '/returns',    label: 'חזרות',           icon: RotateCcw },
+  { to: '/exceptions', label: 'חריגים',          icon: AlertTriangle },
+  { to: '/anomalies',  label: 'זיהוי חריגים',    icon: Eye, highlight: true },
+  { to: '/cod',        label: 'תשלום במזומן',    icon: Banknote },
   { to: '/closure',    label: 'סגירת יום',       icon: BarChart3 },
-  { to: '/zones',      label: 'אזורי הפצה',     icon: MapPin },
-  { to: '/drivers',    label: 'נהגים',          icon: Users },
-  { to: '/pickers',    label: 'מלקטים',         icon: Warehouse },
-  { to: '/users',      label: 'משתמשים',        icon: UserCog },
-  { to: '/leaderboard', label: 'ביצועי נהגים',   icon: Trophy },
-  { to: '/cod',         label: 'תשלום במזומן',    icon: Banknote },
-  { to: '/anomalies',  label: 'זיהוי חריגים',     icon: Eye, highlight: true },
-  { to: '/exceptions', label: 'חריגים',         icon: AlertTriangle },
-  { to: '/wallboard',  label: 'מסך גדול',        icon: Tv },
-  { to: '/settings',   label: 'הגדרות + SAP',   icon: Settings },
 ];
+
+const reportsSection = [
+  { to: '/analytics',   label: 'ניתוח ביצועים',  icon: BarChart3 },
+  { to: '/weekly',      label: 'דוח שבועי',      icon: BarChart3 },
+  { to: '/leaderboard', label: 'ביצועי נהגים',   icon: Trophy },
+  { to: '/failures',    label: 'ניהול כשלים',    icon: AlertOctagon, highlight: true },
+];
+
+const settingsSection = [
+  { to: '/customer-policy',     label: 'מדיניות לקוחות', icon: Building2 },
+  { to: '/customer-doc-policy', label: 'מדיניות מסמכים', icon: FileText },
+  { to: '/zones',               label: 'אזורי הפצה',     icon: MapPin },
+  { to: '/drivers',             label: 'נהגים',          icon: Users },
+  { to: '/pickers',             label: 'מלקטים',         icon: Warehouse },
+  { to: '/users',               label: 'משתמשים',        icon: UserCog },
+  { to: '/settings',            label: 'הגדרות + SAP',   icon: Settings },
+];
+
+const wallboardItem = { to: '/wallboard', label: 'מסך גדול', icon: Tv };
+
+// Helper for NavLink className. Extracted because we render it identically
+// in three places now (workflow + reports + settings).
+const navLinkClass = ({ isActive }, item) =>
+  clsx(
+    'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
+    isActive
+      ? 'bg-brand-50 text-brand-700'
+      : item.highlight
+        ? 'text-red-700 hover:bg-red-50'
+        : 'text-gray-700 hover:bg-gray-100'
+  );
+
+function NavItem({ item }) {
+  return (
+    <NavLink
+      to={item.to}
+      end={item.to === '/'}
+      className={(state) => navLinkClass(state, item)}
+    >
+      <item.icon size={18} />
+      {item.label}
+    </NavLink>
+  );
+}
+
+function CategoryHeader({ label, icon: Icon, open, onToggle }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="w-full flex items-center justify-between gap-2 px-3 py-2 mt-3 rounded-lg text-xs font-bold uppercase tracking-wider text-gray-500 hover:bg-gray-100 hover:text-gray-700 transition-colors"
+      aria-expanded={open}
+    >
+      <span className="flex items-center gap-2">
+        <Icon size={14} />
+        {label}
+      </span>
+      {open ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+    </button>
+  );
+}
 
 export default function DashboardLayout() {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [openCategories, setOpenCategories] = useState({
+    reports: false,
+    settings: false,
+  });
 
   // Close sidebar when navigating on mobile
   useEffect(() => {
     setSidebarOpen(false);
   }, [location.pathname]);
 
+  // Auto-expand a collapsible group when the user lands on one of its
+  // routes (e.g. shared link, browser back). Keeps the highlight visible
+  // without forcing the user to manually open the group first.
+  useEffect(() => {
+    const inReports = reportsSection.some((i) => i.to === location.pathname);
+    const inSettings = settingsSection.some((i) => i.to === location.pathname);
+    if (inReports || inSettings) {
+      setOpenCategories((prev) => ({
+        reports: inReports || prev.reports,
+        settings: inSettings || prev.settings,
+      }));
+    }
+  }, [location.pathname]);
+
   const handleLogout = () => {
     logout();
     navigate('/login');
   };
+
+  const toggleCategory = (key) =>
+    setOpenCategories((prev) => ({ ...prev, [key]: !prev[key] }));
 
   return (
     <div className="min-h-screen flex bg-gray-50">
@@ -112,26 +193,35 @@ export default function DashboardLayout() {
         </div>
 
         <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {navItems.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              end={item.to === '/'}
-              className={({ isActive }) =>
-                clsx(
-                  'flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors',
-                  isActive
-                    ? 'bg-brand-50 text-brand-700'
-                    : item.highlight
-                      ? 'text-red-700 hover:bg-red-50'
-                      : 'text-gray-700 hover:bg-gray-100'
-                )
-              }
-            >
-              <item.icon size={18} />
-              {item.label}
-            </NavLink>
+          {/* Section 1 — daily workflow (always visible) */}
+          {workflowSection.map((item) => (
+            <NavItem key={item.to} item={item} />
           ))}
+
+          {/* Section 2 — reports (collapsible) */}
+          <CategoryHeader
+            label="דוחות"
+            icon={BarChart3}
+            open={openCategories.reports}
+            onToggle={() => toggleCategory('reports')}
+          />
+          {openCategories.reports &&
+            reportsSection.map((item) => <NavItem key={item.to} item={item} />)}
+
+          {/* Section 3 — settings / master data (collapsible) */}
+          <CategoryHeader
+            label="הגדרות"
+            icon={Settings}
+            open={openCategories.settings}
+            onToggle={() => toggleCategory('settings')}
+          />
+          {openCategories.settings &&
+            settingsSection.map((item) => <NavItem key={item.to} item={item} />)}
+
+          {/* Standalone — wallboard (operations display, not part of daily flow) */}
+          <div className="pt-3 mt-3 border-t border-gray-100">
+            <NavItem item={wallboardItem} />
+          </div>
         </nav>
 
         <div className="p-3 border-t border-gray-200">
@@ -181,6 +271,9 @@ export default function DashboardLayout() {
 
         <div className="flex-1 min-w-0">
           <Outlet />
+          {/* NextPageButton hides itself on non-workflow routes and on the
+              last workflow page (/closure). See NextPageButton.jsx. */}
+          <NextPageButton />
         </div>
       </main>
     </div>
