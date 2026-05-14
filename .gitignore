@@ -9,6 +9,18 @@ dist/
 infra/osrm/data/*
 !infra/osrm/data/.gitkeep
 
+# PDF rendering test artifacts (created by scripts that re-generate PDFs
+# before/after a change and diff them visually). Disposable.
+.pdftest-*.pdf
+
+# Local Claude Code settings (per-clone, not shared).
+frontend/.claude/
+backend/.claude/
+
+# AI sandbox local config (the only file in backend-sandbox/ that can hold
+# secrets — never commit). The rest of backend-sandbox/ is committed normally.
+backend-sandbox/.env.sandbox
+
 # ── Phase-1 baseline additions ─────────────────────────────────────
 
 # Real env files (every variant — NEVER commit)
