@@ -119,11 +119,18 @@ function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
                 <Check size={10} /> אשר הזמנה
               </button>
             )}
-            {a.QcApproved && (
+            {a.QcApproved && !a.PartialFulfillment && (
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded text-[10px] font-medium" title="ההזמנה אושרה ומסמכים הופקו">
                 <Check size={10} /> מאושרת
                 {a.DeliveryNoteId && <span className="text-emerald-700 mr-1">·ת.משלוח</span>}
                 {a.InvoiceId && <span className="text-emerald-700">·חשבונית</span>}
+              </span>
+            )}
+            {a.QcApproved && a.PartialFulfillment && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-400 rounded text-[10px] font-medium" title="ההזמנה אושרה חלקית — היתרה נשארת פתוחה ב-SAP">
+                <AlertTriangle size={10} /> חלקית
+                {a.DeliveryNoteId && <span className="text-amber-800 mr-1">·ת.משלוח חלקית</span>}
+                {a.InvoiceId && <span className="text-amber-800">·חשבונית</span>}
               </span>
             )}
           </div>
@@ -186,10 +193,29 @@ export default function PickingPage() {
       const parts = [];
       if (result.deliveryNote) parts.push('תעודת משלוח ' + result.deliveryNote.DocNumber);
       if (result.invoice)      parts.push('חשבונית '       + result.invoice.DocNumber);
-      const msg = result.idempotent
+      const prefix = result.idempotent
         ? 'הזמנה ' + alloc.SapDocNum + ' כבר אושרה'
-        : 'אושר: ' + (parts.join(' + ') || '(ללא מסמך)');
-      toast.success(msg, { duration: 4000 });
+        : (result.isPartial ? 'אושר חלקית: ' : 'אושר: ') + (parts.join(' + ') || '(ללא מסמך)');
+      if (result.isPartial) {
+        // Partial pick — show the picked-of-ordered ratio and the missing items
+        // so the operator can decide whether to chase the leftover today or
+        // leave it open in SAP for the next run.
+        const shortageNames = (result.deliveryNote?.Shortages || [])
+          .map((sh) => `${sh.ItemName || sh.ItemCode} (חסר ${sh.Missing})`)
+          .join(', ');
+        toast.success(
+          (t) => (
+            <div className="flex flex-col gap-0.5 text-sm">
+              <div className="font-bold">{prefix}</div>
+              <div className="text-xs">נלקטו {result.totalPicked}/{result.totalOrdered} יחידות</div>
+              {shortageNames && <div className="text-xs text-amber-200">חוסר: {shortageNames}</div>}
+            </div>
+          ),
+          { duration: 7000 },
+        );
+      } else {
+        toast.success(prefix, { duration: 4000 });
+      }
       queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] });
     },
     onError: (err) => {
@@ -211,6 +237,8 @@ export default function PickingPage() {
           ),
           { duration: 8000 },
         );
+      } else if (data.code === 'NOTHING_PICKED') {
+        toast.error(data.error || 'לא נלקטה אף יחידה — לקט פריט אחד לפחות לפני אישור', { duration: 6000 });
       } else {
         toast.error(data.error || 'שגיאה באישור ההזמנה');
       }

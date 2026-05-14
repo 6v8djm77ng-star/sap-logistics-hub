@@ -56,9 +56,31 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 
 const app = express();
 const server = http.createServer(app);
-const io = new SocketServer(server, { cors: { origin: '*' } });
 
-app.use(cors());
+// Wave A security follow-up — explicit CORS allow-list from CORS_ORIGINS env.
+// Without this, any origin on the public internet could call our API once it
+// found a valid token. Same-origin requests (no Origin header — curl, mobile
+// native, server-to-server) stay allowed.
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:5174,http://localhost:4000')
+  .split(',').map((o) => o.trim()).filter(Boolean);
+
+const corsOriginCheck = (origin, cb) => {
+  if (!origin) return cb(null, true);
+  if (allowedOrigins.includes(origin)) return cb(null, true);
+  console.warn(`[CORS] blocked origin: ${origin}`);
+  return cb(new Error('Origin not allowed by CORS'));
+};
+
+const io = new SocketServer(server, {
+  cors: { origin: corsOriginCheck, credentials: true },
+});
+
+app.use(cors({
+  origin: corsOriginCheck,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(compression());
 app.use(express.json({ limit: '2mb' }));
 
@@ -2655,8 +2677,16 @@ app.post('/api/orders/:runOrderId/qc-approve', (req, res) => {
     res.json({
       ok: true,
       idempotent: !!result.idempotent,
+      isPartial: !!result.isPartial,
+      totalOrdered: result.totalOrdered,
+      totalPicked: result.totalPicked,
       deliveryNote: result.deliveryNote
-        ? { DeliveryNoteId: result.deliveryNote.DeliveryNoteId, DocNumber: result.deliveryNote.DocNumber }
+        ? {
+            DeliveryNoteId: result.deliveryNote.DeliveryNoteId,
+            DocNumber: result.deliveryNote.DocNumber,
+            IsPartial: !!result.deliveryNote.IsPartial,
+            Shortages: result.deliveryNote.Shortages || [],
+          }
         : null,
       invoice: result.invoice
         ? { InvoiceId: result.invoice.InvoiceId, DocNumber: result.invoice.DocNumber }

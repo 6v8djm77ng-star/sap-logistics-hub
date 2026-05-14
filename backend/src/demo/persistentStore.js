@@ -1499,6 +1499,7 @@ export function getWave(waveId) {
       qcApproved: !!ord.QcApproved,
       deliveryNoteId: ord.DeliveryNoteId || null,
       invoiceId: ord.InvoiceId || null,
+      partialFulfillment: !!ord.PartialFulfillment,
     });
   }
   const enrich = (a) => {
@@ -1516,6 +1517,7 @@ export function getWave(waveId) {
       QcApproved: !!cust.qcApproved,
       DeliveryNoteId: cust.deliveryNoteId || null,
       InvoiceId: cust.invoiceId || null,
+      PartialFulfillment: !!cust.partialFulfillment,
     };
   };
 
@@ -2017,6 +2019,62 @@ function _hasAnyPerOrderPolicy(policy) {
 }
 
 /**
+ * Phase 2 — compute fulfillment for one RunOrder by walking its allocations
+ * across this run's wave. Returns picked/ordered totals + per-item breakdown
+ * so the DN can be flagged partial and downstream UI can show shortages.
+ *
+ * Matching key: SapDocEntry + CompanyCode. We also scope to the wave of the
+ * order's run to avoid cross-wave bleed if the same SAP order ever lives in
+ * two different waves (it shouldn't, but be defensive).
+ */
+function _computeOrderFulfillment(order) {
+  const s = ensureDocsStore();
+  const stop = _findStopOfOrder(order);
+  const runId = stop?.RunId;
+  const waves = ensureWavesStore();
+
+  // Restrict to allocations from the wave of this order's run.
+  const waveOfRun = (waves.waves || []).find((w) => w.RunId === Number(runId));
+  const allowedWaveLineIds = waveOfRun
+    ? new Set((waves.waveLines || []).filter((wl) => wl.WaveId === waveOfRun.WaveId).map((wl) => wl.WaveLineId))
+    : null;
+
+  const allocs = (waves.waveAllocations || []).filter((a) =>
+    Number(a.SapDocEntry) === Number(order.SapDocEntry) &&
+    a.CompanyCode === order.CompanyCode &&
+    (!allowedWaveLineIds || allowedWaveLineIds.has(a.WaveLineId))
+  );
+
+  const lines = [];
+  let totalOrdered = 0;
+  let totalPicked = 0;
+  for (const a of allocs) {
+    const wl = (waves.waveLines || []).find((l) => l.WaveLineId === a.WaveLineId);
+    const ordered = Number(a.Quantity || 0);
+    const picked = Number(a.PickedQuantity || 0);
+    totalOrdered += ordered;
+    totalPicked += picked;
+    lines.push({
+      AllocationId: a.AllocationId,
+      WaveLineId: a.WaveLineId,
+      ItemCode: wl?.SapItemCode || null,
+      ItemName: wl?.SapItemName || null,
+      Ordered: ordered,
+      Picked: picked,
+      Missing: Math.max(0, ordered - picked),
+    });
+  }
+
+  return {
+    lines,
+    totalOrdered,
+    totalPicked,
+    isEmpty: totalPicked === 0,
+    isPartial: totalPicked > 0 && totalPicked < totalOrdered,
+  };
+}
+
+/**
  * Generate the SAP documents one order needs, based on its customer's
  * DocPolicy. Returns { deliveryNote, invoice, skipped } on success, or
  * throws an Error with .status=422 if the policy is empty.
@@ -2060,12 +2118,38 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     throw err;
   }
 
-  const result = { deliveryNote: null, invoice: null, skipped: false, idempotent: false };
+  // Phase 2 — shortage gate. Walk this order's allocations and refuse if
+  // nothing was picked (operator can't approve a 0-quantity DN). Partial
+  // picks are allowed but flagged on the DN; the SAP order stays open so the
+  // leftover can be picked on a later run.
+  const fulfillment = _computeOrderFulfillment(order);
+  if (fulfillment.isEmpty) {
+    const err = new Error(
+      'אי אפשר לאשר הזמנה ' + (order.SapDocNum || order.SapDocEntry) +
+      ' — לא נלקטה אף יחידה. לקט לפחות פריט אחד לפני אישור.'
+    );
+    err.status = 422;
+    err.code = 'NOTHING_PICKED';
+    err.cardCode = order.SapCardCode;
+    err.cardName = order.SapCardName;
+    throw err;
+  }
+
+  const result = {
+    deliveryNote: null, invoice: null, skipped: false, idempotent: false,
+    isPartial: fulfillment.isPartial,
+    totalOrdered: fulfillment.totalOrdered,
+    totalPicked: fulfillment.totalPicked,
+  };
 
   // Create a single-order DN scoped to THIS order (not all orders at the stop).
   // We piggyback on the existing DN shape so downstream code (PDFs, /api/delivery-notes)
-  // keeps working unchanged.
+  // keeps working unchanged. Phase 2 adds IsPartial + per-item Lines/Shortages
+  // so the actual picked quantities (not the ordered quantities) go on the DN.
   if (policy.perOrderDeliveryNote === 'yes' || policy.perOrderInvoice === 'yes') {
+    const pickedLines = fulfillment.lines.filter((l) => l.Picked > 0);
+    const shortages = fulfillment.lines.filter((l) => l.Missing > 0);
+
     const dn = {
       DeliveryNoteId: s.nextDeliveryNoteId++,
       DocNumber: `DN-${stop.StopId}-${order.CompanyCode}-${String(s.nextDeliveryNoteId).padStart(4, '0')}`,
@@ -2084,7 +2168,12 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
         LinesCount: order.LinesCount,
       }],
       TotalAmount: Number(order.OrderTotal || 0),
-      LineCount: Number(order.LinesCount || 0),
+      LineCount: pickedLines.length,
+      IsPartial: fulfillment.isPartial,
+      TotalOrdered: fulfillment.totalOrdered,
+      TotalPicked: fulfillment.totalPicked,
+      Lines: pickedLines,
+      Shortages: shortages,
       Status: 'PENDING_EXPORT',
       SapDeliveryDocEntry: null,
       SapDeliveryDocNum: null,
@@ -2103,6 +2192,7 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     };
     s.deliveryNotes.push(dn);
     order.DeliveryNoteId = dn.DeliveryNoteId;
+    if (fulfillment.isPartial) order.PartialFulfillment = true;
     result.deliveryNote = dn;
 
     // perOrderInvoice='yes' → also emit a tax invoice from this DN.
