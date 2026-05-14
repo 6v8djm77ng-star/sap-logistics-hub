@@ -23,6 +23,13 @@ export default function PlannerPage() {
   const [runDate, setRunDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [planResult, setPlanResult] = useState(null); // last auto-plan response
   const [showExcluded, setShowExcluded] = useState(true);
+  // Day filter: defaults to today's Hebrew weekday. The planner can flip to
+  // a different weekday or to 'all' (which shows every stop regardless of
+  // scheduledDays). Friday/Saturday are excluded — the warehouse doesn't
+  // deliver then.
+  const today = new Date(runDate + 'T00:00:00').getDay();
+  const defaultDayKey = today >= 0 && today <= 4 ? HEBREW_WEEKDAYS[today] : 'all';
+  const [selectedDay, setSelectedDay] = useState(defaultDayKey);
   const queryClient = useQueryClient();
 
   const { data, isLoading, refetch } = useQuery({
@@ -39,8 +46,13 @@ export default function PlannerPage() {
 
   // Group the flat list by suggestedZone for the section layout. Unknown
   // zone falls into a synthetic '(ללא אזור)' bucket at the bottom.
+  // Day-filter is applied first — anything outside the selected weekday
+  // is hidden entirely (no row, no zone-section header).
   const groupedByZone = useMemo(() => {
-    const groups = data?.groups || [];
+    const all = data?.groups || [];
+    const groups = selectedDay === 'all'
+      ? all
+      : all.filter((g) => (g.scheduledDays || []).includes(selectedDay));
     const buckets = new Map();
     for (const g of groups) {
       const z = g.suggestedZone || '__NONE__';
@@ -62,7 +74,7 @@ export default function PlannerPage() {
         if (b.code === '__NONE__') return -1;
         return (zoneOrder.get(a.code) ?? 99) - (zoneOrder.get(b.code) ?? 99);
       });
-  }, [data, zones]);
+  }, [data, zones, selectedDay]);
 
   const upcoming = upcomingWeekdays(runDate);
   const todayLabel = upcoming[0];
@@ -190,20 +202,44 @@ export default function PlannerPage() {
         />
       )}
 
-      {/* Day legend */}
+      {/* Day filter — Sunday → Thursday, plus 'all'. Default = today's
+          weekday. Friday/Saturday are intentionally absent (no deliveries). */}
       {data?.groups?.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
           <CalendarDays size={16} className="text-gray-500" />
-          <span className="text-gray-600">הדגשה לפי טבלת הפצה:</span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-green-100 text-green-900 border border-green-300 font-semibold">
-            <span className="w-2 h-2 rounded-full bg-green-500" /> היום ({todayLabel})
-          </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-amber-50 text-amber-900 border border-amber-300">
-            <span className="w-2 h-2 rounded-full bg-amber-500" /> מחר ({upcoming[1]})
-          </span>
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-blue-50 text-blue-900 border border-blue-300">
-            <span className="w-2 h-2 rounded-full bg-blue-500" /> מחרתיים ({upcoming[2]})
-          </span>
+          <span className="text-gray-600">סינון לפי טבלת הפצה:</span>
+          {HEBREW_WEEKDAYS.slice(0, 5).map((day) => {
+            const active = selectedDay === day;
+            const isToday = day === todayLabel;
+            return (
+              <button
+                key={day}
+                type="button"
+                onClick={() => setSelectedDay(day)}
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
+                  active
+                    ? (isToday
+                        ? 'bg-green-100 text-green-900 border-green-400 font-semibold'
+                        : 'bg-brand-100 text-brand-900 border-brand-400 font-semibold')
+                    : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+                }`}
+              >
+                {isToday && <span className="w-2 h-2 rounded-full bg-green-500" />}
+                {day}{isToday ? ' (היום)' : ''}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={() => setSelectedDay('all')}
+            className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
+              selectedDay === 'all'
+                ? 'bg-gray-800 text-white border-gray-800 font-semibold'
+                : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+            }`}
+          >
+            כל הימים
+          </button>
         </div>
       )}
 
@@ -218,26 +254,40 @@ export default function PlannerPage() {
         <div className="space-y-4">
           {groupedByZone.map((zg) => {
             const todayCount = zg.list.filter((g) => (g.scheduledDays || []).includes(todayLabel)).length;
+            // When filtering by a single day, row highlights are noise (all
+            // rows are by definition that day). Only colour rows in 'all'.
+            const effectiveUpcoming = selectedDay === 'all' ? upcoming : ['', '', ''];
             return (
               <ZoneSection
                 key={zg.code}
                 zoneMeta={zg.meta}
                 groups={zg.list}
-                upcoming={upcoming}
-                todayCount={todayCount}
+                upcoming={effectiveUpcoming}
+                todayCount={selectedDay === 'all' ? todayCount : 0}
               />
             );
           })}
 
-          {/* Grand total */}
-          <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 text-sm text-gray-700 flex flex-wrap gap-6">
-            <span><strong>{data.groups.length}</strong> יעדים</span>
-            <span><strong>{data.groups.reduce((s, g) => s + g.orderCount, 0)}</strong> הזמנות</span>
-            <span><strong>{data.groups.reduce((s, g) => s + g.totalLines, 0)}</strong> שורות</span>
-            <span>
-              <strong>{data.groups.filter((g) => (g.scheduledDays || []).includes(todayLabel)).length}</strong> מתוזמנים להיום ({todayLabel})
-            </span>
-          </div>
+          {/* Grand total — counts respect the active day filter */}
+          {(() => {
+            const shownStops = groupedByZone.reduce((s, zg) => s + zg.list.length, 0);
+            const shownOrders = groupedByZone.reduce((s, zg) =>
+              s + zg.list.reduce((a, g) => a + g.orderCount, 0), 0);
+            const shownLines = groupedByZone.reduce((s, zg) =>
+              s + zg.list.reduce((a, g) => a + g.totalLines, 0), 0);
+            return (
+              <div className="bg-gray-50 border border-gray-200 rounded-lg px-4 py-3 text-sm text-gray-700 flex flex-wrap gap-6">
+                <span><strong>{shownStops}</strong> יעדים</span>
+                <span><strong>{shownOrders}</strong> הזמנות</span>
+                <span><strong>{shownLines}</strong> שורות</span>
+                <span className="text-gray-500">
+                  {selectedDay === 'all'
+                    ? `(כל הימים, ${data.groups.length} יעדים סה"כ)`
+                    : `(${selectedDay}${selectedDay === todayLabel ? ' · היום' : ''})`}
+                </span>
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
@@ -463,23 +513,54 @@ function ExcludedOrdersPanel({ orders, summary, open, onToggle, onForceInclude, 
   );
 }
 
+// Compact list of SKU rows shown under EVERY reason (low_total, too_few_lines,
+// missing_stock). Lets the planner see "what's in this order" without
+// opening it. Capped at 5 lines + "ועוד N פריטים…" link.
+function ItemsPreview({ items, qtyLabel, hilite }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <ul className="text-[10px] text-gray-700 mr-5 mt-0.5 list-disc">
+      {items.slice(0, 5).map((it, idx) => (
+        <li key={idx}>
+          <span className="font-mono text-gray-500">{it.itemCode}</span>
+          {it.itemName ? <span className="mr-1">{it.itemName}</span> : null}
+          {qtyLabel && qtyLabel(it) ? (
+            <span className={(hilite ? 'text-red-600 font-semibold' : 'text-gray-500') + ' mr-1'}>
+              {qtyLabel(it)}
+            </span>
+          ) : null}
+        </li>
+      ))}
+      {items.length > 5 && (
+        <li className="text-gray-400">ועוד {items.length - 5} פריטים…</li>
+      )}
+    </ul>
+  );
+}
+
 function ReasonsList({ reasons }) {
   return (
     <div className="space-y-1">
       {reasons.map((r, i) => {
         if (r.type === 'low_total') {
           return (
-            <div key={i} className="flex items-center gap-1 text-amber-700">
-              <Coins size={12} />
-              <span>סך לקוח {formatNis(r.total)} &lt; {formatNis(r.threshold)}</span>
+            <div key={i} className="text-amber-700">
+              <div className="flex items-center gap-1">
+                <Coins size={12} />
+                <span>סך לקוח {formatNis(r.total)} &lt; {formatNis(r.threshold)}</span>
+              </div>
+              <ItemsPreview items={r.items} qtyLabel={(it) => it.quantity ? `×${it.quantity}` : null} />
             </div>
           );
         }
         if (r.type === 'too_few_lines') {
           return (
-            <div key={i} className="flex items-center gap-1 text-orange-700">
-              <Package size={12} />
-              <span>{r.linesCount} פריטים בהזמנה (מינימום {r.threshold})</span>
+            <div key={i} className="text-orange-700">
+              <div className="flex items-center gap-1">
+                <Package size={12} />
+                <span>{r.linesCount} פריטים בהזמנה (מינימום {r.threshold})</span>
+              </div>
+              <ItemsPreview items={r.items} qtyLabel={(it) => it.quantity ? `×${it.quantity}` : null} />
             </div>
           );
         }
@@ -490,20 +571,11 @@ function ReasonsList({ reasons }) {
                 <PackageX size={12} />
                 <span>חוסר ב-{r.items.length} פריט{r.items.length > 1 ? 'ים' : ''}</span>
               </div>
-              <ul className="text-[10px] text-gray-700 mr-5 mt-0.5 list-disc">
-                {r.items.slice(0, 5).map((it, idx) => (
-                  <li key={idx}>
-                    <span className="font-mono text-gray-500">{it.itemCode}</span>
-                    {it.itemName ? <span className="mr-1">{it.itemName}</span> : null}
-                    <span className="text-red-600 font-semibold mr-1">
-                      (חסר {(it.needed - it.available).toFixed(0)})
-                    </span>
-                  </li>
-                ))}
-                {r.items.length > 5 && (
-                  <li className="text-gray-400">ועוד {r.items.length - 5} פריטים…</li>
-                )}
-              </ul>
+              <ItemsPreview
+                items={r.items}
+                qtyLabel={(it) => `(חסר ${(it.needed - it.available).toFixed(0)})`}
+                hilite
+              />
             </div>
           );
         }

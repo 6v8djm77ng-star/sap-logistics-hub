@@ -1943,19 +1943,22 @@ async function computePlanExclusions(opts = {}) {
   }
 
   // (b) Per-order lines + stock availability.
+  // Always load order lines (regardless of requireStock) — the planner UI
+  // wants to see WHICH items are in any excluded order, not just the ones
+  // failing stock. Stock map is still loaded only when requireStock=true.
   let stockMap = new Map();
   let linesByOrder = new Map();
+  const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
+  const allLines = await sapBridge.getBulkOrderLines(refs).catch((e) => {
+    console.warn('[plan-exclusions] getBulkOrderLines failed:', e.message);
+    return [];
+  });
+  for (const ln of allLines) {
+    const k = `${ln.CompanyCode}:${ln.DocEntry}`;
+    if (!linesByOrder.has(k)) linesByOrder.set(k, []);
+    linesByOrder.get(k).push(ln);
+  }
   if (requireStock) {
-    const refs = allOrders.map((o) => ({ companyCode: o.CompanyCode, docEntry: o.DocEntry }));
-    const allLines = await sapBridge.getBulkOrderLines(refs).catch((e) => {
-      console.warn('[plan-exclusions] getBulkOrderLines failed:', e.message);
-      return [];
-    });
-    for (const ln of allLines) {
-      const k = `${ln.CompanyCode}:${ln.DocEntry}`;
-      if (!linesByOrder.has(k)) linesByOrder.set(k, []);
-      linesByOrder.get(k).push(ln);
-    }
     const PICKING_WAREHOUSES = (process.env.PICKING_WAREHOUSES || '01,02,03,10,20')
       .split(',').map((s) => s.trim()).filter(Boolean);
     for (const code of ['A', 'B']) {
@@ -1973,6 +1976,16 @@ async function computePlanExclusions(opts = {}) {
     }
   }
 
+  // Helper: compact items[] for any reason (one row per SKU in the order).
+  function itemsOf(o) {
+    const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
+    return lns.map((ln) => ({
+      itemCode: ln.ItemCode,
+      itemName: ln.ItemName,
+      quantity: Number(ln.OpenQty || ln.Quantity || 0),
+    }));
+  }
+
   // (c) Apply the 3 filters.
   const plannableOrders = [];
   const excludedOrders = [];
@@ -1980,11 +1993,17 @@ async function computePlanExclusions(opts = {}) {
     const reasons = [];
     const custTotal = customerTotals.get(norm(o.CardName)) || 0;
     if (custTotal < MIN_CUSTOMER_TOTAL) {
-      reasons.push({ type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL });
+      reasons.push({
+        type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL,
+        items: itemsOf(o),
+      });
     }
     const ordLinesCount = Number(o.LinesCount || 0);
     if (MIN_LINES_PER_ORDER > 0 && ordLinesCount > 0 && ordLinesCount < MIN_LINES_PER_ORDER) {
-      reasons.push({ type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER });
+      reasons.push({
+        type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER,
+        items: itemsOf(o),
+      });
     }
     if (requireStock) {
       const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
