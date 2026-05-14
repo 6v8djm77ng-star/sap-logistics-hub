@@ -244,6 +244,31 @@ export function clearDriverPin(driverId) {
   return true;
 }
 
+// ============================================================================
+// Token revocation — instead of tracking individual JTI per JWT, we track a
+// per-subject "logged-out-at" timestamp. Any token whose `iat` is older than
+// that timestamp is rejected. Effect: one /api/auth/logout call invalidates
+// every outstanding token for that subject, no list bookkeeping needed.
+//
+// "subject" follows the JWT sub claim: integer UserId for ADMIN/users,
+// `picker-N` for pickers, `driver-N` for drivers.
+// ============================================================================
+export function logoutSub(sub) {
+  const s = load();
+  if (!s.tokenRevocations) s.tokenRevocations = {};
+  s.tokenRevocations[String(sub)] = Math.floor(Date.now() / 1000);
+  save();
+  return true;
+}
+
+export function isSubRevoked(sub, tokenIat) {
+  if (sub == null || tokenIat == null) return false;
+  const s = load();
+  const cutoff = s.tokenRevocations?.[String(sub)];
+  if (!cutoff) return false;
+  return Number(tokenIat) < Number(cutoff);
+}
+
 // Same shape for drivers (the demoServer also has a passwordless code-only
 // driver-login that issues a long-lived token).
 export function setDriverPin(driverId, pin) {

@@ -120,16 +120,30 @@ app.use((req, res, next) => {
 // via middleware/auth.js).
 // Rollback: git revert <wave-a-sha>; pm2 restart sap-logistics
 // =====================================================================
+// Verify the JWT AND reject if the subject has logged out after the token
+// was issued (per-sub revocation, not per-jti). Returns the payload or
+// throws — callers should map the error to 401.
+function verifyToken(token) {
+  const payload = jwt.verify(token, JWT_SECRET);
+  if (store.isSubRevoked(payload.sub, payload.iat)) {
+    const err = new Error('Session revoked');
+    err.code = 'TOKEN_REVOKED';
+    throw err;
+  }
+  return payload;
+}
+
 function requireAuthBasic(req, res, next) {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Authentication required' });
   }
   try {
-    req.user = jwt.verify(auth.slice(7), JWT_SECRET);
+    req.user = verifyToken(auth.slice(7));
     return next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  } catch (err) {
+    const code = err.code === 'TOKEN_REVOKED' ? 'TOKEN_REVOKED' : undefined;
+    return res.status(401).json({ error: err.message || 'Invalid or expired token', code });
   }
 }
 
@@ -139,14 +153,15 @@ function adminOnly(req, res, next) {
     return res.status(401).json({ error: 'Authentication required' });
   }
   try {
-    const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    const payload = verifyToken(auth.slice(7));
     if (payload.role !== 'ADMIN') {
       return res.status(403).json({ error: 'Admin role required' });
     }
     req.user = payload;
     return next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
+  } catch (err) {
+    const code = err.code === 'TOKEN_REVOKED' ? 'TOKEN_REVOKED' : undefined;
+    return res.status(401).json({ error: err.message || 'Invalid or expired token', code });
   }
 }
 
@@ -414,27 +429,64 @@ app.get('/api/auth/me', (req, res) => {
   const auth = req.headers.authorization;
   if (auth?.startsWith('Bearer ')) {
     try {
-      const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+      const payload = verifyToken(auth.slice(7));
       return res.json({ user: payload });
     } catch {}
   }
   res.status(401).json({ error: 'Not authenticated' });
 });
 
-app.post('/api/users/me/change-password', async (req, res) => {
+// Invalidates all outstanding tokens for the caller's subject. Subsequent
+// requests with any token issued before this moment return 401 TOKEN_REVOKED.
+// Pickers / drivers also pass through here.
+app.post('/api/auth/logout', (req, res) => {
   const auth = req.headers.authorization;
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = jwt.verify(auth.slice(7), JWT_SECRET);
+    store.logoutSub(payload.sub);
+    res.json({ ok: true });
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// Reject weak new passwords. The old rule was length>=4 which let a user
+// rotate to "abcd". Current rules: at least 10 chars, contains a letter
+// AND a digit AND a non-alphanumeric. Returns the specific failure so
+// the UI can show a meaningful hint.
+function validatePasswordStrength(pwd) {
+  if (typeof pwd !== 'string' || pwd.length < 10) {
+    return { ok: false, error: 'סיסמה חדשה חייבת להכיל לפחות 10 תווים', code: 'PWD_TOO_SHORT' };
+  }
+  if (!/[A-Za-z֐-׿]/.test(pwd)) {
+    return { ok: false, error: 'סיסמה חייבת להכיל לפחות אות אחת', code: 'PWD_NO_LETTER' };
+  }
+  if (!/\d/.test(pwd)) {
+    return { ok: false, error: 'סיסמה חייבת להכיל לפחות ספרה אחת', code: 'PWD_NO_DIGIT' };
+  }
+  if (!/[^A-Za-z0-9֐-׿]/.test(pwd)) {
+    return { ok: false, error: 'סיסמה חייבת להכיל לפחות תו מיוחד אחד (!@#$ וכו׳)', code: 'PWD_NO_SPECIAL' };
+  }
+  return { ok: true };
+}
+
+app.post('/api/users/me/change-password', async (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  try {
+    const payload = verifyToken(auth.slice(7));
     const { oldPassword, newPassword } = req.body;
-    if (!newPassword || newPassword.length < 4) {
-      return res.status(400).json({ error: 'סיסמה חדשה קצרה מדי' });
-    }
+    const strength = validatePasswordStrength(newPassword);
+    if (!strength.ok) return res.status(400).json({ error: strength.error, code: strength.code });
     const user = store.getUserById(payload.sub);
     if (!user) return res.status(404).json({ error: 'משתמש לא נמצא' });
     const ok = await store.verifyUserPassword(user.Username, oldPassword);
     if (!ok) return res.status(401).json({ error: 'סיסמה קיימת שגויה' });
     await store.setUserPassword(user.UserId, newPassword);
+    // Revoke all earlier tokens for this user so the password rotation
+    // actually kicks unauthorized sessions out.
+    store.logoutSub(user.UserId);
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1386,11 +1438,13 @@ app.patch('/api/users/:id', adminOnly, async (req, res) => {
 
 app.post('/api/users/:id/reset-password', adminOnly, async (req, res) => {
   const { password } = req.body;
-  if (!password || password.length < 4) {
-    return res.status(400).json({ error: 'סיסמה קצרה מדי (מינימום 4 תווים)' });
-  }
+  const strength = validatePasswordStrength(password);
+  if (!strength.ok) return res.status(400).json({ error: strength.error, code: strength.code });
   const ok = await store.setUserPassword(req.params.id, password);
   if (!ok) return res.status(404).json({ error: 'User not found' });
+  // Force logout of any active sessions for the reset user so the rotation
+  // is real, not cosmetic.
+  store.logoutSub(Number(req.params.id));
   res.json({ ok: true });
 });
 
