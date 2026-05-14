@@ -579,6 +579,17 @@ function ReasonsList({ reasons }) {
             </div>
           );
         }
+        if (r.type === 'no_open_lines') {
+          // Order has no rows with OpenQty>0 in SAP — already shipped or
+          // closed. The planner should usually skip; manual override via
+          // force-include is still possible.
+          return (
+            <div key={i} className="flex items-center gap-1 text-gray-600">
+              <PackageX size={12} />
+              <span>אין שורות פתוחות (כל הפריטים נסגרו ב-SAP)</span>
+            </div>
+          );
+        }
         return null;
       })}
     </div>

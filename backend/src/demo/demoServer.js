@@ -1913,13 +1913,21 @@ app.delete('/api/run-orders/:runOrderId', (req, res) => {
 async function computePlanExclusions(opts = {}) {
   const runDate = opts.runDate || new Date().toISOString().slice(0, 10);
 
+  // Same-day runs — used to decide whether to add stops to an existing run
+  // for a given zone (later in auto-plan, NOT for the alreadyAssigned check).
   const existingRuns = store.getRuns().filter((r) => r.RunDate === runDate);
-  const existingRunIds = existingRuns.map((r) => r.RunId);
-  const existingStops = (store.load().stops || []).filter((s) => existingRunIds.includes(s.RunId));
-  const existingStopIds = existingStops.map((s) => s.StopId);
+
+  // alreadyAssigned spans ALL runs (cross-day). An order that's been in any
+  // earlier run is presumed dispatched/picked; re-planning it for today
+  // would create a "ghost" run-order whose SAP lines may already be closed
+  // (OpenQty=0), causing buildWave to fail with "no open lines". The
+  // operator can still pull a specific order back via /api/runs/force-include.
+  const allRunOrders = store.load().runOrders || [];
+  const allStops = store.load().stops || [];
+  const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
   const alreadyAssigned = new Set(
-    (store.load().runOrders || [])
-      .filter((o) => existingStopIds.includes(o.StopId))
+    allRunOrders
+      .filter((o) => stopIdToRunId.has(o.StopId))
       .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
   );
 
@@ -2009,6 +2017,11 @@ async function computePlanExclusions(opts = {}) {
   // (c) Apply the 3 filters.
   const plannableOrders = [];
   const excludedOrders = [];
+  // Did SAP return any lines at all? If yes, "no rows for THIS order" is
+  // meaningful (the order is closed). If allLines is empty, the SAP call
+  // itself probably failed and we shouldn't blame each order for it.
+  const sapLinesAvailable = allLines.length > 0;
+
   for (const o of allOrders) {
     const reasons = [];
     // Read the per-customer total under the same key the loop in (a) wrote.
@@ -2025,6 +2038,17 @@ async function computePlanExclusions(opts = {}) {
         type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER,
         items: itemsOf(o),
       });
+    }
+    // no_open_lines — RDR1 has zero open rows for this DocEntry. Either the
+    // order shipped from a previous run-day (OpenQty already drawn down by
+    // a real-life DN in SAP) or the order is closed. Either way, this run
+    // order would be dead weight: buildWave's getBulkOrderLines call
+    // returns empty and the picker UI shows "no open lines found".
+    if (sapLinesAvailable) {
+      const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
+      if (lns.length === 0) {
+        reasons.push({ type: 'no_open_lines', linesCount: ordLinesCount, items: [] });
+      }
     }
     if (requireStock) {
       const lns = linesByOrder.get(`${o.CompanyCode}:${o.DocEntry}`) || [];
@@ -2094,6 +2118,7 @@ app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
         excludedLowTotal:     e.filter((o) => o.reasons.some((r) => r.type === 'low_total')).length,
         excludedTooFewLines:  e.filter((o) => o.reasons.some((r) => r.type === 'too_few_lines')).length,
         excludedMissingStock: e.filter((o) => o.reasons.some((r) => r.type === 'missing_stock')).length,
+        excludedNoOpenLines:  e.filter((o) => o.reasons.some((r) => r.type === 'no_open_lines')).length,
       },
       filters: result.filters,
       preview: true,
