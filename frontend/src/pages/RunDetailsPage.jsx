@@ -46,14 +46,14 @@ export default function RunDetailsPage() {
     queryFn: () => runsApi.get(id),
   });
 
-  // Road-distance route optimization (Google Maps Distance Matrix + 2-opt).
-  // Backend requires GOOGLE_MAPS_API_KEY — returns 422 otherwise, and the
+  // Road-distance route optimization (self-hosted OSRM + 2-opt).
+  // Backend requires OSRM_BASE_URL — returns 422 otherwise, and the
   // server-side error string is surfaced verbatim via the onError toast.
   const smartOptimizeMutation = useMutation({
     mutationFn: () => api.post(`/runs/${id}/optimize`, { apply: true }).then((r) => r.data),
     onSuccess: (result) => {
       toast.success(
-        `אופטימיזציית כביש הושלמה - ${result.totalKm} ק"מ (Google Maps)`,
+        `אופטימיזציית כביש הושלמה - ${result.totalKm} ק"מ (OSRM)`,
         { duration: 4000 }
       );
       queryClient.invalidateQueries({ queryKey: ['run', id] });
@@ -251,7 +251,7 @@ export default function RunDetailsPage() {
             onClick={() => smartOptimizeMutation.mutate()}
             disabled={smartOptimizeMutation.isPending}
             className="inline-flex items-center gap-2 px-3 py-2 bg-purple-600 text-white rounded-lg text-sm hover:bg-purple-700 disabled:opacity-50"
-            title="אופטימיזציה לפי מרחק כביש (Google Maps Distance Matrix). דורש GOOGLE_MAPS_API_KEY ב-backend/.env"
+            title="אופטימיזציה לפי מרחק כביש (OSRM מקומי). דורש OSRM_BASE_URL ב-backend/.env"
           >
             <Sparkles size={16} /> {smartOptimizeMutation.isPending ? 'מחשב...' : 'אופטימיזציית כביש'}
           </button>

@@ -1030,23 +1030,24 @@ app.get('/api/runs/:id/loading-plan', async (req, res) => {
 });
 
 // Road-distance route optimization - reorders stops in a run for minimum
-// driving distance using Google Maps Distance Matrix.
+// driving distance using a self-hosted OSRM instance.
 //
-// Hard requirement: GOOGLE_MAPS_API_KEY must be set. Without it the endpoint
-// returns 422 and does NOT touch StopOrder — silently falling back to
-// haversine would mislead the operator into trusting bad geometry.
+// Hard requirement: OSRM_BASE_URL must point to a running OSRM (see
+// infra/osrm/). Without it the endpoint returns 422 and does NOT touch
+// StopOrder — silently falling back to haversine would mislead the
+// operator into trusting bad geometry.
 app.post('/api/runs/:id/optimize', async (req, res) => {
   try {
     // Gate before any work — fail fast and visibly.
-    if (!process.env.GOOGLE_MAPS_API_KEY) {
+    if (!process.env.OSRM_BASE_URL) {
       return res.status(422).json({
-        error: 'אופטימיזציית כביש דורשת GOOGLE_MAPS_API_KEY',
-        code: 'MISSING_GOOGLE_MAPS_KEY',
-        hint: 'הגדר GOOGLE_MAPS_API_KEY ב-backend/.env (ראה .env.example) והפעל מחדש את השרת.',
+        error: 'אופטימיזציית כביש דורשת OSRM_BASE_URL',
+        code: 'MISSING_OSRM_URL',
+        hint: 'הגדר OSRM_BASE_URL ב-backend/.env (ראה .env.example) והפעל מחדש את השרת. ראה גם infra/osrm/README.md להפעלת ה-container המקומי.',
       });
     }
 
-    const { optimizeRoute, GoogleMapsConfigError, GoogleMapsApiError } =
+    const { optimizeRoute, OsrmConfigError, OsrmApiError } =
       await import('./routeOptimizer.js');
     const { resolveStopLatLng } = await import('./cityCoords.js');
     const runId = Number(req.params.id);
@@ -1087,20 +1088,20 @@ app.post('/api/runs/:id/optimize', async (req, res) => {
           : undefined
       );
     } catch (err) {
-      // Distinguish config error (key missing — shouldn't happen here since
+      // Distinguish config error (URL missing — shouldn't happen here since
       // we gated above, but kept defensively) from upstream API failure.
-      if (err instanceof GoogleMapsConfigError) {
+      if (err instanceof OsrmConfigError) {
         return res.status(422).json({
           error: err.message,
-          code: 'MISSING_GOOGLE_MAPS_KEY',
+          code: 'MISSING_OSRM_URL',
         });
       }
-      if (err instanceof GoogleMapsApiError) {
-        // Log only the sanitized message — never the URL (it carries the key).
-        console.error('[optimize] Google Maps failed:', err.message);
+      if (err instanceof OsrmApiError) {
+        // OSRM runs locally — no secrets in the URL, safe to log fully.
+        console.error('[optimize] OSRM failed:', err.message);
         return res.status(502).json({
-          error: 'Google Maps Distance Matrix נכשל - לא בוצע שינוי בסדר העצירות',
-          code: 'GOOGLE_MAPS_API_FAILED',
+          error: 'OSRM נכשל - לא בוצע שינוי בסדר העצירות',
+          code: 'OSRM_API_FAILED',
           detail: err.message,
           upstreamStatus: err.upstreamStatus || null,
         });
@@ -1125,7 +1126,7 @@ app.post('/api/runs/:id/optimize', async (req, res) => {
       runId,
       optimizedOrder: result.order.map((s) => s.id),
       totalKm: result.totalKm,
-      source: result.source, // always 'google' now
+      source: result.source, // always 'osrm' now
       coordSource: result.coordSource,
       applied: !!req.body?.apply,
     });

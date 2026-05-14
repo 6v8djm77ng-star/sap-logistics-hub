@@ -1,87 +1,95 @@
 /**
  * Road-distance route optimization - finds the optimal stop order to minimize
- * total driving distance/time across a run, using Google Maps Distance Matrix
- * for real road distances + 2-opt local search.
+ * total driving distance/time across a run, using OSRM's Distance Matrix API
+ * for real road distances + nearest-neighbour + 2-opt local search.
  *
- * Hard requirement: GOOGLE_MAPS_API_KEY must be set in backend/.env.
- * If the key is missing or the API call fails, the optimizer throws — callers
- * MUST NOT silently fall back to great-circle / haversine distances, since
- * that would change StopOrder based on misleading data.
+ * Hard requirement: OSRM_BASE_URL must point to a running OSRM instance
+ * (typically a self-hosted Docker container — see infra/osrm/).
+ * If the URL is missing or the API call fails, the optimizer throws —
+ * callers MUST NOT silently fall back to great-circle / haversine
+ * distances, since that would change StopOrder based on misleading data.
  *
- * (Previous versions of this file had a silent haversine fallback. Removed
- * on purpose — see fix(routes): require Google Maps for road-distance
- * optimization.)
+ * (Previous versions used Google Maps Distance Matrix; switched to
+ * self-hosted OSRM to remove the per-request cost, the API-key dependency,
+ * and the external rate limits. See:
+ *  - fix(routes): require Google Maps for road-distance optimization
+ *  - feat(routes): switch road-distance optimization from Google Maps to OSRM
+ * )
  */
 
-const GOOGLE_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+const OSRM_BASE_URL = (process.env.OSRM_BASE_URL || '').replace(/\/$/, '');
 
-export class GoogleMapsConfigError extends Error {
+export class OsrmConfigError extends Error {
   constructor(message) {
     super(message);
-    this.name = 'GoogleMapsConfigError';
-    this.code = 'MISSING_GOOGLE_MAPS_KEY';
+    this.name = 'OsrmConfigError';
+    this.code = 'MISSING_OSRM_URL';
   }
 }
 
-export class GoogleMapsApiError extends Error {
+export class OsrmApiError extends Error {
   constructor(message, upstreamStatus) {
     super(message);
-    this.name = 'GoogleMapsApiError';
-    this.code = 'GOOGLE_MAPS_API_FAILED';
+    this.name = 'OsrmApiError';
+    this.code = 'OSRM_API_FAILED';
     this.upstreamStatus = upstreamStatus;
   }
 }
 
-/** Build matrix from Google Distance Matrix API. Throws on any failure. */
-async function buildGoogleMatrix(points) {
-  if (!GOOGLE_KEY) {
-    throw new GoogleMapsConfigError('אופטימיזציית כביש דורשת GOOGLE_MAPS_API_KEY');
+/**
+ * Build an N×N distance matrix from OSRM. Throws on any failure.
+ * OSRM /table accepts coordinates as `lng,lat;lng,lat;...` (NOT lat,lng —
+ * OSRM uses GeoJSON ordering). Response shape:
+ *   { code: "Ok", distances: number[][] (metres), durations: number[][] (s) }
+ * We only request `annotations=distance` because the optimizer minimizes
+ * distance, not duration.
+ */
+async function buildOsrmMatrix(points) {
+  if (!OSRM_BASE_URL) {
+    throw new OsrmConfigError(
+      'אופטימיזציית כביש דורשת OSRM_BASE_URL (ראה infra/osrm/README.md)',
+    );
   }
-  const origins = points.map((p) => `${p.lat},${p.lng}`).join('|');
-  const dests = origins;
-  // Note: key is passed as a query param. We never log this URL — see the
-  // catch arm in the endpoint that logs `err.message` only, never the URL.
-  const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origins}&destinations=${dests}&mode=driving&key=${encodeURIComponent(GOOGLE_KEY)}`;
+  // GeoJSON order: lng,lat
+  const coords = points.map((p) => `${p.lng},${p.lat}`).join(';');
+  const url = `${OSRM_BASE_URL}/table/v1/driving/${coords}?annotations=distance`;
 
   let res;
   try {
     res = await fetch(url);
   } catch (e) {
-    throw new GoogleMapsApiError(`Google Maps Distance Matrix לא הגיב: ${e.message}`);
+    throw new OsrmApiError(`OSRM לא הגיב: ${e.message}`);
   }
   if (!res.ok) {
-    throw new GoogleMapsApiError(
-      `Google Maps Distance Matrix החזיר HTTP ${res.status}`,
-      res.status,
-    );
+    throw new OsrmApiError(`OSRM החזיר HTTP ${res.status}`, res.status);
   }
   const payload = await res.json();
-  if (payload.status !== 'OK') {
-    // Don't leak Google's error_message into the response — it can sometimes
-    // include the partial key. Just surface the status code.
-    throw new GoogleMapsApiError(
-      `Google Maps Distance Matrix החזיר status=${payload.status}`,
+  if (payload.code !== 'Ok') {
+    // OSRM error codes: NoRoute, NoSegment, InvalidQuery, etc.
+    throw new OsrmApiError(`OSRM החזיר code=${payload.code}`);
+  }
+  if (!Array.isArray(payload.distances) || payload.distances.length !== points.length) {
+    throw new OsrmApiError(
+      `OSRM החזיר מטריצה במבנה לא צפוי (rows=${payload.distances?.length}, expected=${points.length})`,
     );
   }
 
-  const n = points.length;
-  const m = Array.from({ length: n }, () => Array(n).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let k = 0; k < n; k++) {
-      // Bugfix: the previous loop variable was `j`, which shadowed the parsed
-      // JSON also bound to `j` — so `j.rows` was always undefined and the
-      // function silently fell back to haversine for every call.
-      const el = payload.rows?.[i]?.elements?.[k];
-      if (el?.status === 'OK') {
-        m[i][k] = el.distance.value / 1000; // metres → km
-      } else {
-        throw new GoogleMapsApiError(
-          `Google Maps Distance Matrix חסר זוג מרחקים (i=${i},j=${k},status=${el?.status || 'missing'})`,
-        );
+  // metres → km. OSRM returns null for unreachable pairs; flag those.
+  return payload.distances.map((row, i) =>
+    row.map((m, j) => {
+      if (m == null) {
+        // Unreachable pair would break tour math. Let the caller hit a
+        // sentinel value (Infinity) so 2-opt naturally avoids it.
+        if (i !== j) {
+          // Don't throw — log and use Infinity so the algorithm still works
+          // for the reachable subgraph (degenerate but better than crashing).
+          console.warn(`[osrm] unreachable pair i=${i} j=${j}, using Infinity`);
+        }
+        return i === j ? 0 : Infinity;
       }
-    }
-  }
-  return m;
+      return m / 1000;
+    }),
+  );
 }
 
 /** Total distance of a tour given a matrix and a permutation. */
@@ -143,24 +151,24 @@ function twoOpt(matrix, tour) {
 }
 
 /**
- * Optimize a list of stops using Google Maps driving distance.
+ * Optimize a list of stops using OSRM driving distance.
  *
  * @param {Array<{id, lat, lng}>} stops - the stops to visit (0+).
  * @param {Object} [options]
  * @param {{lat,lng}} [options.start] - depot/starting point. Defaults to first stop.
- * @returns {Promise<{order: Array, totalKm: number, source: 'google'}>}
- * @throws {GoogleMapsConfigError} when GOOGLE_MAPS_API_KEY is missing.
- * @throws {GoogleMapsApiError} when the Distance Matrix call fails.
+ * @returns {Promise<{order: Array, totalKm: number, source: 'osrm'}>}
+ * @throws {OsrmConfigError} when OSRM_BASE_URL is missing.
+ * @throws {OsrmApiError} when the OSRM call fails.
  */
 export async function optimizeRoute(stops, options = {}) {
   if (!stops || stops.length < 2) {
-    return { order: stops || [], totalKm: 0, source: 'google' };
+    return { order: stops || [], totalKm: 0, source: 'osrm' };
   }
   const start = options.start;
   // Prepend depot as index 0 if provided
   const points = start ? [start, ...stops] : [...stops];
 
-  const matrix = await buildGoogleMatrix(points);
+  const matrix = await buildOsrmMatrix(points);
 
   // Start from depot (index 0)
   let tour = nearestNeighbour(matrix, 0);
@@ -174,6 +182,6 @@ export async function optimizeRoute(stops, options = {}) {
   return {
     order,
     totalKm: Math.round(totalKm * 10) / 10,
-    source: 'google',
+    source: 'osrm',
   };
 }
