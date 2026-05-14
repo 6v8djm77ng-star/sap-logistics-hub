@@ -1,0 +1,12 @@
+{
+  "window_days": 7,
+  "as_of": "2026-05-10",
+  "total_failures": 12,
+  "by_reason": [
+    { "reason_code": "CUSTOMER_NOT_AVAILABLE", "count": 5, "pct": 41.7 },
+    { "reason_code": "ADDRESS_NOT_FOUND",       "count": 3, "pct": 25.0 },
+    { "reason_code": "VEHICLE_BREAKDOWN",       "count": 2, "pct": 16.7 },
+    { "reason_code": "WRONG_ITEMS_LOADED",      "count": 1, "pct":  8.3 },
+    { "reason_code": "OTHER",                   "count": 1, "pct":  8.3 }
+  ]
+}

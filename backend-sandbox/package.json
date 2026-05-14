@@ -1,0 +1,21 @@
+{
+  "name": "sap-logistics-sandbox",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Isolated AI sandbox for sap-logistics — read-only, localhost-only, never production.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

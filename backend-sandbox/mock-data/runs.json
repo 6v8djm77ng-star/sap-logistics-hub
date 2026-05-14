@@ -1,0 +1,20 @@
+[
+  {
+    "RunId": 1001,
+    "RunNumber": "RUN-MOCK-2026-05-10-01",
+    "RunDate": "2026-05-10",
+    "DriverId": 1,
+    "DriverName": "Mock Driver A",
+    "Status": "COMPLETED",
+    "Stops": [
+      { "StopId": 5001, "Order": 1, "CustomerName": "Mock Customer Alpha Ltd", "City": "Tel Aviv", "Status": "DELIVERED", "ArrivedAt": "2026-05-10 09:15", "CompletedAt": "2026-05-10 09:42" },
+      { "StopId": 5002, "Order": 2, "CustomerName": "Mock Customer Beta Ltd",  "City": "Ramat Gan", "Status": "DELIVERED", "ArrivedAt": "2026-05-10 10:05", "CompletedAt": "2026-05-10 10:25" },
+      { "StopId": 5003, "Order": 3, "CustomerName": "Mock Customer Gamma Ltd", "City": "Herzliya",  "Status": "FAILED",    "ArrivedAt": "2026-05-10 11:10", "FailureReason": "CUSTOMER_NOT_AVAILABLE", "Notes": "Closed for inventory; reschedule to next week" }
+    ],
+    "Orders": [
+      { "RunOrderId": 7001, "StopId": 5001, "SapDocNum": 88001, "SapDocEntry": 88001, "Status": "DELIVERED" },
+      { "RunOrderId": 7002, "StopId": 5002, "SapDocNum": 88002, "SapDocEntry": 88002, "Status": "DELIVERED" },
+      { "RunOrderId": 7003, "StopId": 5003, "SapDocNum": 88003, "SapDocEntry": 88003, "Status": "FAILED" }
+    ]
+  }
+]

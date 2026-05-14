@@ -1,0 +1,9 @@
+[
+  { "item_code": "MOCK-DAVO-MIXER-PRO",      "item_name": "Mock DAVO Mixer Pro",     "qty_sold": 45, "revenue_ils": 67500, "margin_pct": 38 },
+  { "item_code": "MOCK-DAVO-MIXER-LITE",     "item_name": "Mock DAVO Mixer Lite",    "qty_sold": 38, "revenue_ils": 38000, "margin_pct": 32 },
+  { "item_code": "MOCK-DAVO-VACUUM-V1",      "item_name": "Mock DAVO Vacuum V1",     "qty_sold": 22, "revenue_ils": 33000, "margin_pct": 41 },
+  { "item_code": "MOCK-TINECO-IRON-A1",      "item_name": "Mock Tineco Iron A1",     "qty_sold": 18, "revenue_ils": 21600, "margin_pct": 28 },
+  { "item_code": "MOCK-NOVO-BLENDER-N3",     "item_name": "Mock Novo Blender N3",    "qty_sold": 15, "revenue_ils": 18000, "margin_pct": 35 },
+  { "item_code": "MOCK-DAVO-ATTACH-WHISK",   "item_name": "Mock DAVO Whisk Attach",  "qty_sold": 65, "revenue_ils": 13000, "margin_pct": 52 },
+  { "item_code": "MOCK-DAVO-ATTACH-DOUGH",   "item_name": "Mock DAVO Dough Attach",  "qty_sold": 42, "revenue_ils":  8400, "margin_pct": 49 }
+]

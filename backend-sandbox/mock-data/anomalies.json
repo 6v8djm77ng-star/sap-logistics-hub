@@ -1,0 +1,57 @@
+{
+  "window_days": 7,
+  "as_of": "2026-05-10",
+  "total": 4,
+  "anomalies": [
+    {
+      "id": "MOCK-ANOM-001",
+      "type": "unusual_doc_total",
+      "company": "A",
+      "doc_entry": 99001,
+      "doc_num": 99001,
+      "card_code": "C-MOCK-001",
+      "card_name": "Mock Customer Alpha Ltd",
+      "doc_total_ils": 142000,
+      "median_total_ils": 7800,
+      "ratio": 18.2,
+      "doc_date": "2026-05-08",
+      "note": "Order ~18× customer's median order size"
+    },
+    {
+      "id": "MOCK-ANOM-002",
+      "type": "duplicate_invoice_suspicion",
+      "company": "A",
+      "doc_entry": 99002,
+      "card_code": "C-MOCK-002",
+      "card_name": "Mock Customer Beta Ltd",
+      "doc_total_ils": 6450,
+      "doc_date": "2026-05-09",
+      "note": "Same line items + total appeared on 2026-05-08; potential duplicate"
+    },
+    {
+      "id": "MOCK-ANOM-003",
+      "type": "below_cost_pricing",
+      "company": "B",
+      "doc_entry": 99003,
+      "card_code": "C-MOCK-007",
+      "card_name": "Mock Customer Eta Ltd",
+      "item_code": "MOCK-DAVO-MIXER-PRO",
+      "unit_price_ils": 950,
+      "avg_price_ils": 1500,
+      "discount_pct": 36.7,
+      "doc_date": "2026-05-09",
+      "note": "Discount >35%; outside policy threshold"
+    },
+    {
+      "id": "MOCK-ANOM-004",
+      "type": "stale_pending_order",
+      "company": "A",
+      "doc_entry": 98750,
+      "card_code": "C-MOCK-005",
+      "card_name": "Mock Customer Epsilon Ltd",
+      "doc_date": "2026-04-15",
+      "days_pending": 25,
+      "note": "Order open >25 days without delivery; check picking queue"
+    }
+  ]
+}

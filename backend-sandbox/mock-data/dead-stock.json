@@ -1,0 +1,10 @@
+{
+  "as_of": "2026-05-10",
+  "threshold_days": 90,
+  "total_items_no_sales": 3,
+  "items": [
+    { "item_code": "MOCK-LEGACY-001", "item_name": "Mock Legacy Item One",   "stock_qty": 22, "last_sale_date": "2025-11-12", "days_since": 180 },
+    { "item_code": "MOCK-LEGACY-002", "item_name": "Mock Legacy Item Two",   "stock_qty":  8, "last_sale_date": "2025-12-03", "days_since": 159 },
+    { "item_code": "MOCK-LEGACY-003", "item_name": "Mock Legacy Item Three", "stock_qty": 15, "last_sale_date": "2026-01-04", "days_since": 126 }
+  ]
+}

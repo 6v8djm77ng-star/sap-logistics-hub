@@ -1,0 +1,10 @@
+[
+  { "date": "2026-05-03", "revenue_ils": 142500, "orders_count": 38 },
+  { "date": "2026-05-04", "revenue_ils": 165200, "orders_count": 45 },
+  { "date": "2026-05-05", "revenue_ils": 158900, "orders_count": 41 },
+  { "date": "2026-05-06", "revenue_ils": 172300, "orders_count": 47 },
+  { "date": "2026-05-07", "revenue_ils": 169800, "orders_count": 46 },
+  { "date": "2026-05-08", "revenue_ils": 181400, "orders_count": 49 },
+  { "date": "2026-05-09", "revenue_ils": 154700, "orders_count": 42 },
+  { "date": "2026-05-10", "revenue_ils": 138200, "orders_count": 36 }
+]

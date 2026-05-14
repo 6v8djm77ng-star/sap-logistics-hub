@@ -1,0 +1,12 @@
+[
+  { "card_code": "C-MOCK-001", "card_name": "Mock Customer Alpha Ltd", "revenue_ils": 89500, "orders": 12 },
+  { "card_code": "C-MOCK-002", "card_name": "Mock Customer Beta Ltd",  "revenue_ils": 76200, "orders":  9 },
+  { "card_code": "C-MOCK-003", "card_name": "Mock Customer Gamma Ltd", "revenue_ils": 64800, "orders": 11 },
+  { "card_code": "C-MOCK-004", "card_name": "Mock Customer Delta Ltd", "revenue_ils": 51300, "orders":  7 },
+  { "card_code": "C-MOCK-005", "card_name": "Mock Customer Epsilon Ltd","revenue_ils": 47600, "orders":  8 },
+  { "card_code": "C-MOCK-006", "card_name": "Mock Customer Zeta Ltd",  "revenue_ils": 41200, "orders":  6 },
+  { "card_code": "C-MOCK-007", "card_name": "Mock Customer Eta Ltd",   "revenue_ils": 38900, "orders":  5 },
+  { "card_code": "C-MOCK-008", "card_name": "Mock Customer Theta Ltd", "revenue_ils": 35100, "orders":  6 },
+  { "card_code": "C-MOCK-009", "card_name": "Mock Customer Iota Ltd",  "revenue_ils": 31400, "orders":  4 },
+  { "card_code": "C-MOCK-010", "card_name": "Mock Customer Kappa Ltd", "revenue_ils": 28700, "orders":  5 }
+]
