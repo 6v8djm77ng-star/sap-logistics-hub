@@ -1934,26 +1934,31 @@ async function computePlanExclusions(opts = {}) {
   const MIN_LINES_PER_ORDER = Number(opts.minLinesPerOrder ?? 2);
   const requireStock = opts.requireStock !== false;
 
-  // (a) Customer-total aggregation across companies AND across branches of
-  // the same chain. The planner UI promises "סך הזמנות הלקוח (שתי החברות)"
-  // and the operator considers the chain (e.g. א.ל.מ סחר 2000 בע"מ) as the
-  // customer — not each branch CardCode in isolation.
+  // (a) Customer-total aggregation key — uses CardCode, NOT CardName.
   //
-  // Without this aggregation, a chain with 17 small orders across 17
-  // branches would have each branch separately compared against the 3,000₪
-  // threshold and almost certainly fail, even though the chain combined is
-  // well above the threshold. Earlier behaviour: 21 SOUTH-1 orders for two
-  // chains (א.ל.מ + טרקלין) were silently excluded for this reason.
+  // The planner UI promises "סך הזמנות הלקוח (שתי החברות)". The grouping
+  // must use a stable business identifier (codes), not a free-text name
+  // that can split chains because of quote variants ("בע\"מ" vs "בע״מ"),
+  // spacing, or inconsistent branch suffixes.
   //
-  // store.parentNameOf strips the branch suffix (" - סניף X", "-עפולה",
-  // "בע\"מ - 134", etc.) and returns the chain name. For a non-chain
-  // customer with no branch suffix, parentNameOf returns the name as-is,
-  // so single-location customers behave exactly as before.
+  // Policy:
+  //   - If SAP exposes a parent identifier (ParentCardCode / ChainCode /
+  //     MasterCustomerKey / Father) — use it.
+  //   - Otherwise fall back to CardCode itself. Each CardCode is treated
+  //     as its own customer; branch-level aggregation is NOT done here.
+  //     If two branches of the same chain have different CardCodes, the
+  //     chain is intentionally split — the operator gets a precise read
+  //     (no false-positive aggregation) at the cost of some orders
+  //     remaining below the threshold.
+  //
+  // No CardName parsing is used as a chain key (was tried earlier and
+  // reverted — name parsing is too fragile).
   const customerTotals = new Map();
   const norm = (s) => String(s || '').trim().toLowerCase();
-  const chainKey = (cardName) => norm(store.parentNameOf(cardName) || cardName);
+  const customerKey = (o) =>
+    String(o.ParentCardCode || o.ChainCode || o.MasterCustomerKey || o.Father || o.CardCode || '').trim();
   for (const o of allOrders) {
-    const k = chainKey(o.CardName);
+    const k = customerKey(o);
     customerTotals.set(k, (customerTotals.get(k) || 0) + Number(o.DocTotal || 0));
   }
 
@@ -2006,8 +2011,8 @@ async function computePlanExclusions(opts = {}) {
   const excludedOrders = [];
   for (const o of allOrders) {
     const reasons = [];
-    // Read the chain-level total (see Phase note in (a) above).
-    const custTotal = customerTotals.get(chainKey(o.CardName)) || 0;
+    // Read the per-customer total under the same key the loop in (a) wrote.
+    const custTotal = customerTotals.get(customerKey(o)) || 0;
     if (custTotal < MIN_CUSTOMER_TOTAL) {
       reasons.push({
         type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL,
