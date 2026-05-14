@@ -92,6 +92,33 @@ export default function RunDetailsPage() {
     onSuccess: () => toast.success('נוצר גל ליקוט'),
   });
 
+  // Phase 3 — aggregate flush. Walks every QcApproved+AggregatePending order
+  // in this run, groups by AggregationKey, and emits one consolidated DN
+  // (and optionally INV) per group. Refuses if any order is unapproved.
+  const flushAggregateMutation = useMutation({
+    mutationFn: () => api.post(`/runs/${id}/flush-aggregate-docs`).then((r) => r.data),
+    onSuccess: (result) => {
+      const dnCount = result.deliveryNotes?.length || 0;
+      const invCount = result.invoices?.length || 0;
+      const parts = [];
+      if (dnCount) parts.push(`${dnCount} תעודות משלוח`);
+      if (invCount) parts.push(`${invCount} חשבוניות`);
+      const summary = parts.join(' + ') || 'אין מסמכים חדשים';
+      toast.success(`הופקו ${summary} (${result.ordersTouched} הזמנות אוחדו)`, { duration: 6000 });
+      queryClient.invalidateQueries({ queryKey: ['run', id] });
+      queryClient.invalidateQueries({ queryKey: ['wave-for-run', id] });
+    },
+    onError: (err) => {
+      const data = err.response?.data || {};
+      if (data.code === 'UNAPPROVED_ORDERS') {
+        const list = (data.unapproved || []).map((o) => `#${o.SapDocNum || o.RunOrderId}`).join(', ');
+        toast.error(`${data.error}\nלא מאושרות: ${list}`, { duration: 8000 });
+      } else {
+        toast.error(data.error || 'שגיאה בהפקת מסמכים מאוחדים');
+      }
+    },
+  });
+
   const splitMutation = useMutation({
     mutationFn: () => api.post(`/runs/${id}/split`).then((r) => r.data),
     onSuccess: (newRun) => {
@@ -253,6 +280,24 @@ export default function RunDetailsPage() {
           >
             <Zap size={16} /> צור גל ליקוט
           </button>
+          {(() => {
+            // Phase 3 — flush button. Visible only when at least one order in
+            // the run is QcApproved + AggregatePending + has no DN/INV yet.
+            const pending = (run.stops || []).flatMap((s) => s.orders || [])
+              .filter((o) => o.QcApproved && o.AggregatePending && !o.DeliveryNoteId && !o.InvoiceId);
+            if (!pending.length) return null;
+            return (
+              <button
+                onClick={() => flushAggregateMutation.mutate()}
+                disabled={flushAggregateMutation.isPending}
+                className="inline-flex items-center gap-2 px-3 py-2 bg-sky-600 text-white rounded-lg text-sm hover:bg-sky-700 disabled:opacity-50"
+                title={`${pending.length} הזמנות ממתינות לאיחוד`}
+              >
+                <FileText size={16} />
+                {flushAggregateMutation.isPending ? 'מפיק...' : `הפק מסמכים מאוחדים (${pending.length})`}
+              </button>
+            );
+          })()}
         </div>
       </div>
 

@@ -119,7 +119,12 @@ function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
                 <Check size={10} /> אשר הזמנה
               </button>
             )}
-            {a.QcApproved && !a.PartialFulfillment && (
+            {a.QcApproved && a.AggregatePending && !a.DeliveryNoteId && !a.InvoiceId && (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-sky-100 text-sky-900 border border-sky-400 rounded text-[10px] font-medium" title="ההזמנה אושרה. תעודת משלוח / חשבונית מאוחדת תופק בסיום ה-run">
+                <Check size={10} /> ממתין לאיחוד
+              </span>
+            )}
+            {a.QcApproved && !a.AggregatePending && !a.PartialFulfillment && (
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-100 text-emerald-800 border border-emerald-300 rounded text-[10px] font-medium" title="ההזמנה אושרה ומסמכים הופקו">
                 <Check size={10} /> מאושרת
                 {a.DeliveryNoteId && <span className="text-emerald-700 mr-1">·ת.משלוח</span>}
@@ -190,6 +195,16 @@ export default function PickingPage() {
     mutationFn: (alloc) =>
       api.post(`/orders/${alloc.RunOrderId}/qc-approve`).then((r) => r.data),
     onSuccess: (result, alloc) => {
+      // Phase 3 — aggregate-pending orders won't produce a per-order DN here;
+      // their toast says "approved, waiting for run-level flush" instead.
+      if (result.aggregatePending) {
+        toast.success(
+          'הזמנה ' + alloc.SapDocNum + ' אושרה — ממתינה לאיחוד בסיום ה-run',
+          { duration: 5000 },
+        );
+        queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] });
+        return;
+      }
       const parts = [];
       if (result.deliveryNote) parts.push('תעודת משלוח ' + result.deliveryNote.DocNumber);
       if (result.invoice)      parts.push('חשבונית '       + result.invoice.DocNumber);
@@ -239,6 +254,23 @@ export default function PickingPage() {
         );
       } else if (data.code === 'NOTHING_PICKED') {
         toast.error(data.error || 'לא נלקטה אף יחידה — לקט פריט אחד לפחות לפני אישור', { duration: 6000 });
+      } else if (data.code === 'INVALID_POLICY') {
+        toast.error(
+          (t) => (
+            <div className="flex flex-col gap-1">
+              <div>{data.error || 'מדיניות המסמכים שגויה'}</div>
+              <a
+                href="/customer-doc-policy"
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs underline text-blue-200 hover:text-white"
+              >
+                ← תקן ב-מדיניות מסמכים
+              </a>
+            </div>
+          ),
+          { duration: 8000 },
+        );
       } else {
         toast.error(data.error || 'שגיאה באישור ההזמנה');
       }

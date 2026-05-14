@@ -2888,6 +2888,45 @@ app.post('/api/orders/:runOrderId/qc-approve', (req, res) => {
   }
 });
 
+// Phase 3 — run-level aggregate flush. Walks all approved orders in the
+// run with AggregatePending=true, groups by AggregationKey, and emits one
+// consolidated DN per group. Admin-only because it mints documents en masse.
+app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, (req, res) => {
+  const auth = req.headers.authorization;
+  let approvedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { approvedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  try {
+    const result = store.flushAggregateDocsForRun(req.params.id, {
+      approvedBy,
+      method: 'AUTO_AGGREGATE_FLUSH',
+    });
+    io.emit('run:aggregate-flushed', { runId: Number(req.params.id) });
+    res.json({
+      ok: true,
+      ordersTouched: result.ordersTouched,
+      deliveryNotes: result.docsCreated.map((d) => ({
+        DeliveryNoteId: d.DeliveryNoteId,
+        DocNumber: d.DocNumber,
+        IsPartial: !!d.IsPartial,
+        SourceOrderCount: d.SourceOrders?.length || 0,
+        AggregationSource: d.AggregationSource,
+      })),
+      invoices: result.invoicesCreated.map((i) => ({
+        InvoiceId: i.InvoiceId,
+        DocNumber: i.DocNumber,
+      })),
+      skipped: result.skipped,
+    });
+  } catch (err) {
+    const payload = { error: err.message };
+    if (err.code) payload.code = err.code;
+    if (err.unapproved) payload.unapproved = err.unapproved;
+    res.status(err.status || 500).json(payload);
+  }
+});
+
 app.post('/api/picking/:waveId/qc-approve', (req, res) => {
   const auth = req.headers.authorization;
   let approvedBy = null;

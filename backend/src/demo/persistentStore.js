@@ -1600,6 +1600,7 @@ export function getWave(waveId) {
       deliveryNoteId: ord.DeliveryNoteId || null,
       invoiceId: ord.InvoiceId || null,
       partialFulfillment: !!ord.PartialFulfillment,
+      aggregatePending: !!ord.AggregatePending,
     });
   }
   const enrich = (a) => {
@@ -1618,6 +1619,7 @@ export function getWave(waveId) {
       DeliveryNoteId: cust.deliveryNoteId || null,
       InvoiceId: cust.invoiceId || null,
       PartialFulfillment: !!cust.partialFulfillment,
+      AggregatePending: !!cust.aggregatePending,
     };
   };
 
@@ -2102,20 +2104,95 @@ function _findStopOfOrder(order) {
   return s.stops.find((st) => st.StopId === order.StopId);
 }
 
+/**
+ * Phase 3 — policy lookup with parent fallback.
+ *
+ * Returns { policy, source, key } where:
+ *   source = 'cardCode' when the policy lives on the customer's own profile
+ *   source = 'parent'   when no per-customer profile exists but a profile
+ *                        whose Name matches the chain parent name does.
+ *   key                  is the stable aggregation key the flush uses to
+ *                        group orders: `card:<CardCode>:<Company>` or
+ *                        `parent:<parentName>:<Company>`.
+ *
+ * The parent fallback is opt-in: it only ever kicks in if an admin has
+ * created a customerDeliveryProfile whose Name equals the chain parent
+ * name (e.g. profile with Name="א.ל.מ סחר 2000 בע\"מ" and a DocPolicy).
+ * Today no such profile exists, so behaviour for Phase 1/2 is unchanged.
+ */
 function _policyForOrder(order) {
   if (!order) return null;
   const profiles = (load().customerDeliveryProfiles || []);
   const cardCode = String(order.SapCardCode || '').trim();
   const company = order.CompanyCode === 'A' ? 'OIG'
                 : order.CompanyCode === 'B' ? 'UNICO' : null;
+
+  // Stage 1 — by CardCode + Company (then by CardCode alone for stragglers).
   let p = profiles.find((x) => String(x.CardCode) === cardCode && x.Company === company);
   if (!p) p = profiles.find((x) => String(x.CardCode) === cardCode);
-  return p?.DocPolicy || null;
+  if (p?.DocPolicy) {
+    return {
+      policy: p.DocPolicy,
+      source: 'cardCode',
+      key: `card:${cardCode}:${order.CompanyCode || ''}`,
+    };
+  }
+
+  // Stage 2 — parent fallback. Find a profile whose Name is the chain
+  // parent name AND that profile is itself "at the root" (Name = its own
+  // parent name). This avoids accidentally matching a sibling branch.
+  const parentName = parentNameOf(order.SapCardName || '');
+  if (parentName) {
+    const parentP = profiles.find((x) =>
+      x.Name === parentName &&
+      parentNameOf(x.Name) === parentName &&
+      x.DocPolicy
+    );
+    if (parentP?.DocPolicy) {
+      return {
+        policy: parentP.DocPolicy,
+        source: 'parent',
+        key: `parent:${parentName}:${order.CompanyCode || ''}`,
+      };
+    }
+  }
+
+  return null;
 }
 
-function _hasAnyPerOrderPolicy(policy) {
+function _hasAnyPolicySignal(policy) {
   if (!policy) return false;
-  return policy.perOrderDeliveryNote === 'yes' || policy.perOrderInvoice === 'yes';
+  return policy.perOrderDeliveryNote === 'yes'
+      || policy.perOrderInvoice === 'yes'
+      || policy.aggregateDeliveryNote === 'yes'
+      || policy.aggregateInvoice === 'yes';
+}
+
+/**
+ * Phase 3 — reject "both yes" within the same dimension (DN or INV).
+ * Cross-dimension mixes are fine: e.g. perOrderDN=yes + aggregateINV=yes is
+ * a legit "DN per delivery, monthly consolidated invoice" pattern.
+ */
+function _validatePolicyShape(policy, cardName, cardCode) {
+  const errors = [];
+  if (policy.perOrderDeliveryNote === 'yes' && policy.aggregateDeliveryNote === 'yes') {
+    errors.push('תעודת משלוח: אסור לסמן גם per-order וגם מאוחד');
+  }
+  if (policy.perOrderInvoice === 'yes' && policy.aggregateInvoice === 'yes') {
+    errors.push('חשבונית: אסור לסמן גם per-order וגם מאוחד');
+  }
+  if (errors.length) {
+    const err = new Error(
+      `מדיניות לא תקינה ללקוח ${cardName || cardCode}: ${errors.join('; ')}. ` +
+      `תקן ב-/customer-doc-policy.`
+    );
+    err.status = 422;
+    err.code = 'INVALID_POLICY';
+    err.cardCode = cardCode;
+    err.cardName = cardName;
+    err.errors = errors;
+    throw err;
+  }
 }
 
 /**
@@ -2205,8 +2282,9 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     if (!options.regenerate) return existing;
   }
 
-  const policy = _policyForOrder(order);
-  if (!_hasAnyPerOrderPolicy(policy)) {
+  const policyResult = _policyForOrder(order);
+  const policy = policyResult?.policy || null;
+  if (!_hasAnyPolicySignal(policy)) {
     const err = new Error(
       'מדיניות מסמכים חסרה ללקוח ' + (order.SapCardName || order.SapCardCode) +
       '. הגדר ב-/customer-doc-policy לפני אישור.'
@@ -2217,6 +2295,10 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     err.cardName = order.SapCardName;
     throw err;
   }
+
+  // Phase 3 — reject conflicting per-order + aggregate flags up front so
+  // the admin sees the broken policy instead of getting a silent default.
+  _validatePolicyShape(policy, order.SapCardName, order.SapCardCode);
 
   // Phase 2 — shortage gate. Walk this order's allocations and refuse if
   // nothing was picked (operator can't approve a 0-quantity DN). Partial
@@ -2240,7 +2322,16 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     isPartial: fulfillment.isPartial,
     totalOrdered: fulfillment.totalOrdered,
     totalPicked: fulfillment.totalPicked,
+    aggregatePending: false,
   };
+
+  // Phase 3 — if the policy says "aggregate" for either dimension AND
+  // does NOT also say per-order for that dimension, defer doc creation
+  // until the run-level flush. The order is still marked QcApproved so the
+  // picker UI shows it as done; the flush will populate DeliveryNoteId /
+  // InvoiceId once the operator triggers it from RunDetailsPage.
+  const wantsAggDN  = policy.aggregateDeliveryNote === 'yes' && policy.perOrderDeliveryNote !== 'yes';
+  const wantsAggINV = policy.aggregateInvoice === 'yes' && policy.perOrderInvoice !== 'yes';
 
   // Create a single-order DN scoped to THIS order (not all orders at the stop).
   // We piggyback on the existing DN shape so downstream code (PDFs, /api/delivery-notes)
@@ -2305,11 +2396,251 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
     }
   }
 
+  // Phase 3 — if any aggregate flag is set without its per-order counterpart,
+  // tag the order so the run-level flush picks it up. AggregationKey is the
+  // GroupBy key the flush uses; it comes from _policyForOrder so it matches
+  // exactly the level the admin authored the policy at (CardCode or parent).
+  if (wantsAggDN || wantsAggINV) {
+    order.AggregatePending = true;
+    order.AggregationKey = policyResult.key;
+    order.AggregationSource = policyResult.source;
+    result.aggregatePending = true;
+  }
+
   order.QcApproved = true;
   order.QcApprovedAt = new Date().toISOString();
   order.QcApprovedBy = options.approvedBy || null;
   save();
   return result;
+}
+
+/**
+ * Phase 3 — run-level aggregate flush. Walks every RunOrder in the run
+ * that's marked AggregatePending=true, groups them by AggregationKey, and
+ * emits one consolidated DN per group (plus a consolidated invoice if the
+ * policy asks for it). The SAP order stays the source of truth for each
+ * shortage — we only persist the picked quantities here.
+ *
+ * Idempotent: orders that already have a DeliveryNoteId/InvoiceId from a
+ * previous flush are skipped (they appear in `skipped` for visibility).
+ * Refuses to run if any order in the run is unapproved (returns 422).
+ */
+export function flushAggregateDocsForRun(runId, options = {}) {
+  const s = ensureDocsStore();
+  const runIdNum = Number(runId);
+
+  const ordersInRun = (s.runOrders || []).filter((o) => {
+    const stop = s.stops?.find((st) => st.StopId === o.StopId);
+    return stop && Number(stop.RunId) === runIdNum;
+  });
+
+  // Refuse to flush if ANY order is unapproved — the operator is about to
+  // mint a chain-level DN; we don't want a pending row sneaking in later.
+  const unapproved = ordersInRun.filter((o) => !o.QcApproved);
+  if (unapproved.length) {
+    const err = new Error(
+      `יש ${unapproved.length} הזמנות לא מאושרות ב-run. אשר את כולן לפני הפקת מסמכים מאוחדים.`
+    );
+    err.status = 422;
+    err.code = 'UNAPPROVED_ORDERS';
+    err.unapproved = unapproved.map((o) => ({
+      RunOrderId: o.RunOrderId,
+      SapDocNum: o.SapDocNum,
+      SapCardName: o.SapCardName,
+    }));
+    throw err;
+  }
+
+  const pending = ordersInRun.filter((o) => o.AggregatePending && !o.DeliveryNoteId && !o.InvoiceId);
+  const skipped = ordersInRun
+    .filter((o) => o.AggregatePending && (o.DeliveryNoteId || o.InvoiceId))
+    .map((o) => ({ RunOrderId: o.RunOrderId, reason: 'already_flushed' }));
+
+  if (!pending.length) {
+    return { docsCreated: [], invoicesCreated: [], skipped, ordersTouched: 0 };
+  }
+
+  // Group orders by their aggregation key — same key = same consolidated DN.
+  const groups = new Map();
+  for (const o of pending) {
+    const key = o.AggregationKey || `card:${o.SapCardCode}:${o.CompanyCode}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(o);
+  }
+
+  const docsCreated = [];
+  const invoicesCreated = [];
+
+  for (const [groupKey, orders] of groups.entries()) {
+    // All orders in a group share the same DocPolicy by construction (the
+    // key is derived from it). Sniff the first order's policy to decide
+    // whether to emit a DN, an INV, or both.
+    const policyResult = _policyForOrder(orders[0]);
+    const policy = policyResult?.policy;
+    if (!policy) continue;
+    const emitDN  = policy.aggregateDeliveryNote === 'yes';
+    const emitINV = policy.aggregateInvoice === 'yes';
+    if (!emitDN && !emitINV) continue;
+
+    // Collapse picked lines across the group by ItemCode so the consolidated
+    // DN has one row per item even if 3 stores ordered the same SKU.
+    const byItem = new Map();
+    const allShortages = [];
+    let totalOrdered = 0;
+    let totalPicked = 0;
+    const sourceOrders = [];
+    let anyPartial = false;
+
+    for (const o of orders) {
+      const fulfillment = _computeOrderFulfillment(o);
+      totalOrdered += fulfillment.totalOrdered;
+      totalPicked += fulfillment.totalPicked;
+      if (fulfillment.isPartial) anyPartial = true;
+
+      for (const ln of fulfillment.lines) {
+        if (ln.Picked > 0) {
+          const existing = byItem.get(ln.ItemCode);
+          if (existing) {
+            existing.Picked += ln.Picked;
+            existing.Ordered += ln.Ordered;
+            existing.SourceRunOrderIds.push(o.RunOrderId);
+          } else {
+            byItem.set(ln.ItemCode, {
+              ItemCode: ln.ItemCode,
+              ItemName: ln.ItemName,
+              Ordered: ln.Ordered,
+              Picked: ln.Picked,
+              SourceRunOrderIds: [o.RunOrderId],
+            });
+          }
+        }
+        if (ln.Missing > 0) {
+          allShortages.push({
+            RunOrderId: o.RunOrderId,
+            SapDocNum: o.SapDocNum,
+            ItemCode: ln.ItemCode,
+            ItemName: ln.ItemName,
+            Ordered: ln.Ordered,
+            Picked: ln.Picked,
+            Missing: ln.Missing,
+          });
+        }
+      }
+
+      sourceOrders.push({
+        RunOrderId: o.RunOrderId,
+        SapDocEntry: o.SapDocEntry,
+        SapDocNum: o.SapDocNum,
+        SapCardCode: o.SapCardCode,
+        SapCardName: o.SapCardName,
+        OrderTotal: o.OrderTotal,
+        LinesCount: o.LinesCount,
+      });
+    }
+
+    const pickedLines = Array.from(byItem.values());
+    const firstOrder = orders[0];
+    const firstStop = _findStopOfOrder(firstOrder);
+
+    let dn = null;
+    if (emitDN) {
+      dn = {
+        DeliveryNoteId: s.nextDeliveryNoteId++,
+        DocNumber: `DN-AGG-${runIdNum}-${firstOrder.CompanyCode}-${String(s.nextDeliveryNoteId).padStart(4, '0')}`,
+        StopId: null, // aggregate — spans multiple stops
+        RunId: runIdNum,
+        RunOrderId: null, // aggregate — spans multiple orders
+        CompanyCode: firstOrder.CompanyCode,
+        CompanyName: firstOrder.CompanyName,
+        SapCardCode: policyResult.source === 'parent' ? null : firstOrder.SapCardCode,
+        SapCardName: policyResult.source === 'parent'
+          ? parentNameOf(firstOrder.SapCardName)
+          : firstOrder.SapCardName,
+        SourceOrders: sourceOrders,
+        TotalAmount: sourceOrders.reduce((sum, x) => sum + Number(x.OrderTotal || 0), 0),
+        LineCount: pickedLines.length,
+        IsAggregate: true,
+        IsPartial: anyPartial,
+        AggregationKey: groupKey,
+        AggregationSource: policyResult.source,
+        TotalOrdered: totalOrdered,
+        TotalPicked: totalPicked,
+        Lines: pickedLines,
+        Shortages: allShortages,
+        Status: 'PENDING_EXPORT',
+        SapDeliveryDocEntry: null,
+        SapDeliveryDocNum: null,
+        ExportedAt: null,
+        SentToSapAt: null,
+        ConfirmedAt: null,
+        ErrorMessage: null,
+        Notes: null,
+        Address: firstStop ? {
+          Street: firstStop.Street, BuildingNumber: firstStop.BuildingNumber,
+          City: firstStop.City, BranchName: firstStop.BranchName,
+        } : null,
+        DeliveryDate: new Date().toISOString().slice(0, 10),
+        CreatedAt: new Date().toISOString(),
+        Method: options.method || 'AUTO_AGGREGATE_FLUSH',
+      };
+      s.deliveryNotes.push(dn);
+      docsCreated.push(dn);
+
+      // Link every order in the group to this DN.
+      for (const o of orders) {
+        o.DeliveryNoteId = dn.DeliveryNoteId;
+        if (anyPartial) o.PartialFulfillment = true;
+      }
+    }
+
+    if (emitINV && dn) {
+      const inv = generateInvoiceFromDeliveryNote(dn.DeliveryNoteId, {
+        method: options.method || 'AUTO_AGGREGATE_FLUSH',
+      });
+      if (inv) {
+        invoicesCreated.push(inv);
+        for (const o of orders) o.InvoiceId = inv.InvoiceId;
+      }
+    } else if (emitINV && !dn) {
+      // INV without DN — rare but legal: chain wants only consolidated INV
+      // without a DN. Build INV directly from the picked lines.
+      const inv = {
+        InvoiceId: s.nextInvoiceId++,
+        DocNumber: `INV-AGG-${runIdNum}-${firstOrder.CompanyCode}-${String(s.nextInvoiceId).padStart(4, '0')}`,
+        RunId: runIdNum,
+        DeliveryNoteId: null,
+        CompanyCode: firstOrder.CompanyCode,
+        SapCardCode: policyResult.source === 'parent' ? null : firstOrder.SapCardCode,
+        SapCardName: policyResult.source === 'parent'
+          ? parentNameOf(firstOrder.SapCardName)
+          : firstOrder.SapCardName,
+        SourceOrders: sourceOrders,
+        TotalAmount: sourceOrders.reduce((sum, x) => sum + Number(x.OrderTotal || 0), 0),
+        IsAggregate: true,
+        AggregationKey: groupKey,
+        Lines: pickedLines,
+        Status: 'PENDING_EXPORT',
+        CreatedAt: new Date().toISOString(),
+        Method: options.method || 'AUTO_AGGREGATE_FLUSH',
+      };
+      s.invoices.push(inv);
+      invoicesCreated.push(inv);
+      for (const o of orders) o.InvoiceId = inv.InvoiceId;
+    }
+
+    // Clear the pending flag now that the docs are written.
+    for (const o of orders) {
+      o.AggregatePending = false;
+    }
+  }
+
+  save();
+  return {
+    docsCreated,
+    invoicesCreated,
+    skipped,
+    ordersTouched: pending.length,
+  };
 }
 
 export function markDocsExported(docIds, type = 'deliveryNote') {
