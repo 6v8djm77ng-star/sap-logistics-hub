@@ -1,73 +1,87 @@
 /**
- * Route optimization - finds the optimal stop order to minimize total
- * driving distance / time across a run.
+ * Road-distance route optimization - finds the optimal stop order to minimize
+ * total driving distance/time across a run, using Google Maps Distance Matrix
+ * for real road distances + 2-opt local search.
  *
- * Two modes:
- *   1. With GOOGLE_MAPS_API_KEY: uses Distance Matrix API for real road distances
- *      (free up to 25k requests/month).
- *   2. Without: falls back to haversine (great-circle) distance + 2-opt local search.
+ * Hard requirement: GOOGLE_MAPS_API_KEY must be set in backend/.env.
+ * If the key is missing or the API call fails, the optimizer throws — callers
+ * MUST NOT silently fall back to great-circle / haversine distances, since
+ * that would change StopOrder based on misleading data.
  *
- * Both modes return the same shape so callers don't need to know which is used.
+ * (Previous versions of this file had a silent haversine fallback. Removed
+ * on purpose — see fix(routes): require Google Maps for road-distance
+ * optimization.)
  */
 
 const GOOGLE_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
 
-/** Great-circle distance in km between two lat/lng points. */
-function haversineKm(a, b) {
-  const toRad = (d) => (d * Math.PI) / 180;
-  const R = 6371; // earth km
-  const dLat = toRad(b.lat - a.lat);
-  const dLng = toRad(b.lng - a.lng);
-  const lat1 = toRad(a.lat);
-  const lat2 = toRad(b.lat);
-  const x =
-    Math.sin(dLat / 2) ** 2 +
-    Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
-  return 2 * R * Math.asin(Math.sqrt(x));
+export class GoogleMapsConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'GoogleMapsConfigError';
+    this.code = 'MISSING_GOOGLE_MAPS_KEY';
+  }
 }
 
-/** Build an N×N distance matrix using haversine. */
-function buildHaversineMatrix(points) {
+export class GoogleMapsApiError extends Error {
+  constructor(message, upstreamStatus) {
+    super(message);
+    this.name = 'GoogleMapsApiError';
+    this.code = 'GOOGLE_MAPS_API_FAILED';
+    this.upstreamStatus = upstreamStatus;
+  }
+}
+
+/** Build matrix from Google Distance Matrix API. Throws on any failure. */
+async function buildGoogleMatrix(points) {
+  if (!GOOGLE_KEY) {
+    throw new GoogleMapsConfigError('אופטימיזציית כביש דורשת GOOGLE_MAPS_API_KEY');
+  }
+  const origins = points.map((p) => `${p.lat},${p.lng}`).join('|');
+  const dests = origins;
+  // Note: key is passed as a query param. We never log this URL — see the
+  // catch arm in the endpoint that logs `err.message` only, never the URL.
+  const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origins}&destinations=${dests}&mode=driving&key=${encodeURIComponent(GOOGLE_KEY)}`;
+
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    throw new GoogleMapsApiError(`Google Maps Distance Matrix לא הגיב: ${e.message}`);
+  }
+  if (!res.ok) {
+    throw new GoogleMapsApiError(
+      `Google Maps Distance Matrix החזיר HTTP ${res.status}`,
+      res.status,
+    );
+  }
+  const payload = await res.json();
+  if (payload.status !== 'OK') {
+    // Don't leak Google's error_message into the response — it can sometimes
+    // include the partial key. Just surface the status code.
+    throw new GoogleMapsApiError(
+      `Google Maps Distance Matrix החזיר status=${payload.status}`,
+    );
+  }
+
   const n = points.length;
   const m = Array.from({ length: n }, () => Array(n).fill(0));
   for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      m[i][j] = i === j ? 0 : haversineKm(points[i], points[j]);
+    for (let k = 0; k < n; k++) {
+      // Bugfix: the previous loop variable was `j`, which shadowed the parsed
+      // JSON also bound to `j` — so `j.rows` was always undefined and the
+      // function silently fell back to haversine for every call.
+      const el = payload.rows?.[i]?.elements?.[k];
+      if (el?.status === 'OK') {
+        m[i][k] = el.distance.value / 1000; // metres → km
+      } else {
+        throw new GoogleMapsApiError(
+          `Google Maps Distance Matrix חסר זוג מרחקים (i=${i},j=${k},status=${el?.status || 'missing'})`,
+        );
+      }
     }
   }
   return m;
-}
-
-/** Build matrix from Google Distance Matrix API. Falls back to haversine on error. */
-async function buildGoogleMatrix(points) {
-  if (!GOOGLE_KEY) return buildHaversineMatrix(points);
-  try {
-    const origins = points.map((p) => `${p.lat},${p.lng}`).join('|');
-    const dests = origins;
-    const url = `https://maps.googleapis.com/maps/api/distancematrix/json?origins=${origins}&destinations=${dests}&mode=driving&key=${GOOGLE_KEY}`;
-    const res = await fetch(url);
-    const j = await res.json();
-    if (j.status !== 'OK') {
-      console.warn('[route-opt] Google API:', j.status, j.error_message);
-      return buildHaversineMatrix(points);
-    }
-    const n = points.length;
-    const m = Array.from({ length: n }, () => Array(n).fill(0));
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < n; j++) {
-        const el = j.rows?.[i]?.elements?.[j];
-        if (el?.status === 'OK') {
-          m[i][j] = el.distance.value / 1000; // metres → km
-        } else {
-          m[i][j] = haversineKm(points[i], points[j]);
-        }
-      }
-    }
-    return m;
-  } catch (e) {
-    console.warn('[route-opt] Google fetch failed:', e.message);
-    return buildHaversineMatrix(points);
-  }
 }
 
 /** Total distance of a tour given a matrix and a permutation. */
@@ -129,23 +143,24 @@ function twoOpt(matrix, tour) {
 }
 
 /**
- * Optimize a list of stops.
+ * Optimize a list of stops using Google Maps driving distance.
  *
  * @param {Array<{id, lat, lng}>} stops - the stops to visit (0+).
  * @param {Object} [options]
  * @param {{lat,lng}} [options.start] - depot/starting point. Defaults to first stop.
- * @returns {Promise<{order: Array, totalKm: number, source: 'google'|'haversine'}>}
+ * @returns {Promise<{order: Array, totalKm: number, source: 'google'}>}
+ * @throws {GoogleMapsConfigError} when GOOGLE_MAPS_API_KEY is missing.
+ * @throws {GoogleMapsApiError} when the Distance Matrix call fails.
  */
 export async function optimizeRoute(stops, options = {}) {
   if (!stops || stops.length < 2) {
-    return { order: stops || [], totalKm: 0, source: 'haversine' };
+    return { order: stops || [], totalKm: 0, source: 'google' };
   }
   const start = options.start;
   // Prepend depot as index 0 if provided
   const points = start ? [start, ...stops] : [...stops];
-  const matrix = GOOGLE_KEY
-    ? await buildGoogleMatrix(points)
-    : buildHaversineMatrix(points);
+
+  const matrix = await buildGoogleMatrix(points);
 
   // Start from depot (index 0)
   let tour = nearestNeighbour(matrix, 0);
@@ -159,6 +174,6 @@ export async function optimizeRoute(stops, options = {}) {
   return {
     order,
     totalKm: Math.round(totalKm * 10) / 10,
-    source: GOOGLE_KEY ? 'google' : 'haversine',
+    source: 'google',
   };
 }

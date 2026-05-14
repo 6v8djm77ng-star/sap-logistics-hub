@@ -1029,21 +1029,35 @@ app.get('/api/runs/:id/loading-plan', async (req, res) => {
   }
 });
 
-// Route optimization - reorders stops in a run for minimum drive distance.
-// Uses Google Maps if GOOGLE_MAPS_API_KEY is set, else haversine + 2-opt.
+// Road-distance route optimization - reorders stops in a run for minimum
+// driving distance using Google Maps Distance Matrix.
+//
+// Hard requirement: GOOGLE_MAPS_API_KEY must be set. Without it the endpoint
+// returns 422 and does NOT touch StopOrder — silently falling back to
+// haversine would mislead the operator into trusting bad geometry.
 app.post('/api/runs/:id/optimize', async (req, res) => {
   try {
-    const { optimizeRoute } = await import('./routeOptimizer.js');
+    // Gate before any work — fail fast and visibly.
+    if (!process.env.GOOGLE_MAPS_API_KEY) {
+      return res.status(422).json({
+        error: 'אופטימיזציית כביש דורשת GOOGLE_MAPS_API_KEY',
+        code: 'MISSING_GOOGLE_MAPS_KEY',
+        hint: 'הגדר GOOGLE_MAPS_API_KEY ב-backend/.env (ראה .env.example) והפעל מחדש את השרת.',
+      });
+    }
+
+    const { optimizeRoute, GoogleMapsConfigError, GoogleMapsApiError } =
+      await import('./routeOptimizer.js');
     const { resolveStopLatLng } = await import('./cityCoords.js');
     const runId = Number(req.params.id);
     const details = store.getRunDetails(runId);
     if (!details) return res.status(404).json({ error: 'Run not found' });
 
     // Coordinates: prefer stored Latitude/Longitude, fall back to the
-    // city-centroid geocoder. (Earlier code looked for s.Lat/s.Lng which
-    // never existed — fields are Latitude/Longitude — and many stops have
-    // null coords anyway. The geocoder covers the ~40 most common
-    // Israeli cities, which is enough for nearest-neighbor ordering.)
+    // city-centroid geocoder for stops without exact coords. Google's
+    // Distance Matrix then computes real driving distance between those
+    // points (city centroid → city centroid is still a road route, not a
+    // straight line).
     const allStops = (details.stops || []);
     const resolved = allStops
       .map((s) => {
@@ -1063,18 +1077,43 @@ app.post('/api/runs/:id/optimize', async (req, res) => {
       });
     }
 
-    const result = await optimizeRoute(
-      resolved.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng })),
-      req.body?.start
-        ? { start: { lat: Number(req.body.start.lat), lng: Number(req.body.start.lng) } }
-        : undefined
-    );
-    // Tag whether we used stored coords or the fallback geocoder, so the
-    // operator knows if results are exact or approximate.
+    // Run the optimizer. Any failure here aborts BEFORE StopOrder is touched.
+    let result;
+    try {
+      result = await optimizeRoute(
+        resolved.map((s) => ({ id: s.id, lat: s.lat, lng: s.lng })),
+        req.body?.start
+          ? { start: { lat: Number(req.body.start.lat), lng: Number(req.body.start.lng) } }
+          : undefined
+      );
+    } catch (err) {
+      // Distinguish config error (key missing — shouldn't happen here since
+      // we gated above, but kept defensively) from upstream API failure.
+      if (err instanceof GoogleMapsConfigError) {
+        return res.status(422).json({
+          error: err.message,
+          code: 'MISSING_GOOGLE_MAPS_KEY',
+        });
+      }
+      if (err instanceof GoogleMapsApiError) {
+        // Log only the sanitized message — never the URL (it carries the key).
+        console.error('[optimize] Google Maps failed:', err.message);
+        return res.status(502).json({
+          error: 'Google Maps Distance Matrix נכשל - לא בוצע שינוי בסדר העצירות',
+          code: 'GOOGLE_MAPS_API_FAILED',
+          detail: err.message,
+          upstreamStatus: err.upstreamStatus || null,
+        });
+      }
+      throw err;
+    }
+
+    // Tag whether we used stored coords or the city-centroid fallback so the
+    // operator knows if the result is exact or based on city centers.
     const usedFallback = resolved.some((s) => s.source === 'city');
     result.coordSource = usedFallback ? 'city-centroid' : 'stored';
 
-    // If client requested apply, reorder the stops in storage.
+    // StopOrder is only mutated AFTER the optimizer succeeded.
     if (req.body?.apply) {
       const ordered = result.order;
       for (let i = 0; i < ordered.length; i++) {
@@ -1086,11 +1125,9 @@ app.post('/api/runs/:id/optimize', async (req, res) => {
       runId,
       optimizedOrder: result.order.map((s) => s.id),
       totalKm: result.totalKm,
-      source: result.source,
+      source: result.source, // always 'google' now
+      coordSource: result.coordSource,
       applied: !!req.body?.apply,
-      hint: result.source === 'haversine'
-        ? 'משתמש במרחק אווירי - הוסף GOOGLE_MAPS_API_KEY ב-.env לדיוק כביש אמיתי'
-        : null,
     });
   } catch (err) {
     console.error('[optimize] failed:', err.message);
