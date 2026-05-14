@@ -21,6 +21,11 @@ backend/.claude/
 # secrets — never commit). The rest of backend-sandbox/ is committed normally.
 backend-sandbox/.env.sandbox
 
+# Generated customer-doc-policy xlsx. Built by scripts/build_customer_doc_policy.py
+# from the operator's Temp folder, contains OIG+UNICO customer master data.
+# Regenerable; not committed.
+docs/customer-doc-policy/*.xlsx
+
 # ── Phase-1 baseline additions ─────────────────────────────────────
 
 # Real env files (every variant — NEVER commit)
