@@ -1934,11 +1934,26 @@ async function computePlanExclusions(opts = {}) {
   const MIN_LINES_PER_ORDER = Number(opts.minLinesPerOrder ?? 2);
   const requireStock = opts.requireStock !== false;
 
-  // (a) Customer-total aggregation across companies (CardName-based).
+  // (a) Customer-total aggregation across companies AND across branches of
+  // the same chain. The planner UI promises "סך הזמנות הלקוח (שתי החברות)"
+  // and the operator considers the chain (e.g. א.ל.מ סחר 2000 בע"מ) as the
+  // customer — not each branch CardCode in isolation.
+  //
+  // Without this aggregation, a chain with 17 small orders across 17
+  // branches would have each branch separately compared against the 3,000₪
+  // threshold and almost certainly fail, even though the chain combined is
+  // well above the threshold. Earlier behaviour: 21 SOUTH-1 orders for two
+  // chains (א.ל.מ + טרקלין) were silently excluded for this reason.
+  //
+  // store.parentNameOf strips the branch suffix (" - סניף X", "-עפולה",
+  // "בע\"מ - 134", etc.) and returns the chain name. For a non-chain
+  // customer with no branch suffix, parentNameOf returns the name as-is,
+  // so single-location customers behave exactly as before.
   const customerTotals = new Map();
   const norm = (s) => String(s || '').trim().toLowerCase();
+  const chainKey = (cardName) => norm(store.parentNameOf(cardName) || cardName);
   for (const o of allOrders) {
-    const k = norm(o.CardName);
+    const k = chainKey(o.CardName);
     customerTotals.set(k, (customerTotals.get(k) || 0) + Number(o.DocTotal || 0));
   }
 
@@ -1991,7 +2006,8 @@ async function computePlanExclusions(opts = {}) {
   const excludedOrders = [];
   for (const o of allOrders) {
     const reasons = [];
-    const custTotal = customerTotals.get(norm(o.CardName)) || 0;
+    // Read the chain-level total (see Phase note in (a) above).
+    const custTotal = customerTotals.get(chainKey(o.CardName)) || 0;
     if (custTotal < MIN_CUSTOMER_TOTAL) {
       reasons.push({
         type: 'low_total', total: custTotal, threshold: MIN_CUSTOMER_TOTAL,
