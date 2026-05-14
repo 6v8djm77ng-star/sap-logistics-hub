@@ -335,9 +335,18 @@ export default function DriversPage() {
 // ----------------------------------------------------------------------------
 function MobileLinkBlock({ driverCode }) {
   const [copied, setCopied] = useState(false);
-  // Build link from current host so it works whether running on localhost,
-  // 192.168.0.14, or any future deployment URL.
-  const url = `${window.location.protocol}//${window.location.host}/m/${driverCode}`;
+  // Same reasoning as PickersPage MobileLinkBlock: localhost links don't work
+  // on a driver's phone. Ask the backend for the live public base when the
+  // planner is on localhost; otherwise use the current host as before.
+  const { data: publicBase } = useQuery({
+    queryKey: ['public-base'],
+    queryFn: () => api.get('/system/public-base').then((r) => r.data.base).catch(() => null),
+    staleTime: 60_000,
+  });
+  const isLocal = /^localhost(:|$)|^127\.|^192\.168\./.test(window.location.host);
+  const base = (isLocal && publicBase) ? publicBase
+    : `${window.location.protocol}//${window.location.host}`;
+  const url = `${base}/m/${driverCode}`;
 
   const copy = async () => {
     try {

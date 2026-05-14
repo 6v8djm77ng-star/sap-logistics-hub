@@ -114,7 +114,19 @@ function PickerFormDialog({ picker, onClose }) {
 
 function MobileLinkBlock({ pickerCode }) {
   const [copied, setCopied] = useState(false);
-  const url = `${window.location.protocol}//${window.location.host}/pick/${pickerCode}`;
+  // When the planner opens this page on localhost (operator's laptop), naively
+  // building the link from window.location.host produces http://localhost:4000/...
+  // which is unreachable from a picker's mobile phone. Ask the backend for its
+  // live public base — it reads the active cloudflared tunnel URL from the log.
+  const { data: publicBase } = useQuery({
+    queryKey: ['public-base'],
+    queryFn: () => api.get('/system/public-base').then((r) => r.data.base).catch(() => null),
+    staleTime: 60_000,
+  });
+  const isLocal = /^localhost(:|$)|^127\.|^192\.168\./.test(window.location.host);
+  const base = (isLocal && publicBase) ? publicBase
+    : `${window.location.protocol}//${window.location.host}`;
+  const url = `${base}/pick/${pickerCode}`;
 
   const copy = async () => {
     try {
