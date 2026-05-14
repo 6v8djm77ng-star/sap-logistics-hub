@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
+import { NavLink, Outlet, Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../stores/auth.js';
 import {
   LayoutDashboard,
@@ -174,6 +174,20 @@ export default function DashboardLayout() {
 
           <RefreshButton />
         </header>
+
+        {/* Phase 4a — soft banner reminding users with incomplete profile to
+            fill it in. Doesn't block work; clicks lead to /settings. */}
+        {user && user.profileCompleted === false && (
+          <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 flex items-center gap-3 text-sm">
+            <span className="text-amber-700">⚠️</span>
+            <span className="text-amber-900 flex-1">
+              חסרים פרטים בחשבון שלך (שם מלא / מייל / טלפון). השלם/י כדי לאפשר שחזור סיסמה.
+            </span>
+            <Link to="/settings" className="text-amber-700 underline font-medium whitespace-nowrap">
+              השלם כעת ←
+            </Link>
+          </div>
+        )}
 
         <div className="flex-1 min-w-0">
           <Outlet />

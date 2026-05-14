@@ -30,6 +30,14 @@ import agentsRouter from '../routes/agents.js';
 
 // Initialize persistent store
 store.load();
+// Phase 4a: idempotent migration — adds MustChangePassword/PasswordResetReason/
+// ProfileCompleted to existing users and backfills moti's email.
+try {
+  const result = store.migrateUsersPhase4a();
+  if (result.updated) console.log(`[migration] Phase 4a updated ${result.updated} users`);
+} catch (err) {
+  console.warn('[migration] Phase 4a failed:', err.message);
+}
 
 let sapLive = false;
 sapBridge.isAvailable().then((ok) => {
@@ -199,10 +207,49 @@ app.post('/api/auth/login', async (req, res) => {
   const data = parseBody(LoginSchema, req.body, res);
   if (!data) return;
   const user = await store.verifyUserPassword(data.username, data.password);
-  if (!user) return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
+  if (!user) {
+    store.recordAudit({
+      action: 'login.failure',
+      actorName: data.username,
+      success: false,
+      ip: req.ip,
+      details: { username: data.username },
+    });
+    return res.status(401).json({ error: 'שם משתמש או סיסמה שגויים' });
+  }
   store.updateLastLogin(user.UserId);
-  const token = jwt.sign({ sub: user.UserId, username: user.Username, role: user.Role, name: user.FullName }, JWT_SECRET, { expiresIn: '8h' });
-  res.json({ token, user: { id: user.UserId, username: user.Username, name: user.FullName, role: user.Role } });
+  store.recordAudit({
+    action: 'login.success',
+    actorSub: user.UserId,
+    actorName: user.FullName,
+    targetUserId: user.UserId,
+    targetUsername: user.Username,
+    ip: req.ip,
+  });
+  const token = jwt.sign(
+    { sub: user.UserId, username: user.Username, role: user.Role, name: user.FullName },
+    JWT_SECRET,
+    { expiresIn: '8h' },
+  );
+  // Admit this new token through any pending revocation cutoff for this user.
+  // Older tokens (lower iat) stay blocked; this one (the legitimate fresh
+  // login) is good to go.
+  const decoded = jwt.decode(token);
+  if (decoded?.iat) store.admitFreshToken(user.UserId, decoded.iat);
+  res.json({
+    token,
+    user: {
+      id: user.UserId,
+      username: user.Username,
+      name: user.FullName,
+      email: user.Email || '',
+      phone: user.Phone || '',
+      role: user.Role,
+      mustChangePassword: !!user.MustChangePassword,
+      passwordResetReason: user.PasswordResetReason || null,
+      profileCompleted: user.ProfileCompleted !== false,
+    },
+  });
 });
 
 // Driver login — code + optional PIN. Drivers that have a PinHash MUST send
@@ -468,7 +515,19 @@ app.get('/api/auth/me', (req, res) => {
   if (auth?.startsWith('Bearer ')) {
     try {
       const payload = verifyToken(auth.slice(7));
-      return res.json({ user: payload });
+      // Phase 4a — pull live user record so mustChangePassword and
+      // profileCompleted reflect the latest state, not what was true when
+      // the token was signed.
+      const user = payload.sub != null ? store.getUserById(payload.sub) : null;
+      const enriched = user ? {
+        ...payload,
+        email: user.Email || '',
+        phone: user.Phone || '',
+        mustChangePassword: !!user.MustChangePassword,
+        passwordResetReason: user.PasswordResetReason || null,
+        profileCompleted: user.ProfileCompleted !== false,
+      } : payload;
+      return res.json({ user: enriched });
     } catch {}
   }
   res.status(401).json({ error: 'Not authenticated' });
@@ -514,17 +573,35 @@ app.post('/api/users/me/change-password', async (req, res) => {
   if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = verifyToken(auth.slice(7));
-    const { oldPassword, newPassword } = req.body;
+    const { oldPassword, newPassword } = req.body || {};
     const strength = validatePasswordStrength(newPassword);
     if (!strength.ok) return res.status(400).json({ error: strength.error, code: strength.code });
     const user = store.getUserById(payload.sub);
     if (!user) return res.status(404).json({ error: 'משתמש לא נמצא' });
     const ok = await store.verifyUserPassword(user.Username, oldPassword);
-    if (!ok) return res.status(401).json({ error: 'סיסמה קיימת שגויה' });
-    await store.setUserPassword(user.UserId, newPassword);
+    if (!ok) {
+      store.recordAudit({
+        action: 'password.change.self', actorSub: user.UserId, actorName: user.FullName,
+        targetUserId: user.UserId, success: false, ip: req.ip,
+        details: { reason: 'wrong_old_password' },
+      });
+      return res.status(401).json({ error: 'סיסמה קיימת שגויה' });
+    }
+    // Phase 4a — refuse rotating to the same password the user just typed.
+    if (oldPassword === newPassword) {
+      return res.status(400).json({
+        error: 'הסיסמה החדשה זהה לסיסמה הנוכחית. בחר סיסמה שונה.',
+        code: 'PWD_SAME_AS_OLD',
+      });
+    }
+    await store.setUserPassword(user.UserId, newPassword); // clears MustChangePassword
     // Revoke all earlier tokens for this user so the password rotation
     // actually kicks unauthorized sessions out.
     store.logoutSub(user.UserId);
+    store.recordAudit({
+      action: 'password.change.self', actorSub: user.UserId, actorName: user.FullName,
+      targetUserId: user.UserId, success: true, ip: req.ip,
+    });
     res.json({ ok: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -1475,15 +1552,66 @@ app.patch('/api/users/:id', adminOnly, async (req, res) => {
 });
 
 app.post('/api/users/:id/reset-password', adminOnly, async (req, res) => {
-  const { password } = req.body;
+  const { password } = req.body || {};
   const strength = validatePasswordStrength(password);
   if (!strength.ok) return res.status(400).json({ error: strength.error, code: strength.code });
-  const ok = await store.setUserPassword(req.params.id, password);
+  const target = store.getUserById(req.params.id);
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  // Phase 4a — flag the target so their next login is forced through the
+  // change-password screen with the temp password they were just handed.
+  const ok = await store.setUserPassword(req.params.id, password, {
+    adminInitiated: true, reason: 'admin_reset',
+  });
   if (!ok) return res.status(404).json({ error: 'User not found' });
   // Force logout of any active sessions for the reset user so the rotation
   // is real, not cosmetic.
   store.logoutSub(Number(req.params.id));
-  res.json({ ok: true });
+  store.recordAudit({
+    action: 'password.reset.admin',
+    actorSub: req.user?.sub, actorName: req.user?.name,
+    targetUserId: target.UserId, targetUsername: target.Username,
+    success: true, ip: req.ip,
+  });
+  res.json({ ok: true, mustChangePassword: true });
+});
+
+// Phase 4a — self-service profile update. Only the three fields the user is
+// supposed to fill on their own (FullName / Email / Phone). Role / IsActive
+// / Username stay admin-controlled, edited via /api/users/:id.
+const ProfileUpdateSchema = z.object({
+  fullName: z.string().trim().min(2, 'שם חייב להכיל לפחות 2 תווים').max(100).optional(),
+  email: z.string().trim().email('כתובת מייל לא תקינה').max(200).optional(),
+  phone: z.string().trim().regex(/^[0-9+\-\s()]{7,20}$/, 'מספר טלפון לא תקין').optional(),
+});
+app.patch('/api/users/me/profile', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not authenticated' });
+  let payload;
+  try { payload = verifyToken(auth.slice(7)); }
+  catch (err) {
+    const code = err.code === 'TOKEN_REVOKED' ? 'TOKEN_REVOKED' : undefined;
+    return res.status(401).json({ error: err.message || 'Invalid token', code });
+  }
+  const data = parseBody(ProfileUpdateSchema, req.body, res);
+  if (!data) return;
+  const updated = store.updateUserProfile(payload.sub, data);
+  if (!updated) return res.status(404).json({ error: 'משתמש לא נמצא' });
+  store.recordAudit({
+    action: 'profile.update.self',
+    actorSub: payload.sub, actorName: payload.name,
+    targetUserId: payload.sub, targetUsername: updated.Username,
+    success: true, ip: req.ip,
+    details: { fields: Object.keys(data) },
+  });
+  res.json({
+    ok: true,
+    user: {
+      id: updated.UserId, username: updated.Username, name: updated.FullName,
+      email: updated.Email || '', phone: updated.Phone || '',
+      role: updated.Role,
+      profileCompleted: updated.ProfileCompleted !== false,
+    },
+  });
 });
 
 app.delete('/api/users/:id', adminOnly, (req, res) => {
@@ -3735,7 +3863,17 @@ app.get('/api/reports/waves/:id/picking.pdf', (req, res) => {
 });
 
 // Audit
-app.get('/api/audit/:entityType/:entityId', (_req, res) => res.json({ trail: [] }));
+app.get('/api/audit/:entityType/:entityId', (req, res) => {
+  const { entityType, entityId } = req.params;
+  if (entityType === 'user') {
+    return res.json({ trail: store.getAuditLog({ targetUserId: entityId, limit: 200 }) });
+  }
+  res.json({ trail: [] });
+});
+// Admin-only: full audit log scan, optionally filtered by action prefix.
+app.get('/api/audit', adminOnly, (req, res) => {
+  res.json({ trail: store.getAuditLog({ action: req.query.action, limit: Number(req.query.limit) || 200 }) });
+});
 
 // System — exposes the live public base URL so the frontend can build
 // QR/install links that work outside the operator's laptop. The frontend

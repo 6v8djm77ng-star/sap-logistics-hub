@@ -17,8 +17,16 @@ export default function LoginPage() {
     try {
       const data = await authApi.login(username, password);
       setAuth({ user: data.user, token: data.token });
-      toast.success(`שלום ${data.user.name}`);
-      navigate('/');
+      // Phase 4a — users flagged for password rotation bounce straight to
+      // the force-change screen. AuthGuard would catch them on the next
+      // route anyway, but this avoids a flash of the dashboard.
+      if (data.user?.mustChangePassword) {
+        toast.info('יש להחליף את הסיסמה כדי להמשיך');
+        navigate('/force-change-password', { replace: true });
+      } else {
+        toast.success(`שלום ${data.user.name}`);
+        navigate('/');
+      }
     } catch (err) {
       toast.error('שם משתמש או סיסמה שגויים');
     } finally {

@@ -253,10 +253,14 @@ export function clearDriverPin(driverId) {
 // "subject" follows the JWT sub claim: integer UserId for ADMIN/users,
 // `picker-N` for pickers, `driver-N` for drivers.
 // ============================================================================
+// Store cutoff at now+1 so a token issued in the SAME second as the logout
+// call is still revoked (JWT iat resolution is 1 second). The login handler
+// below explicitly lowers the cutoff back to (new iat - 1) after minting a
+// fresh token so the legitimate new token survives — but only that one.
 export function logoutSub(sub) {
   const s = load();
   if (!s.tokenRevocations) s.tokenRevocations = {};
-  s.tokenRevocations[String(sub)] = Math.floor(Date.now() / 1000);
+  s.tokenRevocations[String(sub)] = Math.floor(Date.now() / 1000) + 1;
   save();
   return true;
 }
@@ -267,6 +271,102 @@ export function isSubRevoked(sub, tokenIat) {
   const cutoff = s.tokenRevocations?.[String(sub)];
   if (!cutoff) return false;
   return Number(tokenIat) < Number(cutoff);
+}
+
+/**
+ * Called by the login handler immediately after a fresh token is signed.
+ * Lowers the per-sub revocation cutoff to (tokenIat - 1) so:
+ *   - the new token itself is NOT revoked (iat > cutoff)
+ *   - any token issued before the new one IS revoked (older iat < cutoff)
+ * Only lowers; never raises (so a future logout that bumped the cutoff
+ * forward stays in effect).
+ */
+export function admitFreshToken(sub, tokenIat) {
+  const s = load();
+  if (!s.tokenRevocations) return;
+  const existing = s.tokenRevocations[String(sub)];
+  if (existing == null) return;
+  const target = Number(tokenIat) - 1;
+  if (existing > target) {
+    s.tokenRevocations[String(sub)] = target;
+    save();
+  }
+}
+
+// ============================================================================
+// Audit log — in-memory ring buffer kept on store.json. Stores the last 1000
+// events. Used by the auth + password endpoints; consumed by /api/audit.
+// ============================================================================
+const AUDIT_LOG_MAX = 1000;
+
+export function recordAudit(event) {
+  const s = load();
+  if (!s.auditLog) s.auditLog = [];
+  s.auditLog.push({
+    ts: new Date().toISOString(),
+    action: event.action,
+    actorSub: event.actorSub ?? null,
+    actorName: event.actorName ?? null,
+    targetUserId: event.targetUserId ?? null,
+    targetUsername: event.targetUsername ?? null,
+    success: event.success !== false,
+    ip: event.ip ?? null,
+    details: event.details ?? null,
+  });
+  if (s.auditLog.length > AUDIT_LOG_MAX) {
+    s.auditLog.splice(0, s.auditLog.length - AUDIT_LOG_MAX);
+  }
+  save();
+}
+
+export function getAuditLog({ targetUserId, action, limit = 200 } = {}) {
+  const s = load();
+  let rows = s.auditLog || [];
+  if (targetUserId != null) rows = rows.filter((r) => r.targetUserId === Number(targetUserId));
+  if (action) rows = rows.filter((r) => r.action === action);
+  return rows.slice(-Number(limit)).reverse();
+}
+
+// ============================================================================
+// Phase 4a migration — runs once on startup. Idempotent.
+//   - Adds MustChangePassword / PasswordResetReason / ProfileCompleted to
+//     every user that doesn't have them.
+//   - ProfileCompleted is computed from FullName + Email + Phone presence.
+//   - Sets moti's Email to moti@oig.co.il if it's empty (per operator ask).
+// ============================================================================
+function _isProfileComplete(user) {
+  return !!(user.FullName?.trim() && user.Email?.trim() && user.Phone?.trim());
+}
+
+export function migrateUsersPhase4a() {
+  const s = load();
+  if (!s.users) return { updated: 0 };
+  let updated = 0;
+
+  for (const u of s.users) {
+    let touched = false;
+    if (u.MustChangePassword === undefined) {
+      u.MustChangePassword = false;
+      touched = true;
+    }
+    if (u.PasswordResetReason === undefined) {
+      u.PasswordResetReason = null;
+      touched = true;
+    }
+    // Backfill: moti gets moti@oig.co.il if no Email
+    if (u.Username === 'moti' && !u.Email) {
+      u.Email = 'moti@oig.co.il';
+      touched = true;
+    }
+    const complete = _isProfileComplete(u);
+    if (u.ProfileCompleted !== complete) {
+      u.ProfileCompleted = complete;
+      touched = true;
+    }
+    if (touched) updated++;
+  }
+  if (updated) save();
+  return { updated };
 }
 
 // Same shape for drivers (the demoServer also has a passwordless code-only
@@ -335,7 +435,13 @@ export async function addUser(data) {
     PasswordHash: passwordHash,
     LastLoginAt: null,
     CreatedAt: new Date().toISOString(),
+    // Phase 4a: new users created via admin get a temp password and must
+    // rotate it on first login. Profile completeness flag is computed below.
+    MustChangePassword: !!data.password,
+    PasswordResetReason: data.password ? 'admin_reset' : null,
+    PasswordChangedAt: data.password ? new Date().toISOString() : null,
   };
+  newUser.ProfileCompleted = _isProfileComplete(newUser);
   store.users.push(newUser);
   save();
   const { PasswordHash, ...safe } = newUser;
@@ -359,18 +465,61 @@ export async function updateUser(id, updates) {
   for (const [from, to] of Object.entries(map)) {
     if (updates[from] !== undefined) user[to] = updates[from];
   }
+  // Recompute profile completeness after any field change.
+  user.ProfileCompleted = _isProfileComplete(user);
   save();
   const { PasswordHash, ...safe } = user;
   return safe;
 }
 
-export async function setUserPassword(id, newPassword) {
+/**
+ * Self-service profile update — only the three fields the user is supposed
+ * to fill themselves. Role / IsActive / Username stay admin-controlled.
+ */
+export function updateUserProfile(id, updates) {
+  const store = load();
+  const user = store.users.find((u) => u.UserId === Number(id));
+  if (!user) return null;
+  const map = { fullName: 'FullName', email: 'Email', phone: 'Phone' };
+  for (const [from, to] of Object.entries(map)) {
+    if (typeof updates[from] === 'string') user[to] = updates[from].trim();
+  }
+  user.ProfileCompleted = _isProfileComplete(user);
+  save();
+  const { PasswordHash, ...safe } = user;
+  return safe;
+}
+
+/**
+ * Set a user's password. `options.adminInitiated=true` flags the user as
+ * MustChangePassword so the next login forces a rotation through the
+ * force-change-password screen. Self-service rotations clear the flag.
+ */
+export async function setUserPassword(id, newPassword, options = {}) {
   const store = load();
   const user = store.users.find((u) => u.UserId === Number(id));
   if (!user) return false;
   user.PasswordHash = await bcrypt.hash(newPassword, 10);
+  user.PasswordChangedAt = new Date().toISOString();
+  if (options.adminInitiated) {
+    user.MustChangePassword = true;
+    user.PasswordResetReason = options.reason || 'admin_reset';
+  } else {
+    user.MustChangePassword = false;
+    user.PasswordResetReason = null;
+  }
   save();
   return true;
+}
+
+/**
+ * Same-password check — used by /change-password to refuse rotating to
+ * the current password.
+ */
+export async function isCurrentPassword(id, plainPassword) {
+  const user = getUserById(id);
+  if (!user?.PasswordHash) return false;
+  return bcrypt.compare(plainPassword, user.PasswordHash);
 }
 
 export function deleteUser(id, requesterId) {

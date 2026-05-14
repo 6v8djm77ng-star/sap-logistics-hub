@@ -10,12 +10,137 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { sapApi, settingsApi } from '../services/api.js';
+import api from '../services/api.js';
+import { useAuthStore } from '../stores/auth.js';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
 import {
   Database, Server, CheckCircle, XCircle, AlertCircle, RefreshCw,
   Settings as SettingsIcon, Building2, Eye, ChevronDown, ChevronUp, Package, User, ShoppingCart,
+  KeyRound, UserCircle,
 } from 'lucide-react';
+
+// Phase 4a — self-service account section. Lives at the top of Settings so
+// any user (not just admin) sees it. Two cards: change password, edit
+// profile. Both write through /api/users/me/* with the user's own token.
+function AccountSection() {
+  const { user, setAuth, logout } = useAuthStore();
+  const [oldPwd, setOldPwd] = useState('');
+  const [newPwd, setNewPwd] = useState('');
+  const [confirmPwd, setConfirmPwd] = useState('');
+  const [fullName, setFullName] = useState(user?.name || '');
+  const [email, setEmail] = useState(user?.email || '');
+  const [phone, setPhone] = useState(user?.phone || '');
+
+  const changePwd = useMutation({
+    mutationFn: () => api.post('/users/me/change-password', {
+      oldPassword: oldPwd, newPassword: newPwd,
+    }).then((r) => r.data),
+    onSuccess: () => {
+      toast.success('הסיסמה הוחלפה. התחבר/י מחדש.');
+      setTimeout(() => { logout(); window.location.href = '/login'; }, 800);
+    },
+    onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בהחלפת הסיסמה'),
+  });
+
+  const updateProfile = useMutation({
+    mutationFn: () => api.patch('/users/me/profile', { fullName, email, phone }).then((r) => r.data),
+    onSuccess: (data) => {
+      toast.success('הפרטים עודכנו');
+      setAuth({ user: { ...user, ...data.user }, token: localStorage.getItem('token') });
+    },
+    onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בעדכון הפרטים'),
+  });
+
+  const PWD_RULES = [
+    { test: (p) => p.length >= 10, label: '10+ תווים' },
+    { test: (p) => /[A-Za-z֐-׿]/.test(p), label: 'אות' },
+    { test: (p) => /\d/.test(p), label: 'ספרה' },
+    { test: (p) => /[^A-Za-z0-9֐-׿]/.test(p), label: 'תו מיוחד' },
+  ];
+  const pwdValid = PWD_RULES.every((r) => r.test(newPwd)) && newPwd === confirmPwd && newPwd !== oldPwd;
+
+  return (
+    <div className="grid md:grid-cols-2 gap-4 mb-6">
+      <div className="border-2 border-gray-200 rounded-2xl p-5 bg-white">
+        <div className="flex items-center gap-2 mb-3">
+          <KeyRound size={20} className="text-brand-600" />
+          <h3 className="font-bold">החלפת סיסמה</h3>
+        </div>
+        <div className="space-y-2">
+          <input
+            type="password" placeholder="סיסמה נוכחית" value={oldPwd}
+            onChange={(e) => setOldPwd(e.target.value)} autoComplete="current-password"
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+          />
+          <input
+            type="password" placeholder="סיסמה חדשה" value={newPwd}
+            onChange={(e) => setNewPwd(e.target.value)} autoComplete="new-password"
+            className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+          />
+          <input
+            type="password" placeholder="אימות סיסמה חדשה" value={confirmPwd}
+            onChange={(e) => setConfirmPwd(e.target.value)} autoComplete="new-password"
+            className={`w-full px-3 py-2 border rounded-lg text-sm ${
+              confirmPwd && confirmPwd !== newPwd ? 'border-red-400' : 'border-gray-300'
+            }`}
+          />
+          <ul className="text-[10px] flex flex-wrap gap-x-2 gap-y-0.5 text-gray-500">
+            {PWD_RULES.map((r, i) => (
+              <li key={i} className={r.test(newPwd) ? 'text-green-700' : ''}>
+                {r.test(newPwd) ? '✓' : '○'} {r.label}
+              </li>
+            ))}
+          </ul>
+          <button
+            onClick={() => changePwd.mutate()}
+            disabled={!oldPwd || !pwdValid || changePwd.isPending}
+            className="w-full mt-2 px-3 py-2 bg-brand-600 text-white rounded-lg text-sm font-bold disabled:opacity-50"
+          >
+            {changePwd.isPending ? 'מעדכן...' : 'החלף סיסמה'}
+          </button>
+        </div>
+      </div>
+
+      <div className="border-2 border-gray-200 rounded-2xl p-5 bg-white">
+        <div className="flex items-center gap-2 mb-3">
+          <UserCircle size={20} className="text-brand-600" />
+          <h3 className="font-bold">פרטים אישיים</h3>
+        </div>
+        <div className="space-y-2">
+          <div>
+            <label className="text-xs text-gray-500">שם מלא</label>
+            <input
+              type="text" value={fullName} onChange={(e) => setFullName(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">מייל</label>
+            <input
+              type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+          <div>
+            <label className="text-xs text-gray-500">טלפון נייד</label>
+            <input
+              type="tel" value={phone} onChange={(e) => setPhone(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
+          </div>
+          <button
+            onClick={() => updateProfile.mutate()}
+            disabled={updateProfile.isPending}
+            className="w-full mt-2 px-3 py-2 bg-brand-600 text-white rounded-lg text-sm font-bold disabled:opacity-50"
+          >
+            {updateProfile.isPending ? 'מעדכן...' : 'שמור פרטים'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function CheckCard({ title, check, icon: Icon, onRetry }) {
   const [expanded, setExpanded] = useState(false);
@@ -300,7 +425,10 @@ export default function SettingsPage() {
       <h1 className="text-2xl font-bold mb-1 flex items-center gap-2">
         <SettingsIcon /> הגדרות מערכת
       </h1>
-      <p className="text-sm text-gray-500 mb-6">חיבור SAP, הגדרות כלליות וטרבלשוטינג</p>
+      <p className="text-sm text-gray-500 mb-6">חשבון, חיבור SAP, הגדרות כלליות וטרבלשוטינג</p>
+
+      {/* Phase 4a — self-service account section. Shown to every signed-in user. */}
+      <AccountSection />
 
       {/* SAP Connection Status */}
       <div className={`border-2 rounded-2xl p-5 mb-6 bg-${statusColor}-50 border-${statusColor}-300`}>

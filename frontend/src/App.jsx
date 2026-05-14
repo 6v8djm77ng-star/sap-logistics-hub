@@ -40,6 +40,7 @@ import PickersPage from './pages/PickersPage.jsx';
 import DavoMixPage from './pages/DavoMixPage.jsx';
 import DriverRunsPage from './pages/driver/DriverRunsPage.jsx';
 import DriverManifestPage from './pages/driver/DriverManifestPage.jsx';
+import ForceChangePasswordPage from './pages/ForceChangePasswordPage.jsx';
 import { useEffect } from 'react';
 import { initAutoFlush } from './services/offlineQueue.js';
 
@@ -49,6 +50,12 @@ function RequireAuth({ children, roles }) {
 
   if (!token || !user) {
     return <Navigate to="/login" state={{ from: location }} replace />;
+  }
+  // Phase 4a — hard gate: a user with mustChangePassword=true can only
+  // visit the force-change-password screen until they rotate. Drivers go
+  // through the mobile flow (no DRIVER role hits this for now).
+  if (user.mustChangePassword && location.pathname !== '/force-change-password') {
+    return <Navigate to="/force-change-password" replace />;
   }
   if (roles && !roles.includes(user.role)) {
     return <Navigate to="/" replace />;
@@ -65,6 +72,14 @@ export default function App() {
     <Routes>
       {/* Public */}
       <Route path="/login" element={<LoginPage />} />
+      <Route
+        path="/force-change-password"
+        element={
+          <RequireAuth>
+            <ForceChangePasswordPage />
+          </RequireAuth>
+        }
+      />
       <Route path="/driver/login" element={<DriverLoginPage />} />
       <Route path="/m/:code" element={<AutoLoginPage />} />
       <Route path="/pick/:code" element={<PickerAutoLoginPage />} />
