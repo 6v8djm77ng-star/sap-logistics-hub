@@ -13,7 +13,142 @@ import {
 
 const analyticsApi = {
   summary: (params) => api.get('/analytics/summary', { params }).then((r) => r.data),
+  salesMtdYoy: () => api.get('/analytics/sales-mtd-yoy').then((r) => r.data),
 };
+
+// ----------------------------------------------------------------------------
+// MTD vs prior-year-MTD sales comparison.
+// Data comes from /api/analytics/sales-mtd-yoy which pulls OINV.DocDate
+// invoices for [1st of this month → today] vs the same window one year ago.
+// 3×3 table: rows (סה"כ / OIG / UNICO) × cols (revenue / count / avg).
+// ----------------------------------------------------------------------------
+function formatNis(n) {
+  const num = Number(n || 0);
+  if (Math.abs(num) >= 1_000_000) return `₪${(num / 1_000_000).toFixed(2)}M`;
+  if (Math.abs(num) >= 1_000) return `₪${(num / 1_000).toFixed(1)}K`;
+  return `₪${Math.round(num).toLocaleString('he-IL')}`;
+}
+function formatInt(n) { return Number(n || 0).toLocaleString('he-IL'); }
+function formatPct(pct) {
+  if (pct == null) return '—';
+  const sign = pct >= 0 ? '+' : '';
+  return `${sign}${pct.toFixed(1)}%`;
+}
+
+function DeltaBlock({ deltaAbs, deltaPct, format }) {
+  if (deltaPct == null && deltaAbs === 0) {
+    return <div className="text-[11px] text-gray-400">—</div>;
+  }
+  const positive = deltaAbs > 0;
+  const color = deltaAbs === 0 ? 'text-gray-500'
+    : positive ? 'text-green-700' : 'text-red-700';
+  const arrow = deltaAbs === 0 ? '' : positive ? '↑' : '↓';
+  const fmt = format === 'currency' ? formatNis : formatInt;
+  return (
+    <div className={`text-[11px] ${color} mt-0.5`}>
+      <span>{arrow} {fmt(Math.abs(deltaAbs))}</span>
+      <span className="mx-1 opacity-50">·</span>
+      <span>{arrow} {formatPct(deltaPct)}</span>
+    </div>
+  );
+}
+
+function MtdCell({ current, prior, delta, format }) {
+  const fmt = format === 'currency' ? formatNis : formatInt;
+  return (
+    <td className="px-3 py-2 align-top">
+      <div className="text-sm font-semibold text-gray-900">{fmt(current)}</div>
+      <div className="text-[11px] text-gray-500">אשתקד: {fmt(prior)}</div>
+      <DeltaBlock deltaAbs={delta.abs} deltaPct={delta.pct} format={format} />
+    </td>
+  );
+}
+
+function MtdRow({ label, dataObj }) {
+  return (
+    <tr className="border-t border-gray-200">
+      <th className="px-3 py-2 text-right text-sm font-medium text-gray-700 align-top w-24">{label}</th>
+      <MtdCell current={dataObj.current.revenue}         prior={dataObj.prior.revenue}         delta={dataObj.delta.revenue}         format="currency" />
+      <MtdCell current={dataObj.current.invoiceCount}    prior={dataObj.prior.invoiceCount}    delta={dataObj.delta.invoiceCount}    format="number" />
+      <MtdCell current={dataObj.current.avgInvoiceValue} prior={dataObj.prior.avgInvoiceValue} delta={dataObj.delta.avgInvoiceValue} format="currency" />
+    </tr>
+  );
+}
+
+function SalesMtdYoySection() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['sales-mtd-yoy'],
+    queryFn: analyticsApi.salesMtdYoy,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
+        <h2 className="text-lg font-semibold mb-1">השוואת מכירות MTD מול שנה קודמת</h2>
+        <div className="animate-pulse mt-4 h-32 bg-gray-100 rounded" />
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="bg-white border border-red-200 rounded-xl p-5 mb-6">
+        <h2 className="text-lg font-semibold mb-1">השוואת מכירות MTD מול שנה קודמת</h2>
+        <p className="text-sm text-red-600 mt-2">שגיאה בטעינת הנתונים: {error.message}</p>
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  const isEmpty = data.totals.current.invoiceCount === 0 && data.totals.prior.invoiceCount === 0;
+  const oig = data.byCompany.find((c) => c.companyCode === 'A')
+    || { current: { revenue: 0, invoiceCount: 0, avgInvoiceValue: 0 }, prior: { revenue: 0, invoiceCount: 0, avgInvoiceValue: 0 }, delta: { revenue: { abs: 0, pct: null }, invoiceCount: { abs: 0, pct: null }, avgInvoiceValue: { abs: 0, pct: null } } };
+  const unico = data.byCompany.find((c) => c.companyCode === 'B') || oig;
+
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            <TrendingUp size={18} className="text-purple-600" />
+            השוואת מכירות MTD מול שנה קודמת
+          </h2>
+          <p className="text-xs text-gray-500 mt-1">
+            {data.currentPeriod.label} מול {data.priorPeriod.label}
+          </p>
+        </div>
+        <div className="text-[10px] text-gray-400">מקור: {data.source}</div>
+      </div>
+      {data.warnings?.length > 0 && (
+        <div className="mb-3 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+          ⚠️ {data.warnings.join(' · ')}
+        </div>
+      )}
+      {isEmpty ? (
+        <div className="text-sm text-gray-500 py-4 text-center">
+          אין נתוני מכירות בשתי התקופות.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50">
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-500 w-24"></th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-500">מחזור</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-500">חשבוניות</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-gray-500">ממ' חשבונית</th>
+              </tr>
+            </thead>
+            <tbody>
+              <MtdRow label="סה״כ" dataObj={data.totals} />
+              <MtdRow label="OIG"  dataObj={oig} />
+              <MtdRow label="UNICO" dataObj={unico} />
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function KpiCard({ icon: Icon, label, value, sub, color = 'blue', trend = null }) {
   return (
@@ -170,6 +305,9 @@ export default function AnalyticsPage() {
           value={syncHealth.PendingDeliveryNotes === 0 ? '✓' : `${syncHealth.PendingDeliveryNotes} ממתינים`}
           sub={`${syncHealth.SyncedDeliveryNotes} סונכרנו · ${syncHealth.QueueBacklog} בתור`} />
       </div>
+
+      {/* MTD vs prior-year-MTD sales comparison */}
+      <SalesMtdYoySection />
 
       {/* Daily trend */}
       <div className="bg-white border border-gray-200 rounded-xl p-5 mb-6">
