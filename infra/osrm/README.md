@@ -122,18 +122,59 @@ Behaviour:
 → Out of RAM. Close Chrome / Office / other heavy apps and rerun
 `docker compose up -d osrm-prepare`. Initial build peak is ~2-3 GB.
 
-**Backend logs "Google Maps Distance Matrix נכשל"**
-→ Stale logs from before OSRM migration. Restart sap-logistics PM2:
-`pm2 restart sap-logistics --update-env`.
+**Backend logs "OSRM נכשל"**
+→ OSRM not running or unreachable. Check `docker compose ps` from
+`infra/osrm/`. The container should show `Up`. If it shows `Exited`,
+run `docker compose logs osrm` for the underlying error. (Note: there
+is no Docker healthcheck on the container — the image is FROM scratch
+and has no shell or wget, so liveness can only be probed from the host
+via `curl http://localhost:5000/route/...`.)
 
-**Backend logs "OSRM אופטימיזציה נכשלה"**
-→ OSRM not running. Check `docker compose ps`. If the `osrm` container
-shows `unhealthy`, check `docker compose logs osrm` for the underlying
-error.
+**Backend returns HTTP 422 with code `MISSING_OSRM_URL`**
+→ `OSRM_BASE_URL` is not set in `backend/.env`. Add the line
+`OSRM_BASE_URL=http://localhost:5000` and run
+`pm2 restart sap-logistics --update-env`.
 
 **`curl http://localhost:5000/...` returns "connection refused"**
 → Docker Desktop isn't running. Open Docker Desktop from the Start menu.
 The `unless-stopped` restart policy will bring OSRM up once Docker is up.
+
+## Recovery after a Windows restart
+
+Normally OSRM comes back on its own after a reboot:
+  - Docker Desktop has `Start Docker Desktop when you sign in` enabled
+    (Settings → General). It boots in the background ~30-60s after
+    sign-in.
+  - The `osrm` container has `restart: unless-stopped`, so Docker
+    auto-starts it as soon as the engine is up.
+
+If it didn't come back automatically (the optimize button returns 502
+"OSRM נכשל"), recover with one of these in order of cost:
+
+```powershell
+# 1. Make sure Docker Desktop is running
+Get-Process "Docker Desktop" -ErrorAction SilentlyContinue
+# If empty: start it from Start menu, wait for the tray icon to go green
+#          ("Engine running"), then re-test.
+
+# 2. From a normal PowerShell (not admin), bring the stack back up
+cd "$env:USERPROFILE\OneDrive - OIG\שולחן העבודה\cowork\sap-logistics-hub\infra\osrm"
+docker compose up -d
+docker compose ps   # both services should be 'running' or 'exited(0)'
+
+# 3. Smoke check OSRM directly
+curl 'http://localhost:5000/route/v1/driving/34.7818,32.0853;35.2137,31.7683'
+# expect routes[0].distance ~= 65000
+
+# 4. Backend doesn't need a restart — it talks to OSRM on every request,
+# so once OSRM is up, the optimize button works again. Only restart PM2
+# if you also edited OSRM_BASE_URL in .env:
+#   pm2 restart sap-logistics --update-env
+```
+
+If `docker compose up -d` complains that the `osrm-prepare` graphs are
+missing, the data volume was wiped — re-download the PBF and rerun the
+first-time setup at the top of this file.
 
 ## Profile choice (car.lua)
 

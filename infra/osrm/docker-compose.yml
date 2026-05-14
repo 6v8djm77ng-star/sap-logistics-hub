@@ -88,12 +88,11 @@ services:
       # this port to LAN/internet would let anyone hit the routing API.
       - "127.0.0.1:5000:5000"
     restart: unless-stopped
-    healthcheck:
-      # /nearest is the cheapest read endpoint. The coords are roughly
-      # Tel Aviv center; if OSRM cannot match a Tel Aviv coord to the
-      # graph, something is broken.
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/nearest/v1/driving/34.78,32.08"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+    # No HEALTHCHECK directive on purpose: the osrm/osrm-backend image is
+    # FROM scratch and ships only the osrm-routed binary — no wget, curl,
+    # or shell available for an in-container probe. The container's only
+    # process IS osrm-routed; if it crashes, the container exits and
+    # `restart: unless-stopped` recovers it. Liveness from the outside
+    # is best checked via `curl http://localhost:5000/route/...` from
+    # the host (or from the Node backend, which surfaces failures as
+    # HTTP 502 with code OSRM_API_FAILED — see backend/src/demo/demoServer.js).

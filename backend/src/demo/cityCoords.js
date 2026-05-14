@@ -8,10 +8,13 @@
  *
  * This file exists only so the route-optimize endpoint stops returning
  * 400 in the pilot environment where stops have no stored Latitude /
- * Longitude. Before production, replace with one of:
- *   - Google Maps Distance Matrix API (per-request cost, accurate roads)
- *   - OSRM / Valhalla self-hosted (free, requires hosting)
- *   - A proper geocoding pass at order ingestion time (one-shot, cached)
+ * Longitude. The endpoint still falls back to these city centroids
+ * when a stop has no stored coords, even though the actual road
+ * distances are computed by self-hosted OSRM (see infra/osrm/).
+ *
+ * Long-term fix: run a proper geocoding pass at order ingestion time
+ * (one-shot, cached per address) so every stop carries real lat/lng,
+ * and `resolveStopLatLng` never needs the centroid fallback.
  *
  * Lookup is forgiving: noisy values like "טירת הכרמל 39026/22" or
  * 'ראשל"צ' still match the canonical key. See resolveStopLatLng() for

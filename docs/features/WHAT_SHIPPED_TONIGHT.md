@@ -17,8 +17,10 @@
 הוסף ב-`backend/.env`:
 
 ```
-# אופטימיזציית מסלולים אמיתית (#1) - האפי קובע מרחק כביש אמיתי
-GOOGLE_MAPS_API_KEY=AIza...
+# אופטימיזציית מסלולים אמיתית (#1) - מחשבת מרחק כביש דרך OSRM מקומי.
+# DEPRECATED: לא משתמשים יותר ב-Google Maps. ראה infra/osrm/README.md
+# להפעלת ה-container, ואז להגדיר:
+OSRM_BASE_URL=http://localhost:5000
 
 # כתיבה ל-SAP (#4) - השאר false עד שתבדוק שה-DRY-RUN נראה תקין
 SAP_SERVICE_LAYER_URL=https://192.168.0.220:50000/b1s/v1
