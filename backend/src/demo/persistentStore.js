@@ -1644,17 +1644,37 @@ export function createWaveFromLines(runId, orderLines) {
   // wave covers multiple stops).
   const stopsInRun = (s.stops || []).filter((st) => st.RunId === run.RunId);
   const stopById = new Map(stopsInRun.map((st) => [st.StopId, st]));
-  const docToCustomer = new Map(); // 'A:42150' -> { city, branchName, cardName }
+  const docToCustomer = new Map(); // 'A:42150' -> { stopId, stopOrder, city, branchName, cardName }
   for (const ord of (s.runOrders || [])) {
     const stop = stopById.get(ord.StopId);
     if (!stop) continue;
     const key = `${ord.CompanyCode}:${ord.SapDocEntry}`;
     docToCustomer.set(key, {
+      // StopId/StopOrder are needed for the BY_CUSTOMER aggregation key below —
+      // see the byItem loop. Without them, the same item ordered by N customers
+      // collapses into one wave line with N allocations, which contradicts the
+      // "one physical box per customer" semantics of BY_CUSTOMER mode.
+      stopId: stop.StopId,
+      stopOrder: stop.StopOrder || 0,
       city: stop.City || '',
       branchName: stop.BranchName || ord.SapCardName || '',
       cardName: ord.SapCardName || '',
     });
   }
+
+  // Pallet mode decides how lines aggregate inside this wave:
+  //   SINGLE / BY_PALLET  → aggregate by ItemCode only. The picker walks
+  //                         the warehouse ONCE per SKU and then splits the
+  //                         total across customers at the end. Existing
+  //                         behaviour, unchanged.
+  //   BY_CUSTOMER         → aggregate by (ItemCode, StopId). The same SKU
+  //                         ordered by two customers produces TWO wave
+  //                         lines, one per customer, so each line is a
+  //                         single physical box. Without this split, the
+  //                         picker can see a line headered "Customer A" but
+  //                         containing quantities meant for Customer B/C —
+  //                         which is the bug this branch fixes.
+  const palletMode = run.PalletMode || 'SINGLE';
 
   // Cancel any existing active wave for this run
   for (const w of s.waves) {
@@ -1681,12 +1701,17 @@ export function createWaveFromLines(runId, orderLines) {
   };
   s.waves.push(newWave);
 
-  // Aggregate lines by ItemCode
+  // Aggregate lines by ItemCode (SINGLE/BY_PALLET) or (ItemCode, StopId)
+  // (BY_CUSTOMER). See the palletMode comment above the docToCustomer loop.
   const byItem = new Map();
   for (const line of orderLines) {
-    const key = line.ItemCode;
-    if (!byItem.has(key)) {
-      byItem.set(key, {
+    const cust = docToCustomer.get(`${line.CompanyCode}:${line.DocEntry}`) || {};
+    const stopId = cust.stopId != null ? cust.stopId : 'NO_STOP';
+    const aggKey = palletMode === 'BY_CUSTOMER'
+      ? `${line.ItemCode}|${stopId}`
+      : line.ItemCode;
+    if (!byItem.has(aggKey)) {
+      byItem.set(aggKey, {
         ItemCode: line.ItemCode,
         ItemName: line.ItemName,
         Barcode: line.Barcode || null,
@@ -1696,15 +1721,20 @@ export function createWaveFromLines(runId, orderLines) {
         Allocations: [],
       });
     }
-    const agg = byItem.get(key);
+    const agg = byItem.get(aggKey);
     agg.TotalQuantity += Number(line.OpenQty || line.Quantity || 0);
-    const cust = docToCustomer.get(`${line.CompanyCode}:${line.DocEntry}`) || {};
     agg.Allocations.push({
       CompanyCode: line.CompanyCode,
       DocEntry: line.DocEntry,
       DocNum: line.DocNum,
       LineNum: line.LineNum,
       CardName: line.CardName,
+      // StopId/StopOrder used by PickingPage.jsx groupKey + sort to keep
+      // BY_CUSTOMER groups stable across rerenders. They were already
+      // captured here implicitly via City/BranchName, but those aren't
+      // unique — see the linked bug in cowork/INCIDENTS.md.
+      StopId: cust.stopId != null ? cust.stopId : null,
+      StopOrder: cust.stopOrder || 0,
       // City + branch enrich the allocation so the picker sees who/where
       City: cust.city || '',
       BranchName: cust.branchName || '',
