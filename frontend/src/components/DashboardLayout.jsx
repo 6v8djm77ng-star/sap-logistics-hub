@@ -52,20 +52,24 @@ const workflowSection = [
   { to: '/runs',       label: 'מסלולי הפצה',     icon: Truck },
   { to: '/warehouse',  label: 'ליקוט מחסן',      icon: Warehouse },
   { to: '/documents',  label: 'תעודות וחשבוניות', icon: FileText, highlight: true },
-  { to: '/map',        label: 'מפת נהגים',       icon: Map },
   { to: '/live',       label: 'מעקב חי',         icon: Activity },
   { to: '/returns',    label: 'חזרות',           icon: RotateCcw },
   { to: '/exceptions', label: 'חריגים',          icon: AlertTriangle },
   { to: '/anomalies',  label: 'זיהוי חריגים',    icon: Eye, highlight: true },
-  { to: '/cod',        label: 'תשלום במזומן',    icon: Banknote },
   { to: '/closure',    label: 'סגירת יום',       icon: BarChart3 },
 ];
 
+// Reports section now includes /map (driver live map) and /cod (cash-on-
+// delivery summary) — both moved out of the daily workflow because they're
+// view-only "look at what's happening" screens, not steps the planner walks
+// through in order. Reordered so that the day-to-day analytics come first.
 const reportsSection = [
   { to: '/analytics',   label: 'ניתוח ביצועים',  icon: BarChart3 },
   { to: '/weekly',      label: 'דוח שבועי',      icon: BarChart3 },
   { to: '/leaderboard', label: 'ביצועי נהגים',   icon: Trophy },
   { to: '/failures',    label: 'ניהול כשלים',    icon: AlertOctagon, highlight: true },
+  { to: '/map',         label: 'מפת נהגים',      icon: Map },
+  { to: '/cod',         label: 'תשלום במזומן',   icon: Banknote },
 ];
 
 const settingsSection = [

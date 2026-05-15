@@ -12,6 +12,8 @@ import { Link, useLocation } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
 
 // Workflow order — matches the sidebar's top section. Keep in sync.
+// /map and /cod were removed and moved to the reports section — they're
+// view-only screens, not workflow steps.
 const WORKFLOW_ORDER = [
   { to: '/',           label: 'דשבורד' },
   { to: '/orders',     label: 'הזמנות SAP' },
@@ -19,12 +21,10 @@ const WORKFLOW_ORDER = [
   { to: '/runs',       label: 'מסלולי הפצה' },
   { to: '/warehouse',  label: 'ליקוט מחסן' },
   { to: '/documents',  label: 'תעודות וחשבוניות' },
-  { to: '/map',        label: 'מפת נהגים' },
   { to: '/live',       label: 'מעקב חי' },
   { to: '/returns',    label: 'חזרות' },
   { to: '/exceptions', label: 'חריגים' },
   { to: '/anomalies',  label: 'זיהוי חריגים' },
-  { to: '/cod',        label: 'תשלום במזומן' },
   { to: '/closure',    label: 'סגירת יום' }, // last — no "next"
 ];
 
