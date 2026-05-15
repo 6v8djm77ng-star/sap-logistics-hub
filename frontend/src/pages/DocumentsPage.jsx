@@ -157,52 +157,6 @@ export default function DocumentsPage() {
     },
   });
 
-  // Auto write to SAP — replaces the old manual "type DocEntry by hand"
-  // dialog. We send dryRun:false, but the backend will fall back to dry-run
-  // when SAP_WRITE_ENABLED is not 'true' (current state), so this is safe
-  // to ship in Phase A2a — no real SAP documents will be created until
-  // ops flips SAP_WRITE_ENABLED on the test DB (Phase A2c).
-  const writeToSapMutation = useMutation({
-    mutationFn: async ({ doc, type }) => {
-      const id = type === 'invoice' ? doc.InvoiceId : doc.DeliveryNoteId;
-      const endpoint = type === 'invoice' ? 'invoice' : 'delivery-note';
-      const { data } = await api.post(`/sap/write/${endpoint}/${id}`, { dryRun: false });
-      return { ...data, doc, type };
-    },
-    onSuccess: (result) => {
-      const docNum = result.doc.DocNumber;
-      if (result.dryRun) {
-        // SAP_WRITE_ENABLED=false (or SL URL missing). Payload was built
-        // and logged to backend/logs/sap-writes.log; nothing reached SAP.
-        const reason = result.reason === 'SAP_WRITE_ENABLED is not true'
-          ? 'הכתיבה ל-SAP מושבתת'
-          : result.reason === 'SAP_SERVICE_LAYER_URL not configured'
-            ? 'SAP Service Layer לא מוגדר'
-            : 'מצב בדיקה';
-        toast.info(
-          `🟡 ${docNum} — Payload נבדק (dry-run)\n${reason}. תעודה לא נוצרה ב-SAP.`,
-          { duration: 6000 }
-        );
-      } else if (result.sapDocEntry) {
-        toast.success(
-          `✅ ${docNum} נוצרה ב-SAP\nDocEntry: ${result.sapDocEntry}${result.sapDocNum ? ` · DocNum: ${result.sapDocNum}` : ''}`,
-          { duration: 6000 }
-        );
-      } else {
-        toast.warning(
-          `⚠ ${docNum} — SAP החזיר OK אבל בלי DocEntry. בדוק logs.`,
-        );
-      }
-      queryClient.invalidateQueries({ queryKey: ['delivery-notes'] });
-      queryClient.invalidateQueries({ queryKey: ['invoices'] });
-      queryClient.invalidateQueries({ queryKey: ['doc-stats'] });
-    },
-    onError: (err) => {
-      const docNum = err.config?.url?.split('/').pop();
-      toast.error(`❌ שגיאה ביצירת תעודה ב-SAP: ${err.response?.data?.error || err.message}`);
-    },
-  });
-
   const dnStats = stats?.deliveryNotes || {};
   const invStats = stats?.invoices || {};
 
@@ -420,14 +374,10 @@ export default function DocumentsPage() {
                     <td className="p-3 text-left whitespace-nowrap">
                       {dn.Status !== 'SAP_CONFIRMED' && (
                         <button
-                          onClick={() => writeToSapMutation.mutate({ doc: dn, type: 'deliveryNote' })}
-                          disabled={writeToSapMutation.isPending}
-                          className="text-xs text-brand-600 hover:underline mr-2 disabled:opacity-50"
-                          title="שולח את התעודה ל-SAP אוטומטית (dry-run עד שהכתיבה הופעלה)"
+                          onClick={() => setConfirmingDoc({ doc: dn, type: 'deliveryNote' })}
+                          className="text-xs text-brand-600 hover:underline mr-2"
                         >
-                          {writeToSapMutation.isPending && writeToSapMutation.variables?.doc?.DeliveryNoteId === dn.DeliveryNoteId
-                            ? 'שולח…'
-                            : 'צור ב-SAP'}
+                          אשר ב-SAP
                         </button>
                       )}
                       <button
@@ -474,14 +424,10 @@ export default function DocumentsPage() {
                     <td className="p-3 text-left">
                       {inv.Status !== 'SAP_CONFIRMED' && (
                         <button
-                          onClick={() => writeToSapMutation.mutate({ doc: inv, type: 'invoice' })}
-                          disabled={writeToSapMutation.isPending}
-                          className="text-xs text-brand-600 hover:underline disabled:opacity-50"
-                          title="שולח את החשבונית ל-SAP אוטומטית (dry-run עד שהכתיבה הופעלה)"
+                          onClick={() => setConfirmingDoc({ doc: inv, type: 'invoice' })}
+                          className="text-xs text-brand-600 hover:underline"
                         >
-                          {writeToSapMutation.isPending && writeToSapMutation.variables?.doc?.InvoiceId === inv.InvoiceId
-                            ? 'שולח…'
-                            : 'צור ב-SAP'}
+                          אשר ב-SAP
                         </button>
                       )}
                     </td>
@@ -493,26 +439,27 @@ export default function DocumentsPage() {
         </div>
       </div>
 
-      {/* Workflow tip — updated for Phase A2a (auto SAP write).
-          The old "open SAP, type DocEntry by hand" steps are gone.
-          The manual ConfirmSapDialog component is still exported for
-          emergency fallback but is no longer wired up to any UI. */}
+      {/* Workflow tip */}
       <div className="bg-gradient-to-r from-blue-50 to-purple-50 border border-blue-200 rounded-xl p-4">
         <h3 className="font-semibold mb-2 flex items-center gap-2">
           💡 איך לעבוד עם המסמכים
         </h3>
         <ol className="text-sm space-y-1 list-decimal pr-5">
-          <li>נהג מסיים עצירה → תעודות משלוח <strong>נוצרות אוטומטית במערכת</strong> (אחת לכל חברה)</li>
-          <li>לחץ <strong>"צור ב-SAP"</strong> ליד תעודה → המערכת שולחת אוטומטית ל-SAP ומחזירה DocEntry/DocNum</li>
+          <li>נהג מסיים עצירה → תעודות משלוח <strong>נוצרות אוטומטית</strong> (אחת לכל חברה)</li>
+          <li>אחרי הליקוט/מסירה - לחץ "Excel - OIG" ו-"Excel - Unico" להורדת רשימה לפי חברה</li>
+          <li>פתח את SAP - הזן את התעודות ידנית מהרשימה (חברה אחר חברה)</li>
+          <li>חזור ולחץ "אשר ב-SAP" - הזן את ה-DocEntry שקיבלת מ-SAP</li>
           <li>לחץ על אייקון <Receipt size={11} className="inline" /> ליצירת חשבונית מתעודת משלוח</li>
-          <li>גם החשבונית: <strong>"צור ב-SAP"</strong> → נשלחת אוטומטית, ה-DocEntry/DocNum נשמרים</li>
         </ol>
-        <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded mt-3 p-2">
-          🟡 <strong>שלב נוכחי</strong>: כתיבה ל-SAP מושבתת (<code>SAP_WRITE_ENABLED=false</code>).
-          לחיצה על "צור ב-SAP" מבצעת <strong>dry-run</strong> — בודקת שה-payload תקין אבל לא יוצרת כלום ב-SAP אמיתי.
-          הפעלת live תתבצע רק אחרי בדיקות על test DBs.
-        </div>
       </div>
+
+      {confirmingDoc && (
+        <ConfirmSapDialog
+          doc={confirmingDoc.doc}
+          type={confirmingDoc.type}
+          onClose={() => setConfirmingDoc(null)}
+        />
+      )}
     </div>
   );
 }
