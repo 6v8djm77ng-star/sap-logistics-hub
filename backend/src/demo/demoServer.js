@@ -3394,14 +3394,16 @@ app.post('/api/orders/:runOrderId/qc-approve', (req, res) => {
 // Phase 3 — run-level aggregate flush. Walks all approved orders in the
 // run with AggregatePending=true, groups by AggregationKey, and emits one
 // consolidated DN per group. Admin-only because it mints documents en masse.
-app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, (req, res) => {
+app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, async (req, res) => {
   const auth = req.headers.authorization;
   let approvedBy = null;
   if (auth?.startsWith('Bearer ')) {
     try { approvedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
   }
   try {
-    const result = store.flushAggregateDocsForRun(req.params.id, {
+    // Phase A2-2: flushAggregateDocsForRun is now async — it performs a
+    // dry-run SAP payload check on every DN it creates.
+    const result = await store.flushAggregateDocsForRun(req.params.id, {
       approvedBy,
       method: 'AUTO_AGGREGATE_FLUSH',
     });
@@ -3415,6 +3417,22 @@ app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, (req, res) => {
         IsPartial: !!d.IsPartial,
         SourceOrderCount: d.SourceOrders?.length || 0,
         AggregationSource: d.AggregationSource,
+        // A2-2 audit summary — null when dry-run didn't run or failed
+        SapWriteAttempts: d.SapWriteAttempts || 0,
+        LastDryRunPayloadAt: d.LastDryRunPayloadAt || null,
+        SapWriteLastError: d.SapWriteLastError || null,
+      })),
+      // Top 5 DN payloads as previews so the operator can sanity-check
+      // CardCode / DocDate / DocumentLines structure before A2c flips the
+      // live switch. Truncated to 1000 chars each (already truncated on
+      // the DN record itself).
+      dryRunPayloads: result.docsCreated.slice(0, 5).map((d) => ({
+        DocNumber: d.DocNumber,
+        CompanyCode: d.CompanyCode,
+        SapCardName: d.SapCardName,
+        preview: d.LastDryRunPayloadPreview,
+        attemptedAt: d.LastDryRunPayloadAt,
+        error: d.SapWriteLastError,
       })),
       invoices: result.invoicesCreated.map((i) => ({
         InvoiceId: i.InvoiceId,

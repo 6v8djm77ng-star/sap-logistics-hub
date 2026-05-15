@@ -8,6 +8,10 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
+// Phase A2-2: dry-run SAP write inside flush-aggregate-docs. The sapWriter
+// itself enforces dry-run when SAP_WRITE_ENABLED is not 'true', so this
+// import is safe even though SAP writes are still globally disabled.
+import { writeDeliveryNote } from './sapWriter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = path.resolve(__dirname, '../../data/store.json');
@@ -2677,7 +2681,11 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
  * previous flush are skipped (they appear in `skipped` for visibility).
  * Refuses to run if any order in the run is unapproved (returns 422).
  */
-export function flushAggregateDocsForRun(runId, options = {}) {
+// Phase A2-2: became `async` so it can `await writeDeliveryNote()` in dry-run
+// mode. Every caller must use `await store.flushAggregateDocsForRun(...)`.
+// The dry-run write happens AFTER the DN is committed to the local store,
+// so a SAP failure cannot leave a half-state.
+export async function flushAggregateDocsForRun(runId, options = {}) {
   const s = ensureDocsStore();
   const runIdNum = Number(runId);
 
@@ -2848,6 +2856,26 @@ export function flushAggregateDocsForRun(runId, options = {}) {
       for (const o of orders) {
         o.DeliveryNoteId = dn.DeliveryNoteId;
         if (anyPartial) o.PartialFulfillment = true;
+      }
+
+      // Phase A2-2: dry-run SAP write. Always dryRun:true in A2 — live
+      // writes are gated by SAP_WRITE_ENABLED and require explicit operator
+      // approval (A2c). Audit fields are populated regardless of success.
+      dn.SapWriteAttempts = (dn.SapWriteAttempts || 0) + 1;
+      dn.SapWriteAttemptedAt = new Date().toISOString();
+      try {
+        const wr = await writeDeliveryNote(dn, { dryRun: true });
+        if (wr.ok && wr.payload) {
+          dn.LastDryRunPayloadAt = new Date().toISOString();
+          // Truncated to 1000 chars per operator decision (avoid bloating
+          // store.json with full payloads).
+          dn.LastDryRunPayloadPreview = JSON.stringify(wr.payload).slice(0, 1000);
+          dn.SapWriteLastError = null;
+        } else if (!wr.ok) {
+          dn.SapWriteLastError = wr.error || 'unknown dry-run failure';
+        }
+      } catch (err) {
+        dn.SapWriteLastError = err?.message || String(err);
       }
     }
 
