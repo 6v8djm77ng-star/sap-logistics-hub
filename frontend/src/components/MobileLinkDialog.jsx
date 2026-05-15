@@ -51,25 +51,32 @@ export default function MobileLinkDialog({ onClose }) {
   };
 
   return (
+    // Backdrop scrolls on tiny viewports (laptop with devtools open, mobile
+    // landscape, browser zoom > 125%) so the dialog is reachable even when
+    // it's taller than the viewport.
     <div
-      className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4"
+      className="fixed inset-0 z-50 bg-black/50 overflow-y-auto p-4"
       onClick={onClose}
     >
-      <div
-        className="bg-white rounded-2xl max-w-md w-full overflow-hidden shadow-2xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between p-4 border-b">
-          <h2 className="font-bold text-lg flex items-center gap-2">
-            <Smartphone className="text-purple-600" />
-            קישור התקנה במובייל
-          </h2>
-          <button onClick={onClose} className="p-1.5 hover:bg-gray-100 rounded-lg">
-            <X size={18} />
-          </button>
-        </div>
+      {/* min-h-full + flex centering keeps the dialog vertically centered
+          when content fits, and lets it stack from top with margin when it
+          doesn't — no more clipped QR codes / headers. */}
+      <div className="min-h-full flex items-center justify-center">
+        <div
+          className="bg-white rounded-2xl max-w-md w-full max-h-[calc(100vh-2rem)] shadow-2xl flex flex-col my-auto"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between p-4 border-b shrink-0">
+            <h2 className="font-bold text-lg flex items-center gap-2">
+              <Smartphone className="text-purple-600" />
+              קישור התקנה במובייל
+            </h2>
+            <button onClick={onClose} className="p-1.5 hover:bg-gray-100 rounded-lg">
+              <X size={18} />
+            </button>
+          </div>
 
-        <div className="p-5">
+          <div className="p-5 overflow-y-auto">
           {loading ? (
             <div className="text-center py-12">
               <Loader2 size={32} className="animate-spin mx-auto text-purple-500" />
@@ -141,6 +148,7 @@ export default function MobileLinkDialog({ onClose }) {
               </button>
             </>
           ) : null}
+          </div>
         </div>
       </div>
     </div>
