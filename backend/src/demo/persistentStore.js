@@ -2720,6 +2720,31 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
     return { docsCreated: [], invoicesCreated: [], skipped, ordersTouched: 0 };
   }
 
+  // Phase A2-3: refuse to flush if ANY pending order has no DocPolicy.
+  // Without a policy we can't decide whether to emit a DN, an INV, or
+  // both — and we must NOT silently fall back to a default, because that
+  // would create a document the customer's accounting flow doesn't
+  // expect. Operator decision: 422 + DOC_POLICY_MISSING.
+  const missingPolicy = pending.filter((o) => {
+    const pr = _policyForOrder(o);
+    return !pr || !pr.policy;
+  });
+  if (missingPolicy.length) {
+    const err = new Error(
+      `יש ${missingPolicy.length} הזמנות ללא מדיניות מסמכים. הגדר מדיניות לכל לקוח לפני flush.`
+    );
+    err.status = 422;
+    err.code = 'DOC_POLICY_MISSING';
+    err.missingPolicy = missingPolicy.map((o) => ({
+      RunOrderId: o.RunOrderId,
+      SapDocNum: o.SapDocNum,
+      SapCardCode: o.SapCardCode,
+      SapCardName: o.SapCardName,
+      CompanyCode: o.CompanyCode,
+    }));
+    throw err;
+  }
+
   // Group orders by their aggregation key — same key = same consolidated DN.
   const groups = new Map();
   for (const o of pending) {
@@ -2866,6 +2891,26 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
       try {
         const wr = await writeDeliveryNote(dn, { dryRun: true });
         if (wr.ok && wr.payload) {
+          // Phase A2-3: validate critical payload fields. SAP would reject
+          // a /DeliveryNotes POST that's missing CardCode, DocDate, or
+          // DocumentLines, so we catch it locally and surface 422 with the
+          // exact missing fields. Operator decision: error, not warning.
+          const missing = [];
+          if (!wr.payload.CardCode) missing.push('CardCode');
+          if (!wr.payload.DocDate)  missing.push('DocDate');
+          if (!Array.isArray(wr.payload.DocumentLines) || wr.payload.DocumentLines.length === 0) {
+            missing.push('DocumentLines');
+          }
+          if (missing.length) {
+            const e = new Error(
+              `תעודה ${dn.DocNumber} חסרה שדות קריטיים ב-payload: ${missing.join(', ')}`
+            );
+            e.status = 422;
+            e.code = 'INVALID_PAYLOAD';
+            e.missingFields = missing;
+            e.docNumber = dn.DocNumber;
+            throw e;
+          }
           dn.LastDryRunPayloadAt = new Date().toISOString();
           // Truncated to 1000 chars per operator decision (avoid bloating
           // store.json with full payloads).
@@ -2876,6 +2921,8 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
         }
       } catch (err) {
         dn.SapWriteLastError = err?.message || String(err);
+        // Re-throw structured payload errors so the caller sees 422.
+        if (err?.code === 'INVALID_PAYLOAD') throw err;
       }
     }
 

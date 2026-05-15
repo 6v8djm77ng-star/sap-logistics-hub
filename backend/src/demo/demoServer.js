@@ -3444,6 +3444,11 @@ app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, async (req, res) => {
     const payload = { error: err.message };
     if (err.code) payload.code = err.code;
     if (err.unapproved) payload.unapproved = err.unapproved;
+    // A2-3: surface the structured fields for the new error codes so the
+    // UI can list which customers / which fields blocked the flush.
+    if (err.missingPolicy) payload.missingPolicy = err.missingPolicy;
+    if (err.missingFields) payload.missingFields = err.missingFields;
+    if (err.docNumber) payload.docNumber = err.docNumber;
     res.status(err.status || 500).json(payload);
   }
 });
