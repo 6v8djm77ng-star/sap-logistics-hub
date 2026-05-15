@@ -2254,6 +2254,13 @@ export function generateDeliveryNotesForStop(stopId, options = {}) {
       SentToSapAt: null,
       ConfirmedAt: null,
       ErrorMessage: null,
+      // A2 audit fields — populated by Phase A2-2 dry-run path. Kept null on
+      // creation so existing flows are unchanged in A2-1.
+      LastDryRunPayloadAt: null,
+      LastDryRunPayloadPreview: null,   // truncated to ≤1000 chars by A2-2
+      SapWriteAttempts: 0,
+      SapWriteAttemptedAt: null,
+      SapWriteLastError: null,
       Notes: stop.Notes || null,
       Address: {
         Street: stop.Street, BuildingNumber: stop.BuildingNumber, City: stop.City,
@@ -2819,6 +2826,12 @@ export function flushAggregateDocsForRun(runId, options = {}) {
         SentToSapAt: null,
         ConfirmedAt: null,
         ErrorMessage: null,
+        // A2 audit fields — see A2-1 for rationale. A2-2 populates them.
+        LastDryRunPayloadAt: null,
+        LastDryRunPayloadPreview: null,
+        SapWriteAttempts: 0,
+        SapWriteAttemptedAt: null,
+        SapWriteLastError: null,
         Notes: null,
         Address: firstStop ? {
           Street: firstStop.Street, BuildingNumber: firstStop.BuildingNumber,
