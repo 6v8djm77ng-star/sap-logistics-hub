@@ -2938,14 +2938,19 @@ app.post('/api/driver/stops/:stopId/complete', (req, res) => {
   const results = [];
   for (const order of stopOrders) {
     order.Status = 'DELIVERED';
-    // Simulate SAP Delivery Note DocEntry (in real life: SAP Service Layer call)
-    order.SapDeliveryDocEntry = 9000000 + order.RunOrderId;
+    // SapDeliveryDocEntry is intentionally NOT touched here. It must be
+    // either null (no DN written to SAP yet) or a genuine DocEntry returned
+    // by Service Layer in the future `flush-aggregate-docs` write path
+    // (Phase A2). Faking it with `9000000 + RunOrderId` used to make the
+    // store look like SAP confirmed the document, blocking the later
+    // "attach POD to existing DN" flow (Phase B/C). See cowork/INCIDENTS.md
+    // and the A1 migration in scripts/migrate-fake-sap-doc-entries.js.
     order.DeliveredAt = new Date().toISOString();
     results.push({
       runOrderId: order.RunOrderId,
       success: true,
-      sapDocEntry: order.SapDeliveryDocEntry,
-      simulated: true,
+      sapDocEntry: order.SapDeliveryDocEntry, // null in steady state until Phase A2
+      simulated: false, // we no longer fake — caller can distinguish properly
     });
   }
   store.save?.();
@@ -2999,7 +3004,9 @@ app.post('/api/driver/orders/:runOrderId/deliver', (req, res) => {
   const order = orders.find((o) => o.RunOrderId === Number(req.params.runOrderId));
   if (!order) return res.status(404).json({ error: 'Order not found' });
   order.Status = 'DELIVERED';
-  order.SapDeliveryDocEntry = 9000000 + order.RunOrderId;
+  // SapDeliveryDocEntry intentionally NOT assigned here — see A1 in the
+  // sibling /api/driver/stops/:stopId/complete handler for the full
+  // rationale. Driver-side endpoints never mint SAP DocEntries.
   order.DeliveredAt = new Date().toISOString();
   store.save?.();
   io.emit('order:delivered', { runOrderId: order.RunOrderId });
