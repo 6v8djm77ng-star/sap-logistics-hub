@@ -140,7 +140,13 @@ export async function writeDeliveryNote(dn, options = {}) {
     return {
       ok: true,
       dryRun: true,
-      sapDocEntry: 9000000 + dn.DeliveryNoteId,  // simulated
+      // No DocEntry available in dry-run — the document was NOT written to
+      // SAP, so there is no real DocEntry to surface. Returning null forces
+      // the caller's `if (result.sapDocEntry)` guards to skip the
+      // "save SAP DocEntry on the local DN" step, which is exactly what we
+      // want — see fix(docs): remove fake SapDeliveryDocEntry assignment
+      // (Phase A1).
+      sapDocEntry: null,
       sapDocNum: null,
       payload,
       reason: !slUrl()
@@ -179,7 +185,11 @@ export async function writeInvoice(invoice, dn, options = {}) {
     return {
       ok: true,
       dryRun: true,
-      sapDocEntry: 8000000 + invoice.InvoiceId,
+      // Mirror of writeDeliveryNote: no DocEntry in dry-run mode — the
+      // invoice was not actually created in SAP, so we MUST NOT surface a
+      // numeric DocEntry that the caller would persist into
+      // invoice.SapInvoiceDocEntry. See A1 rationale above.
+      sapDocEntry: null,
       sapDocNum: null,
       payload,
       reason: !slUrl()
