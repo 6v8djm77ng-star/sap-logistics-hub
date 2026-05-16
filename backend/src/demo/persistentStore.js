@@ -2869,10 +2869,65 @@ export function generateDocsForRunOrder(runOrderId, options = {}) {
  * previous flush are skipped (they appear in `skipped` for visibility).
  * Refuses to run if any order in the run is unapproved (returns 422).
  */
+/**
+ * A2c-4a (2026-05-16): apply the result of writeDeliveryNote() to the
+ * local DN. Mutates `dn` in place. Pure helper, exported for unit tests.
+ *
+ * Cases:
+ *   wr.ok && wr.payload && wr.dryRun !== false
+ *     → audit fields updated (LastDryRunPayloadAt/Preview), SapWriteLastError
+ *       cleared. Status stays as-is (PENDING_EXPORT). This is the current
+ *       A2-2 behaviour and is the default when options.liveWrite is not
+ *       passed to flushAggregateDocsForRun.
+ *
+ *   wr.ok && wr.payload && wr.dryRun === false && wr.sapDocEntry != null
+ *     → live write success. All audit fields updated, PLUS:
+ *       SapDeliveryDocEntry + SapDeliveryDocNum populated,
+ *       Status='EXPORTED', ExportedAt + SentToSapAt set.
+ *
+ *   !wr.ok
+ *     → SapWriteLastError set with the error message. Status NOT advanced
+ *       (stays PENDING_EXPORT) — operator can retry by re-running the
+ *       flush after fixing whatever broke (e.g. SAP login, env, payload).
+ *
+ *   missing dn or wr → no-op (defensive).
+ *
+ * Note: field names LastDryRunPayloadAt/Preview are historical (introduced
+ * in A2-1 for dry-run only). A2c-4a populates them for live writes too —
+ * they document "last payload sent to SAP" regardless of mode.
+ */
+export function _applyWriteResultToDn(dn, wr) {
+  if (!dn || !wr) return;
+  if (wr.ok && wr.payload) {
+    const now = new Date().toISOString();
+    dn.LastDryRunPayloadAt = now;
+    dn.LastDryRunPayloadPreview = JSON.stringify(wr.payload).slice(0, 1000);
+    dn.SapWriteLastError = null;
+    if (wr.dryRun === false && wr.sapDocEntry != null) {
+      dn.SapDeliveryDocEntry = wr.sapDocEntry;
+      dn.SapDeliveryDocNum = wr.sapDocNum != null ? wr.sapDocNum : null;
+      dn.Status = 'EXPORTED';
+      dn.ExportedAt = now;
+      dn.SentToSapAt = now;
+    }
+  } else if (!wr.ok) {
+    dn.SapWriteLastError = wr.error
+      || (wr.dryRun === false ? 'unknown live write failure' : 'unknown dry-run failure');
+    // Status stays unchanged (PENDING_EXPORT) — caller can retry.
+  }
+}
+
 // Phase A2-2: became `async` so it can `await writeDeliveryNote()` in dry-run
 // mode. Every caller must use `await store.flushAggregateDocsForRun(...)`.
-// The dry-run write happens AFTER the DN is committed to the local store,
-// so a SAP failure cannot leave a half-state.
+// The write happens AFTER the DN is committed to the local store, so a
+// SAP failure cannot leave a half-state.
+//
+// Phase A2c-4a (2026-05-16): the call to writeDeliveryNote now respects
+// `options.liveWrite`. Default is false — every existing caller (including
+// /api/runs/:id/flush-aggregate-docs) continues to get dryRun:true behaviour
+// with NO change. Only callers that explicitly pass { liveWrite: true } get
+// dryRun:false. The A2c-1 whitelist gate inside writeDeliveryNote will still
+// block live writes if SAP_WRITE_ENABLED!=true or whitelist mismatch.
 export async function flushAggregateDocsForRun(runId, options = {}) {
   const s = ensureDocsStore();
   const runIdNum = Number(runId);
@@ -3071,18 +3126,23 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
         if (anyPartial) o.PartialFulfillment = true;
       }
 
-      // Phase A2-2: dry-run SAP write. Always dryRun:true in A2 — live
-      // writes are gated by SAP_WRITE_ENABLED and require explicit operator
-      // approval (A2c). Audit fields are populated regardless of success.
+      // Phase A2-2 (dry-run write) + A2c-4a (optional live write).
+      // Default options.liveWrite=false → dryRun:true (no SAP HTTP). When
+      // a caller explicitly opts in with { liveWrite: true }, dryRun:false
+      // is passed to writeDeliveryNote — but the A2c-1 whitelist gate
+      // there will still block the actual POST unless SAP_WRITE_ENABLED=
+      // true AND the configured DBs are in SAP_LIVE_WRITE_DB_WHITELIST.
+      // Audit fields are populated regardless of mode.
       dn.SapWriteAttempts = (dn.SapWriteAttempts || 0) + 1;
       dn.SapWriteAttemptedAt = new Date().toISOString();
+      const liveWrite = options.liveWrite === true;
       try {
-        const wr = await writeDeliveryNote(dn, { dryRun: true });
+        const wr = await writeDeliveryNote(dn, { dryRun: !liveWrite });
+        // Phase A2-3: validate critical payload fields BEFORE applying the
+        // result. SAP would reject a /DeliveryNotes POST that's missing
+        // CardCode, DocDate, or DocumentLines, so we catch it locally and
+        // surface 422 with the exact missing fields. Same in both modes.
         if (wr.ok && wr.payload) {
-          // Phase A2-3: validate critical payload fields. SAP would reject
-          // a /DeliveryNotes POST that's missing CardCode, DocDate, or
-          // DocumentLines, so we catch it locally and surface 422 with the
-          // exact missing fields. Operator decision: error, not warning.
           const missing = [];
           if (!wr.payload.CardCode) missing.push('CardCode');
           if (!wr.payload.DocDate)  missing.push('DocDate');
@@ -3099,14 +3159,9 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
             e.docNumber = dn.DocNumber;
             throw e;
           }
-          dn.LastDryRunPayloadAt = new Date().toISOString();
-          // Truncated to 1000 chars per operator decision (avoid bloating
-          // store.json with full payloads).
-          dn.LastDryRunPayloadPreview = JSON.stringify(wr.payload).slice(0, 1000);
-          dn.SapWriteLastError = null;
-        } else if (!wr.ok) {
-          dn.SapWriteLastError = wr.error || 'unknown dry-run failure';
         }
+        // A2c-4a: apply the result (dry-run or live) via the pure helper.
+        _applyWriteResultToDn(dn, wr);
       } catch (err) {
         dn.SapWriteLastError = err?.message || String(err);
         // Re-throw structured payload errors so the caller sees 422.
