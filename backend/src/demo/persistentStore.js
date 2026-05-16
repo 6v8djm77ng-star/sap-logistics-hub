@@ -2041,18 +2041,48 @@ export function pickAllocation(allocationId, qty, userId = null, userName = null
     }
     const allLines = s.waveLines.filter((l) => l.WaveId === line.WaveId);
     const allDone = allLines.every((l) => l.Status === 'COMPLETED' || l.Status === 'SHORTAGE');
-    if (allDone && wave && wave.Status !== 'COMPLETED') {
-      wave.Status = 'COMPLETED';
-      wave.CompletedAt = new Date().toISOString();
-      const run = s.runs.find((r) => r.RunId === wave.RunId);
-      if (run && ['PLANNED', 'OPEN', 'PICKING'].includes(run.Status)) {
-        run.Status = 'LOADED';
-      }
+    if (allDone && wave) {
+      // Bug fix (2026-05-16): when all lines finish picking, the wave
+      // moves to PENDING_QC and waits for approveWaveQc — which is the
+      // SOLE place that transitions run.Status to LOADED and triggers
+      // DN generation (generateDeliveryNotesForStop per stop).
+      //
+      // Previously this block did:
+      //   wave.Status = 'COMPLETED'
+      //   run.Status = 'LOADED' (if run was in PLANNED/OPEN/PICKING)
+      // ...which skipped QC entirely. approveWaveQc requires
+      // wave.Status==='PENDING_QC' (persistentStore.js line ~1941), so
+      // any wave that auto-completed via this path could never be
+      // QC-approved, and its DNs were never generated. Four real runs
+      // (25, 75, 76, 77) landed in this stuck state. recordPick already
+      // moves to PENDING_QC correctly (line ~2110); now pickAllocation
+      // matches.
+      wave.Status = _nextWaveStatusOnPickingDone(wave.Status);
+      if (!wave.CompletedAt) wave.CompletedAt = new Date().toISOString();
+      // run.Status is intentionally NOT touched here. approveWaveQc owns
+      // that transition.
     }
   }
 
   save();
   return { alloc, line };
+}
+
+/**
+ * Pure helper — pick the next wave.Status when all picking is done.
+ * Exported for unit tests.
+ *
+ * Rules:
+ *   IN_PROGRESS / PENDING / anything else → PENDING_QC
+ *   PENDING_QC                            → PENDING_QC (idempotent)
+ *   COMPLETED                             → COMPLETED  (don't downgrade
+ *                                           a wave that was already
+ *                                           explicitly QC-approved)
+ */
+export function _nextWaveStatusOnPickingDone(currentStatus) {
+  if (currentStatus === 'COMPLETED') return 'COMPLETED';
+  if (currentStatus === 'PENDING_QC') return 'PENDING_QC';
+  return 'PENDING_QC';
 }
 
 /**
