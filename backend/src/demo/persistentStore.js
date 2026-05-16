@@ -2452,13 +2452,52 @@ function _validatePolicyShape(policy, cardName, cardCode) {
 }
 
 /**
+ * Pick the wave that represents the *current* state of picking for a run.
+ *
+ * Bug A fix (2026-05-16): a run can have multiple waves over its lifetime
+ * (created → CANCELLED → fresh wave created and picked). The old code did
+ * `.find()` on RunId alone, which returns the *first* match regardless of
+ * Status, so it could lock onto a stale CANCELLED wave whose allocations
+ * are all PickedQuantity=0, making the order look empty even though it was
+ * actually picked in the active wave.
+ *
+ * Selection rules:
+ *   1. waves of the same RunId
+ *   2. Status !== 'CANCELLED' (COMPLETED is fine — that's the happy path)
+ *   3. latest by CreatedAt, tiebreak by WaveId
+ *
+ * Returns null if no non-cancelled wave exists for the run.
+ *
+ * Exported as `_selectActiveWaveForRun` for unit tests.
+ */
+export function _selectActiveWaveForRun(allWaves, runId) {
+  const candidates = (allWaves || [])
+    .filter((w) => w.RunId === Number(runId) && w.Status !== 'CANCELLED');
+  let pick = null;
+  for (const w of candidates) {
+    if (!pick) { pick = w; continue; }
+    const tBest = pick.CreatedAt ? Date.parse(pick.CreatedAt) : 0;
+    const tCur = w.CreatedAt ? Date.parse(w.CreatedAt) : 0;
+    if (tCur > tBest) { pick = w; continue; }
+    if (tCur === tBest && (w.WaveId || 0) > (pick.WaveId || 0)) {
+      pick = w;
+    }
+  }
+  return pick;
+}
+
+/**
  * Phase 2 — compute fulfillment for one RunOrder by walking its allocations
  * across this run's wave. Returns picked/ordered totals + per-item breakdown
  * so the DN can be flagged partial and downstream UI can show shortages.
  *
- * Matching key: SapDocEntry + CompanyCode. We also scope to the wave of the
- * order's run to avoid cross-wave bleed if the same SAP order ever lives in
- * two different waves (it shouldn't, but be defensive).
+ * Matching key: SapDocEntry + CompanyCode. Scoped to the *active* wave of
+ * the order's run (see _selectActiveWaveForRun) to avoid pulling stale picks
+ * from a cancelled wave.
+ *
+ * Return shape (all callers tolerate a missing `reason`):
+ *   { lines, totalOrdered, totalPicked, isEmpty, isPartial, reason }
+ *   reason === 'NO_ACTIVE_WAVE' when no non-cancelled wave exists for the run.
  */
 function _computeOrderFulfillment(order) {
   const s = ensureDocsStore();
@@ -2466,16 +2505,31 @@ function _computeOrderFulfillment(order) {
   const runId = stop?.RunId;
   const waves = ensureWavesStore();
 
-  // Restrict to allocations from the wave of this order's run.
-  const waveOfRun = (waves.waves || []).find((w) => w.RunId === Number(runId));
-  const allowedWaveLineIds = waveOfRun
-    ? new Set((waves.waveLines || []).filter((wl) => wl.WaveId === waveOfRun.WaveId).map((wl) => wl.WaveLineId))
-    : null;
+  // Pick the active wave for this run (skip CANCELLED, latest by CreatedAt).
+  // See _selectActiveWaveForRun for the full rationale.
+  const waveOfRun = _selectActiveWaveForRun(waves.waves || [], runId);
+
+  if (!waveOfRun) {
+    return {
+      lines: [],
+      totalOrdered: 0,
+      totalPicked: 0,
+      isEmpty: true,
+      isPartial: false,
+      reason: 'NO_ACTIVE_WAVE',
+    };
+  }
+
+  const allowedWaveLineIds = new Set(
+    (waves.waveLines || [])
+      .filter((wl) => wl.WaveId === waveOfRun.WaveId)
+      .map((wl) => wl.WaveLineId)
+  );
 
   const allocs = (waves.waveAllocations || []).filter((a) =>
     Number(a.SapDocEntry) === Number(order.SapDocEntry) &&
     a.CompanyCode === order.CompanyCode &&
-    (!allowedWaveLineIds || allowedWaveLineIds.has(a.WaveLineId))
+    allowedWaveLineIds.has(a.WaveLineId)
   );
 
   const lines = [];
@@ -2504,6 +2558,7 @@ function _computeOrderFulfillment(order) {
     totalPicked,
     isEmpty: totalPicked === 0,
     isPartial: totalPicked > 0 && totalPicked < totalOrdered,
+    reason: null,
   };
 }
 
