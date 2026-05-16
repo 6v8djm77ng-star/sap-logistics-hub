@@ -2077,22 +2077,140 @@ export function resetAllocation(allocationId) {
 }
 
 /**
- * Record a pick action - user scanned/entered quantity for a line.
+ * FIFO comparator for waveAllocations of a single waveLine.
+ *
+ * Bug B (2026-05-16): when a waveLine is split across multiple allocations
+ * (~32% of real lines in production data; 60–92% for Tineco/DAVO flagship
+ * SKUs), recordPick used to update only `line.PickedQuantity` and never
+ * propagated the picks to allocations. Since _computeOrderFulfillment
+ * sums from allocations, this caused QC-approve to raise NOTHING_PICKED
+ * for orders that had been fully picked at the line level.
+ *
+ * Business decision: when distributing a partial pick across multiple
+ * allocations, the OLDEST SAP order gets filled first. There's no
+ * proportional split and no fractional units.
+ *
+ * Sort key (all asc):
+ *   1. SapDocEntry — SAP's own monotonic counter, the truest "arrival
+ *      order" signal. Allocations carry SapDocEntry directly, no lookup
+ *      needed for this primary key.
+ *   2. RunOrderId — local fallback if two allocations somehow share a
+ *      SapDocEntry (shouldn't happen, but defensive). Requires lookup
+ *      via SapDocEntry+CompanyCode → RunOrder, hence the orderByKey arg.
+ *   3. AllocationId — final tiebreak so the order is fully deterministic.
+ *
+ * orderByKey is a function `(alloc) → runOrder|undefined`. Passed in (not
+ * imported from ensureDocsStore) so this helper stays pure and unit-
+ * testable without store-state setup.
+ *
+ * Exported as `_compareAllocationsFifo` for unit tests.
+ */
+export function _compareAllocationsFifo(a, b, orderByKey = () => undefined) {
+  const sapA = Number(a.SapDocEntry || 0);
+  const sapB = Number(b.SapDocEntry || 0);
+  if (sapA !== sapB) return sapA - sapB;
+  const roA = Number(orderByKey(a)?.RunOrderId || 0);
+  const roB = Number(orderByKey(b)?.RunOrderId || 0);
+  if (roA !== roB) return roA - roB;
+  return Number(a.AllocationId || 0) - Number(b.AllocationId || 0);
+}
+
+/**
+ * Compute how a `pickedQty` should be distributed across `sortedAllocs`
+ * by FIFO. Returns an array of { AllocationId, take } deltas — does NOT
+ * mutate the allocations themselves so the helper is pure (caller applies).
+ *
+ * Caps:
+ *   - Each allocation can only receive up to `alloc.Quantity - alloc.PickedQuantity`.
+ *   - Total distributed is capped at `lineTotalQuantity - sum(current picks)`,
+ *     i.e. we never over-pick the line. Excess `pickedQty` is silently
+ *     dropped (matches the cap behaviour of `pickAllocation`).
+ *
+ * Negative `pickedQty` is treated as 0 (defensive; recordPick rejects
+ * negatives upstream with HTTP 400).
+ *
+ * Exported as `_distributePickedQtyByFifo` for unit tests.
+ */
+export function _distributePickedQtyByFifo(pickedQty, sortedAllocs, lineTotalQuantity) {
+  const allocs = Array.isArray(sortedAllocs) ? sortedAllocs : [];
+  const currentTotal = allocs.reduce((sum, a) => sum + Number(a.PickedQuantity || 0), 0);
+  const lineCapacity = Math.max(0, Number(lineTotalQuantity || 0) - currentTotal);
+  let toDistribute = Math.min(Math.max(0, Number(pickedQty || 0)), lineCapacity);
+  const deltas = [];
+  for (const a of allocs) {
+    if (toDistribute <= 0) break;
+    const allocCap = Number(a.Quantity || 0) - Number(a.PickedQuantity || 0);
+    if (allocCap <= 0) continue;
+    const take = Math.min(allocCap, toDistribute);
+    deltas.push({ AllocationId: a.AllocationId, take });
+    toDistribute -= take;
+  }
+  return deltas;
+}
+
+/**
+ * Record a pick action — user scanned/entered quantity for a line.
+ *
+ * Bug B fix (2026-05-16): now propagates the pick into waveAllocations
+ * by FIFO of SAP order arrival (oldest SapDocEntry first). The line's
+ * PickedQuantity is recomputed as the sum of all its allocations, so
+ * the allocations become the single source of truth — matching what
+ * pickAllocation() already does and what _computeOrderFulfillment reads.
+ *
+ * Backward-compat: if a waveLine has zero allocations (legacy data),
+ * falls back to the previous behaviour (update line.PickedQuantity only).
+ *
+ * Negative `pickedQty` is rejected — callers must use resetWaveLine to
+ * clear. A future endpoint may add line-level decrement, but it's not
+ * in this fix's scope.
  */
 export function recordPick(waveLineId, pickedQty, userId = null, userName = null) {
+  if (Number(pickedQty) < 0) {
+    const err = new Error('recordPick: negative qty not supported; use resetWaveLine to clear');
+    err.status = 400;
+    throw err;
+  }
+
   const s = ensureWavesStore();
   const line = s.waveLines.find((l) => l.WaveLineId === Number(waveLineId));
   if (!line) return null;
 
-  const newPicked = Number(line.PickedQuantity) + Number(pickedQty);
-  line.PickedQuantity = newPicked;
-  if (newPicked >= Number(line.TotalQuantity)) {
-    line.Status = 'COMPLETED';
-  } else if (newPicked > 0) {
-    line.Status = 'PARTIAL';
+  const allocs = (s.waveAllocations || []).filter((a) => a.WaveLineId === line.WaveLineId);
+
+  if (allocs.length === 0) {
+    // Legacy line with no allocations — keep prior behaviour so this fix
+    // is a strict superset (no surprise breakage on old data).
+    const newPicked = Number(line.PickedQuantity || 0) + Number(pickedQty);
+    line.PickedQuantity = newPicked;
+    if (newPicked >= Number(line.TotalQuantity)) line.Status = 'COMPLETED';
+    else if (newPicked > 0) line.Status = 'PARTIAL';
+  } else {
+    // FIFO distribution. Look up RunOrders for the secondary sort key.
+    const docs = ensureDocsStore();
+    const orderByKey = (a) => (docs.runOrders || []).find((o) =>
+      o && Number(o.SapDocEntry) === Number(a.SapDocEntry) && o.CompanyCode === a.CompanyCode
+    );
+    allocs.sort((a, b) => _compareAllocationsFifo(a, b, orderByKey));
+    const deltas = _distributePickedQtyByFifo(pickedQty, allocs, line.TotalQuantity);
+
+    const now = new Date().toISOString();
+    for (const d of deltas) {
+      const a = allocs.find((x) => x.AllocationId === d.AllocationId);
+      if (!a) continue;
+      a.PickedQuantity = Number(a.PickedQuantity || 0) + d.take;
+      a.Status = a.PickedQuantity >= Number(a.Quantity) ? 'COMPLETED' : 'PARTIAL';
+      a.LastPickedAt = now;
+      if (userName) a.LastPickedBy = userName;
+    }
+
+    // Line is now derived: sum of all (post-distribution) allocations.
+    const newTotal = allocs.reduce((sum, a) => sum + Number(a.PickedQuantity || 0), 0);
+    line.PickedQuantity = newTotal;
+    if (newTotal >= Number(line.TotalQuantity)) line.Status = 'COMPLETED';
+    else if (newTotal > 0) line.Status = 'PARTIAL';
   }
 
-  // Mark wave as in-progress on first pick
+  // Mark wave as in-progress on first pick.
   const wave = s.waves.find((w) => w.WaveId === line.WaveId);
   if (wave && wave.Status === 'PENDING') {
     wave.Status = 'IN_PROGRESS';
@@ -2101,12 +2219,10 @@ export function recordPick(waveLineId, pickedQty, userId = null, userName = null
     wave.PickedByName = userName;
   }
 
-  // Check if all lines complete
+  // Check if all lines complete → advance wave to PENDING_QC.
   const allLines = s.waveLines.filter((l) => l.WaveId === line.WaveId);
   const allDone = allLines.every((l) => l.Status === 'COMPLETED' || l.Status === 'SHORTAGE');
   if (allDone && wave) {
-    // Picking is done - move to QC review (manual approval gate before docs are generated).
-    // The user can either approve (→ generates docs and advances run) or reject specific lines.
     wave.Status = 'PENDING_QC';
     wave.CompletedAt = new Date().toISOString();
   }
@@ -2125,10 +2241,27 @@ export function markShortage(waveLineId, notes = null) {
   return line;
 }
 
+/**
+ * Reset a waveLine — clears all picks on the line AND on its allocations.
+ *
+ * Bug B fix follow-up (2026-05-16): now that recordPick populates
+ * allocations, reset must clear them too. Otherwise we'd leave
+ * `line.PickedQuantity = 0` but `alloc.PickedQuantity > 0`, and
+ * _computeOrderFulfillment (which sums allocations) would still return
+ * stale picks, causing QC-approve to emit DNs for already-reset orders.
+ */
 export function resetWaveLine(waveLineId) {
   const s = ensureWavesStore();
   const line = s.waveLines.find((l) => l.WaveLineId === Number(waveLineId));
   if (!line) return null;
+
+  const allocs = (s.waveAllocations || []).filter((a) => a.WaveLineId === line.WaveLineId);
+  for (const a of allocs) {
+    a.PickedQuantity = 0;
+    a.Status = 'PENDING';
+    a.LastPickedAt = null;
+  }
+
   line.PickedQuantity = 0;
   line.Status = 'PENDING';
   line.Notes = null;
