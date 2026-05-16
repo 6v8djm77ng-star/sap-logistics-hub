@@ -100,7 +100,7 @@ export default function DriverManifestPage() {
       if (stop.Status === 'PENDING' || stop.Status === 'OPEN' || stop.Status === 'PLANNED') {
         if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
         toast.success(`📍 הגעת ל-${stop.BranchName || stop.City}!`, { duration: 4000 });
-        updateStatusMutation.mutate({ stopId: stop.StopId, status: 'ARRIVED' });
+        updateStopMutation.mutate({ stopId: stop.StopId, status: 'ARRIVED' });
       }
     },
   });
@@ -117,11 +117,11 @@ export default function DriverManifestPage() {
         break;
       }
       case 'arrive':
-        updateStatusMutation.mutate({ stopId: currentStop.StopId, status: 'ARRIVED' });
+        updateStopMutation.mutate({ stopId: currentStop.StopId, status: 'ARRIVED' });
         break;
       case 'complete':
         if (currentStop.Status !== 'ARRIVED') {
-          updateStatusMutation.mutate({ stopId: currentStop.StopId, status: 'ARRIVED' });
+          updateStopMutation.mutate({ stopId: currentStop.StopId, status: 'ARRIVED' });
         }
         setPodForStop(currentStop);
         break;
