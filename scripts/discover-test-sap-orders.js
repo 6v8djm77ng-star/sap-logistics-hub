@@ -87,7 +87,9 @@ if (!JSON_OUTPUT) {
   log('==============================================================');
   log(`SAP_SL_URL              = ${SL_URL}`);
   log(`SAP_SL_USERNAME         = ${SL_USER}`);
-  log(`SAP_SL_PASSWORD         = ${'*'.repeat(8) + (SL_PASS.length > 4 ? SL_PASS.slice(-4) : '')}`);
+  // Per user instruction: do NOT print any portion of the password (not
+  // even masked-last-4). Only confirm presence.
+  log(`SAP_SL_PASSWORD         = ${SL_PASS ? '(set)' : '(empty)'}`);
   log(`SAP_SL_COMPANY_DB_A     = ${DB_A}`);
   log(`SSL_REJECT_UNAUTHORIZED = ${SSL_REJECT}`);
   log(`Top N orders to fetch   = ${TOP}`);
@@ -251,8 +253,9 @@ async function logout(cookie) {
     log('Next step (NOT executed by this script): A2c-3 will use these DocEntries');
     log('to seed a QC-ready test run that references real SAP orders.');
   } catch (e) {
+    // Print only the error message — no stack trace, in case the trace
+    // happens to capture the request body (which contains the password).
     err(`Discovery failed: ${e.message}`);
-    if (e.stack && !JSON_OUTPUT) console.error(e.stack);
     process.exit(3);
   }
 })();
