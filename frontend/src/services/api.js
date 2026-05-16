@@ -53,7 +53,10 @@ export const runsApi = {
   list: (params) => api.get('/runs', { params }).then((r) => r.data.runs),
   get: (id) => api.get(`/runs/${id}`).then((r) => r.data),
   create: (data) => api.post('/runs', data).then((r) => r.data),
-  autoPlan: (runDate) => api.post('/runs/auto-plan', { runDate }).then((r) => r.data),
+  // opts may include { minCustomerTotal, minLinesPerOrder, requireStock }.
+  // Backend (computePlanExclusions) accepts the same params on both
+  // preview-exclusions (GET) and auto-plan (POST body).
+  autoPlan: (runDate, opts = {}) => api.post('/runs/auto-plan', { runDate, ...opts }).then((r) => r.data),
   updateStatus: (id, status) => api.patch(`/runs/${id}/status`, { status }).then((r) => r.data),
   optimizeOrder: (id) => api.post(`/runs/${id}/optimize-order`).then((r) => r.data),
   buildWave: (id) => api.post(`/runs/${id}/wave`).then((r) => r.data),

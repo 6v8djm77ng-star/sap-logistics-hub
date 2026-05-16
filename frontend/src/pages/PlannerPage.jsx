@@ -1,10 +1,22 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ordersApi, runsApi } from '../services/api.js';
 import api from '../services/api.js';
 import { format } from 'date-fns';
 import { toast } from 'sonner';
 import { Zap, Package, AlertTriangle, ChevronDown, ChevronUp, Coins, PackageX, Plus, CalendarDays, MapPin, Search } from 'lucide-react';
+
+// Customer-total threshold slider config.
+// The default planner rule excludes orders whose customer-total (both
+// companies combined) is below 3,000 ₪. This slider lets the logistics
+// manager loosen that floor down to 2,000 ₪ on a per-session basis,
+// pulling more borderline customers into the route. Persisted in
+// localStorage so it survives refresh.
+const MIN_CT_LO = 2000;
+const MIN_CT_HI = 3000;          // also the historical default
+const MIN_CT_DEFAULT = 2000;     // session default per planner request
+const MIN_CT_BASELINE = 3000;    // fixed reference for delta calculation
+const MIN_CT_STORAGE_KEY = 'planner.minCustomerTotal';
 
 // Hebrew weekday names indexed by Date.getDay() (0=Sunday).
 const HEBREW_WEEKDAYS = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
@@ -23,6 +35,21 @@ export default function PlannerPage() {
   const [runDate, setRunDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [planResult, setPlanResult] = useState(null); // last auto-plan response
   const [showExcluded, setShowExcluded] = useState(true);
+
+  // Customer-total threshold slider. Initialized from localStorage (lazy
+  // initializer so SSR / first render is safe). Default MIN_CT_DEFAULT
+  // when storage is empty, NaN, or out of range.
+  const [minCustomerTotal, setMinCustomerTotal] = useState(() => {
+    if (typeof window === 'undefined') return MIN_CT_DEFAULT;
+    const raw = window.localStorage?.getItem(MIN_CT_STORAGE_KEY);
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return MIN_CT_DEFAULT;
+    return Math.max(MIN_CT_LO, Math.min(MIN_CT_HI, n));
+  });
+  // Persist on every change so refresh restores the last value.
+  useEffect(() => {
+    try { window.localStorage?.setItem(MIN_CT_STORAGE_KEY, String(minCustomerTotal)); } catch {}
+  }, [minCustomerTotal]);
   // Day filter: defaults to today's Hebrew weekday. The planner can flip to
   // a different weekday or to 'all' (which shows every stop regardless of
   // scheduledDays). Friday/Saturday are excluded — the warehouse doesn't
@@ -96,8 +123,38 @@ export default function PlannerPage() {
     onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בשיוך הידני'),
   });
 
+  // Live counts of plannable orders at the CURRENT slider threshold and at
+  // the BASELINE 3000 ₪ — used to show "X extra orders enter vs 3000".
+  // Both queries hit the read-only /preview-exclusions endpoint. The
+  // baseline query has a fixed threshold so React Query caches it across
+  // slider changes (refetches only when runDate changes). When the slider
+  // is at 3000, both queryKeys coincide and React Query serves a single
+  // request.
+  const baselineQuery = useQuery({
+    queryKey: ['preview-exclusions', runDate, MIN_CT_BASELINE],
+    queryFn: () => api.get('/runs/auto-plan/preview-exclusions', {
+      params: { runDate, minCustomerTotal: MIN_CT_BASELINE },
+    }).then((r) => r.data),
+  });
+  const currentQuery = useQuery({
+    queryKey: ['preview-exclusions', runDate, minCustomerTotal],
+    queryFn: () => api.get('/runs/auto-plan/preview-exclusions', {
+      params: { runDate, minCustomerTotal },
+    }).then((r) => r.data),
+  });
+  const baselinePlannable = baselineQuery.data?.summary?.ordersPlannable ?? null;
+  const currentPlannable  = currentQuery.data?.summary?.ordersPlannable ?? null;
+  // delta = how many ADDITIONAL orders enter the plan vs the 3000 baseline.
+  // Always >= 0 because lower threshold = more orders plannable.
+  const deltaVsBaseline = (currentPlannable != null && baselinePlannable != null)
+    ? Math.max(0, currentPlannable - baselinePlannable)
+    : null;
+
   const autoPlanMutation = useMutation({
-    mutationFn: () => runsApi.autoPlan(runDate),
+    // Pass the slider value so /api/runs/auto-plan applies the SAME
+    // threshold the planner just previewed. Backend defaults to 3000
+    // if not sent (current behaviour for older callers).
+    mutationFn: () => runsApi.autoPlan(runDate, { minCustomerTotal }),
     onSuccess: (result) => {
       setPlanResult(result);
       const created = result.runsCreated?.length || 0;
@@ -117,8 +174,12 @@ export default function PlannerPage() {
   // do not create any runs. Lets the planner see who falls outside the
   // rules before committing. Result reuses the ExcludedOrdersPanel.
   const previewExclusionsMutation = useMutation({
+    // Pass the slider value so the on-demand preview matches what auto-plan
+    // would do RIGHT NOW (same threshold). The two background useQuery
+    // hooks above keep counts live as the slider moves; this mutation
+    // remains for the manual "בדיקת חריגים" button + ExcludedOrdersPanel.
     mutationFn: () =>
-      api.get('/runs/auto-plan/preview-exclusions', { params: { runDate } })
+      api.get('/runs/auto-plan/preview-exclusions', { params: { runDate, minCustomerTotal } })
         .then((r) => r.data),
     onSuccess: (result) => {
       // Adapt preview-summary keys to the shape ExcludedOrdersPanel expects.
@@ -176,12 +237,63 @@ export default function PlannerPage() {
         </div>
       </div>
 
+      {/* Customer-total threshold slider (per planner request).
+          Range 2000-3000 ₪. Default 2000 on first load, then persisted
+          per-browser in localStorage. Affects BOTH preview-exclusions
+          AND auto-plan (POST body). The two background useQuery hooks
+          show live counts: current threshold + delta vs baseline 3000. */}
+      <div className="mb-4 bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900">
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex items-center gap-2 font-medium">
+            <Coins size={14} />
+            סף מינימום לקוח: <span className="font-bold tabular-nums">{minCustomerTotal.toLocaleString('he-IL')} ₪</span>
+          </div>
+          <input
+            type="range"
+            min={MIN_CT_LO}
+            max={MIN_CT_HI}
+            step={100}
+            value={minCustomerTotal}
+            onChange={(e) => setMinCustomerTotal(Number(e.target.value))}
+            className="flex-1 min-w-[200px] max-w-md accent-amber-600"
+            aria-label="סף מינימום לקוח"
+          />
+          <div className="text-xs text-amber-800 tabular-nums whitespace-nowrap">
+            {MIN_CT_LO.toLocaleString('he-IL')} – {MIN_CT_HI.toLocaleString('he-IL')} ₪
+          </div>
+        </div>
+        <div className="mt-2 text-xs text-amber-800 flex items-center gap-4 flex-wrap">
+          {currentQuery.isLoading || baselineQuery.isLoading ? (
+            <span>טוען נתונים…</span>
+          ) : currentPlannable == null ? (
+            <span>אין נתוני תכנון לתאריך זה</span>
+          ) : (
+            <>
+              <span>
+                הזמנות לתכנון בסף הנוכחי: <strong className="tabular-nums">{currentPlannable.toLocaleString('he-IL')}</strong>
+              </span>
+              <span className="text-amber-300">·</span>
+              {deltaVsBaseline === 0 || minCustomerTotal === MIN_CT_BASELINE ? (
+                <span>אין שינוי לעומת {MIN_CT_BASELINE.toLocaleString('he-IL')} ₪</span>
+              ) : (
+                <span>
+                  +<strong className="tabular-nums">{deltaVsBaseline?.toLocaleString('he-IL') ?? '…'}</strong> הזמנות נוספות נכנסות לעומת סף {MIN_CT_BASELINE.toLocaleString('he-IL')} ₪
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
       {/* Filter rules info */}
       <div className="mb-4 bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm text-blue-900">
         <strong>תנאים לכניסה למסלול אוטומטי:</strong>
         <span className="mx-2">·</span>
         <Coins size={14} className="inline -mt-0.5 ml-1" />
-        סך הזמנות הלקוח (שתי החברות) ≥ 3,000 ש״ח
+        סך הזמנות הלקוח (שתי החברות) ≥ <span className="tabular-nums">{minCustomerTotal.toLocaleString('he-IL')}</span> ש״ח
+        {minCustomerTotal !== MIN_CT_BASELINE && (
+          <span className="text-blue-600"> (ברירת מחדל: {MIN_CT_BASELINE.toLocaleString('he-IL')})</span>
+        )}
         <span className="mx-2">·</span>
         <PackageX size={14} className="inline -mt-0.5 ml-1" />
         כל הפריטים זמינים במלאי
