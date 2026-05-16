@@ -31,9 +31,27 @@
  *     waits for HTTP liveness.
  *
  * Usage:
- *   node scripts/seed-qc-ready-run.js                # preview only (no changes)
- *   node scripts/seed-qc-ready-run.js --apply        # actually create the seed
- *   node scripts/seed-qc-ready-run.js --cleanup      # remove ALL IsTest=true entries
+ *   node scripts/seed-qc-ready-run.js                                       # preview only (no changes)
+ *   node scripts/seed-qc-ready-run.js --apply                               # actually create the seed (synthetic)
+ *   node scripts/seed-qc-ready-run.js --apply --use-real-sap-orders=<json>  # seed from real SAP orders (A2c-3)
+ *   node scripts/seed-qc-ready-run.js --cleanup                             # remove ALL IsTest=true entries
+ *
+ * A2c-3 flag (--use-real-sap-orders=<path>):
+ *   Reads the JSON output of scripts/discover-test-sap-orders.js --json
+ *   (an object with `orders[]`, each having DocEntry, CardCode, DocumentLines)
+ *   and creates the test RunOrders pointing at real SAP DocEntries instead
+ *   of the synthetic 9_900_000+ range. Picks up to 2 orders for the seed.
+ *
+ *   When this flag is set:
+ *     - RunOrders use real SapDocEntry / SapDocNum / SapCardCode / SapCardName
+ *     - WaveLines + WaveAllocations are built from the real DocumentLines
+ *     - Quantities come from OpenQuantity (fallback Quantity)
+ *     - If the real CardCode already has a customerDeliveryProfile, we
+ *       reuse it (the real customer's DocPolicy applies). Otherwise we
+ *       create a tagged-IsTest profile with aggregateDeliveryNote=yes.
+ *   When the flag is NOT set:
+ *     - Synthetic behaviour (CardCode=TEST-SEED-A1, SapDocEntry=9_900_001+)
+ *       — unchanged from the original A2c-2 seed.
  *
  * Exit codes:
  *   0  success
@@ -130,10 +148,22 @@ async function waitLiveness() {
 
 // ---------------------------------------------------------------------------
 // Seed plan — what we add. Documented so reviewers see the full footprint.
+//
+// A2c-3 (2026-05-16): accepts an optional `realOrders` array (from
+// scripts/discover-test-sap-orders.js --json). When provided, the seed
+// uses real SAP DocEntries / CardCodes / DocumentLines instead of the
+// synthetic 9_900_000+ range. When null, behaviour is unchanged from
+// the original A2c-2 synthetic seed.
 // ---------------------------------------------------------------------------
-function buildSeedPlan(s) {
+function buildSeedPlan(s, realOrders = null) {
   const now = new Date().toISOString();
   const runTag = TEST_RUN_PREFIX + Date.now();
+  const useReal = Array.isArray(realOrders) && realOrders.length >= 1;
+
+  // Pick up to 2 real orders (mirror the synthetic seed shape — 2 orders, 1
+  // customer profile, 1 wave). If fewer than 2 supplied, work with what we have.
+  const selectedOrders = useReal ? realOrders.slice(0, 2) : null;
+  const orderCount = useReal ? selectedOrders.length : 2;
 
   // Counters: bump from current store. Do NOT decrement on cleanup — these
   // are monotonic and small wasted-id gaps are harmless.
@@ -152,44 +182,70 @@ function buildSeedPlan(s) {
     ZoneId: 1, ZoneCode: 'TEST', ZoneName: 'בדיקה', ZoneColor: '#888888',
     DriverId: null, DriverName: '', DriverPhone: '', VehiclePlate: '',
     Status: 'OPEN', PlannedStartTime: null, ActualStartTime: null, ActualEndTime: null,
-    Notes: 'TEST SEED — auto-created for Phase A2 dry-run validation. Safe to delete via --cleanup.',
+    Notes: useReal
+      ? 'TEST SEED (A2c-3 real SAP orders) — Safe to delete via --cleanup.'
+      : 'TEST SEED — auto-created for Phase A2 dry-run validation. Safe to delete via --cleanup.',
     CreatedAt: now,
-    StopCount: 2, OrderCount: 2, PalletMode: 'SINGLE',
+    StopCount: orderCount, OrderCount: orderCount, PalletMode: 'SINGLE',
     IsTest: true,
   };
 
-  // 2 Stops (each holds 1 RunOrder). Test addresses; no real geolocation.
-  const stops = [
-    { StopId: nextStopId,     RunId: run.RunId, AddressId: null, StopOrder: 1, Status: 'PENDING',
+  // Stops — one per RunOrder. In real mode, BranchName comes from CardName.
+  const stops = [];
+  for (let i = 0; i < orderCount; i++) {
+    const cardName = useReal
+      ? (selectedOrders[i].CardName || selectedOrders[i].CardCode)
+      : (TEST_CARDNAME + ' #' + (i + 1));
+    stops.push({
+      StopId: nextStopId + i, RunId: run.RunId, AddressId: null,
+      StopOrder: i + 1, Status: 'PENDING',
       ArrivedAt: null, CompletedAt: null, SignatureUrl: null, PhotoUrl: null, Notes: 'TEST',
-      Street: 'בדיקה 1', BuildingNumber: '', City: 'תל אביב', BranchName: TEST_CARDNAME + ' #1',
+      Street: useReal ? '' : `בדיקה ${i + 1}`, BuildingNumber: '',
+      City: useReal ? '' : 'תל אביב',
+      BranchName: cardName,
       Latitude: null, Longitude: null, DeliveryWindowStart: null, DeliveryWindowEnd: null,
       DeliveryDays: null, ContactPhone: null, ContactName: null, DeliveryNotes: null,
-      SuggestedZoneId: 1, SuggestedZoneName: 'בדיקה', IsTest: true },
-    { StopId: nextStopId + 1, RunId: run.RunId, AddressId: null, StopOrder: 2, Status: 'PENDING',
-      ArrivedAt: null, CompletedAt: null, SignatureUrl: null, PhotoUrl: null, Notes: 'TEST',
-      Street: 'בדיקה 2', BuildingNumber: '', City: 'תל אביב', BranchName: TEST_CARDNAME + ' #2',
-      Latitude: null, Longitude: null, DeliveryWindowStart: null, DeliveryWindowEnd: null,
-      DeliveryDays: null, ContactPhone: null, ContactName: null, DeliveryNotes: null,
-      SuggestedZoneId: 1, SuggestedZoneName: 'בדיקה', IsTest: true },
-  ];
+      SuggestedZoneId: 1, SuggestedZoneName: 'בדיקה', IsTest: true,
+    });
+  }
 
-  // 2 RunOrders, both for the SAME synthetic customer so aggregateDN flow
-  // groups them. SapDocEntry in reserved high range (no real collision).
-  const runOrders = [
-    { RunOrderId: nextRunOrderId,     StopId: stops[0].StopId, CompanyId: TEST_COMPANY_ID,
-      CompanyCode: TEST_COMPANY_CODE, CompanyName: TEST_COMPANY_NAME,
-      SapDocEntry: TEST_SAPDOCENTRY_BASE + 1, SapDocNum: TEST_SAPDOCENTRY_BASE + 1,
-      SapCardCode: TEST_CARDCODE, SapCardName: TEST_CARDNAME,
-      OrderTotal: 100, LinesCount: 2, Status: 'PENDING', SapDeliveryDocEntry: null,
-      IsTest: true },
-    { RunOrderId: nextRunOrderId + 1, StopId: stops[1].StopId, CompanyId: TEST_COMPANY_ID,
-      CompanyCode: TEST_COMPANY_CODE, CompanyName: TEST_COMPANY_NAME,
-      SapDocEntry: TEST_SAPDOCENTRY_BASE + 2, SapDocNum: TEST_SAPDOCENTRY_BASE + 2,
-      SapCardCode: TEST_CARDCODE, SapCardName: TEST_CARDNAME,
-      OrderTotal: 60, LinesCount: 1, Status: 'PENDING', SapDeliveryDocEntry: null,
-      IsTest: true },
-  ];
+  // RunOrders — real or synthetic.
+  let runOrders;
+  if (useReal) {
+    runOrders = selectedOrders.map((src, i) => ({
+      RunOrderId: nextRunOrderId + i,
+      StopId: stops[i].StopId,
+      CompanyId: TEST_COMPANY_ID,
+      CompanyCode: TEST_COMPANY_CODE,
+      CompanyName: TEST_COMPANY_NAME,
+      SapDocEntry: Number(src.DocEntry),
+      SapDocNum: Number(src.DocNum != null ? src.DocNum : src.DocEntry),
+      SapCardCode: src.CardCode,
+      SapCardName: src.CardName || src.CardCode,
+      OrderTotal: Number(src.DocTotal || 0),
+      LinesCount: (src.DocumentLines || []).length,
+      Status: 'PENDING',
+      SapDeliveryDocEntry: null,
+      IsTest: true,
+    }));
+  } else {
+    // Synthetic: 2 RunOrders for the same fake customer, SapDocEntry in
+    // reserved high range (no real collision).
+    runOrders = [
+      { RunOrderId: nextRunOrderId,     StopId: stops[0].StopId, CompanyId: TEST_COMPANY_ID,
+        CompanyCode: TEST_COMPANY_CODE, CompanyName: TEST_COMPANY_NAME,
+        SapDocEntry: TEST_SAPDOCENTRY_BASE + 1, SapDocNum: TEST_SAPDOCENTRY_BASE + 1,
+        SapCardCode: TEST_CARDCODE, SapCardName: TEST_CARDNAME,
+        OrderTotal: 100, LinesCount: 2, Status: 'PENDING', SapDeliveryDocEntry: null,
+        IsTest: true },
+      { RunOrderId: nextRunOrderId + 1, StopId: stops[1].StopId, CompanyId: TEST_COMPANY_ID,
+        CompanyCode: TEST_COMPANY_CODE, CompanyName: TEST_COMPANY_NAME,
+        SapDocEntry: TEST_SAPDOCENTRY_BASE + 2, SapDocNum: TEST_SAPDOCENTRY_BASE + 2,
+        SapCardCode: TEST_CARDCODE, SapCardName: TEST_CARDNAME,
+        OrderTotal: 60, LinesCount: 1, Status: 'PENDING', SapDeliveryDocEntry: null,
+        IsTest: true },
+    ];
+  }
 
   // 1 Wave (COMPLETED — so _selectActiveWaveForRun picks it).
   const wave = {
@@ -204,76 +260,169 @@ function buildSeedPlan(s) {
     IsTest: true,
   };
 
-  // 2 WaveLines (1 per item). Quantities sum to what's allocated below.
-  const waveLines = [
-    { WaveLineId: nextWaveLineId,     WaveId: wave.WaveId,
-      SapItemCode: 'TEST-ITEM-01', SapItemName: 'פריט בדיקה 1', Barcode: 'TEST001',
-      UomCode: 'יח', BinLocation: 'TEST',
-      TotalQuantity: 3, PickedQuantity: 3, Status: 'COMPLETED', AllocationCount: 2, Notes: null,
-      IsTest: true },
-    { WaveLineId: nextWaveLineId + 1, WaveId: wave.WaveId,
-      SapItemCode: 'TEST-ITEM-02', SapItemName: 'פריט בדיקה 2', Barcode: 'TEST002',
-      UomCode: 'יח', BinLocation: 'TEST',
-      TotalQuantity: 2, PickedQuantity: 2, Status: 'COMPLETED', AllocationCount: 1, Notes: null,
-      IsTest: true },
-  ];
+  // WaveLines + WaveAllocations
+  let waveLines, waveAllocations;
+  if (useReal) {
+    // Real mode: each unique ItemCode across selectedOrders → one WaveLine.
+    // Each (line × order) pair with qty > 0 → one Allocation.
+    const lineMap = new Map(); // ItemCode → wlObj
+    for (const src of selectedOrders) {
+      for (const ln of (src.DocumentLines || [])) {
+        const itemKey = ln.ItemCode;
+        if (!itemKey) continue;
+        const qty = Number(ln.OpenQuantity != null ? ln.OpenQuantity : ln.Quantity || 0);
+        if (qty <= 0) continue;
+        if (!lineMap.has(itemKey)) {
+          lineMap.set(itemKey, {
+            WaveLineId: nextWaveLineId + lineMap.size,
+            SapItemCode: ln.ItemCode,
+            SapItemName: ln.ItemDescription || ln.ItemCode,
+            Barcode: ln.Barcode || '',
+            TotalQuantity: 0,
+            PickedQuantity: 0,
+            allocs: [],
+          });
+        }
+        const wl = lineMap.get(itemKey);
+        wl.TotalQuantity += qty;
+        wl.PickedQuantity += qty;
+        wl.allocs.push({
+          CompanyCode: TEST_COMPANY_CODE,
+          SapDocEntry: Number(src.DocEntry),
+          SapDocNum: Number(src.DocNum != null ? src.DocNum : src.DocEntry),
+          SapOrderLineNum: ln.LineNum != null ? Number(ln.LineNum) : 0,
+          SapCardName: src.CardName || src.CardCode,
+          City: '',
+          BranchName: src.CardName || src.CardCode,
+          Quantity: qty,
+          PickedQuantity: qty,
+        });
+      }
+    }
+    waveLines = [];
+    waveAllocations = [];
+    let allocSeq = 0;
+    for (const wl of lineMap.values()) {
+      waveLines.push({
+        WaveLineId: wl.WaveLineId, WaveId: wave.WaveId,
+        SapItemCode: wl.SapItemCode, SapItemName: wl.SapItemName, Barcode: wl.Barcode,
+        UomCode: 'יח', BinLocation: 'TEST',
+        TotalQuantity: wl.TotalQuantity, PickedQuantity: wl.PickedQuantity,
+        Status: 'COMPLETED', AllocationCount: wl.allocs.length, Notes: null, IsTest: true,
+      });
+      for (const a of wl.allocs) {
+        waveAllocations.push({
+          AllocationId: nextWaveAllocationId + allocSeq++,
+          WaveLineId: wl.WaveLineId,
+          ...a,
+          Status: 'COMPLETED', IsTest: true,
+        });
+      }
+    }
+  } else {
+    // Synthetic — 2 WaveLines + 3 WaveAllocations as before.
+    waveLines = [
+      { WaveLineId: nextWaveLineId,     WaveId: wave.WaveId,
+        SapItemCode: 'TEST-ITEM-01', SapItemName: 'פריט בדיקה 1', Barcode: 'TEST001',
+        UomCode: 'יח', BinLocation: 'TEST',
+        TotalQuantity: 3, PickedQuantity: 3, Status: 'COMPLETED', AllocationCount: 2, Notes: null,
+        IsTest: true },
+      { WaveLineId: nextWaveLineId + 1, WaveId: wave.WaveId,
+        SapItemCode: 'TEST-ITEM-02', SapItemName: 'פריט בדיקה 2', Barcode: 'TEST002',
+        UomCode: 'יח', BinLocation: 'TEST',
+        TotalQuantity: 2, PickedQuantity: 2, Status: 'COMPLETED', AllocationCount: 1, Notes: null,
+        IsTest: true },
+    ];
+    waveAllocations = [
+      { AllocationId: nextWaveAllocationId,     WaveLineId: waveLines[0].WaveLineId,
+        CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[0].SapDocEntry,
+        SapDocNum: runOrders[0].SapDocNum, SapOrderLineNum: 1,
+        SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #1',
+        Quantity: 2, PickedQuantity: 2, Status: 'COMPLETED', IsTest: true },
+      { AllocationId: nextWaveAllocationId + 1, WaveLineId: waveLines[0].WaveLineId,
+        CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[1].SapDocEntry,
+        SapDocNum: runOrders[1].SapDocNum, SapOrderLineNum: 1,
+        SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #2',
+        Quantity: 1, PickedQuantity: 1, Status: 'COMPLETED', IsTest: true },
+      { AllocationId: nextWaveAllocationId + 2, WaveLineId: waveLines[1].WaveLineId,
+        CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[0].SapDocEntry,
+        SapDocNum: runOrders[0].SapDocNum, SapOrderLineNum: 2,
+        SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #1',
+        Quantity: 2, PickedQuantity: 2, Status: 'COMPLETED', IsTest: true },
+    ];
+  }
 
-  // 3 WaveAllocations — each with PickedQuantity > 0. Linkage:
-  //   line 1 (3 units) → split: order1=2, order2=1
-  //   line 2 (2 units) → all to order1
-  const waveAllocations = [
-    { AllocationId: nextWaveAllocationId,     WaveLineId: waveLines[0].WaveLineId,
-      CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[0].SapDocEntry,
-      SapDocNum: runOrders[0].SapDocNum, SapOrderLineNum: 1,
-      SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #1',
-      Quantity: 2, PickedQuantity: 2, Status: 'COMPLETED', IsTest: true },
-    { AllocationId: nextWaveAllocationId + 1, WaveLineId: waveLines[0].WaveLineId,
-      CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[1].SapDocEntry,
-      SapDocNum: runOrders[1].SapDocNum, SapOrderLineNum: 1,
-      SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #2',
-      Quantity: 1, PickedQuantity: 1, Status: 'COMPLETED', IsTest: true },
-    { AllocationId: nextWaveAllocationId + 2, WaveLineId: waveLines[1].WaveLineId,
-      CompanyCode: TEST_COMPANY_CODE, SapDocEntry: runOrders[0].SapDocEntry,
-      SapDocNum: runOrders[0].SapDocNum, SapOrderLineNum: 2,
-      SapCardName: TEST_CARDNAME, City: 'תל אביב', BranchName: TEST_CARDNAME + ' #1',
-      Quantity: 2, PickedQuantity: 2, Status: 'COMPLETED', IsTest: true },
-  ];
+  // Customer DeliveryProfile.
+  //   - Real mode: if a profile already exists for the real CardCode, reuse it
+  //     (the real customer's DocPolicy applies). Otherwise create a tagged-
+  //     IsTest profile with aggregateDeliveryNote='yes' so the flush flow has
+  //     somewhere to land.
+  //   - Synthetic mode: always create the TEST-SEED-A1 profile.
+  let customerProfile = null;
+  if (useReal) {
+    const realCardCode = selectedOrders[0].CardCode;
+    const existing = (s.customerDeliveryProfiles || []).find((p) => p && p.CardCode === realCardCode);
+    if (!existing) {
+      customerProfile = {
+        CardCode: realCardCode,
+        Company: TEST_COMPANY_NAME,
+        Name: selectedOrders[0].CardName || realCardCode,
+        City: '', Street: '', Zone: 'TEST', SubZone: '',
+        ZoneNameRaw: '', DeliveryDays: [], Issue: '',
+        DocPolicy: {
+          perOrderDeliveryNote: 'no',
+          perOrderInvoice: 'no',
+          aggregateDeliveryNote: 'yes',
+          aggregateInvoice: 'no',
+          notes: 'TEST SEED (A2c-3 real-orders) — Delete with --cleanup.',
+          updatedAt: now,
+        },
+        IsTest: true,
+      };
+    }
+    // If existing profile, customerProfile stays null → applySeed skips it
+    // → real customer's existing DocPolicy applies.
+  } else {
+    customerProfile = {
+      CardCode: TEST_CARDCODE,
+      Company: TEST_COMPANY_NAME,
+      Name: TEST_CARDNAME,
+      City: 'תל אביב', Street: 'בדיקה 1', Zone: 'TEST', SubZone: '',
+      ZoneNameRaw: 'בדיקה', DeliveryDays: [], Issue: '',
+      DocPolicy: {
+        perOrderDeliveryNote: 'no',
+        perOrderInvoice: 'no',
+        aggregateDeliveryNote: 'yes',
+        aggregateInvoice: 'no',
+        notes: 'TEST SEED — for Phase A2 dry-run validation only. Delete with --cleanup.',
+        updatedAt: now,
+      },
+      IsTest: true,
+    };
+  }
 
-  // 1 synthetic customer DeliveryProfile — aggregateDN=yes so the A2
-  // flush-aggregate-docs path is exercised. Per-order DN/INV stay 'no'
-  // to keep the flow narrow (one DN per customer, no invoice).
-  const customerProfile = {
-    CardCode: TEST_CARDCODE,
-    Company: TEST_COMPANY_NAME,
-    Name: TEST_CARDNAME,
-    City: 'תל אביב', Street: 'בדיקה 1', Zone: 'TEST', SubZone: '',
-    ZoneNameRaw: 'בדיקה', DeliveryDays: [], Issue: '',
-    DocPolicy: {
-      perOrderDeliveryNote: 'no',
-      perOrderInvoice: 'no',
-      aggregateDeliveryNote: 'yes',
-      aggregateInvoice: 'no',
-      notes: 'TEST SEED — for Phase A2 dry-run validation only. Delete with --cleanup.',
-      updatedAt: now,
+  return {
+    run, stops, runOrders, wave, waveLines, waveAllocations, customerProfile,
+    counters: {
+      nextRunId: nextRunId + 1,
+      nextStopId: nextStopId + stops.length,
+      nextRunOrderId: nextRunOrderId + runOrders.length,
+      nextWaveId: nextWaveId + 1,
+      nextWaveLineId: nextWaveLineId + waveLines.length,
+      nextWaveAllocationId: nextWaveAllocationId + waveAllocations.length,
     },
-    IsTest: true,
   };
-
-  return { run, stops, runOrders, wave, waveLines, waveAllocations, customerProfile,
-           counters: {
-             nextRunId: nextRunId + 1,
-             nextStopId: nextStopId + 2,
-             nextRunOrderId: nextRunOrderId + 2,
-             nextWaveId: nextWaveId + 1,
-             nextWaveLineId: nextWaveLineId + 2,
-             nextWaveAllocationId: nextWaveAllocationId + 3,
-           } };
 }
 
 function applySeed(s, plan) {
-  // Idempotency: if a profile with our CardCode already exists, abort.
-  if ((s.customerDeliveryProfiles || []).some((p) => p.CardCode === TEST_CARDCODE)) {
-    err(`A profile with CardCode=${TEST_CARDCODE} already exists. Run --cleanup first.`);
+  // Idempotency: refuse if a seed run with the SEED-TEST- prefix is already
+  // in the store. Covers both synthetic and real-orders modes — the run
+  // prefix is the stable identifier (CardCode differs between modes).
+  const existingSeed = (s.runs || []).find(
+    (r) => r && r.IsTest === true && typeof r.RunNumber === 'string' && r.RunNumber.startsWith(TEST_RUN_PREFIX)
+  );
+  if (existingSeed) {
+    err(`A test seed run already exists (RunId=${existingSeed.RunId}, ${existingSeed.RunNumber}). Run --cleanup first.`);
     process.exit(5);
   }
   (s.runs ||= []).push(plan.run);
@@ -282,7 +431,11 @@ function applySeed(s, plan) {
   (s.waves ||= []).push(plan.wave);
   (s.waveLines ||= []).push(...plan.waveLines);
   (s.waveAllocations ||= []).push(...plan.waveAllocations);
-  (s.customerDeliveryProfiles ||= []).push(plan.customerProfile);
+  // customerProfile is null in real-orders mode when an existing profile is
+  // being reused — don't push null into the array.
+  if (plan.customerProfile) {
+    (s.customerDeliveryProfiles ||= []).push(plan.customerProfile);
+  }
   Object.assign(s, plan.counters);
 }
 
@@ -339,27 +492,78 @@ function applyCleanup(s) {
 }
 
 // ---------------------------------------------------------------------------
+// A2c-3 helper: load real SAP orders from discovery JSON output
+// ---------------------------------------------------------------------------
+function loadRealSapOrders(filePath) {
+  if (!fs.existsSync(filePath)) {
+    err(`--use-real-sap-orders: file not found: ${filePath}`);
+    process.exit(6);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    err(`--use-real-sap-orders: failed to parse JSON: ${e.message}`);
+    process.exit(6);
+  }
+  // Accept either the discover-test-sap-orders --json shape ({ orders: [...] })
+  // or a bare array of orders. Be forgiving.
+  const orders = Array.isArray(parsed) ? parsed
+               : Array.isArray(parsed.orders) ? parsed.orders
+               : null;
+  if (!orders || orders.length === 0) {
+    err(`--use-real-sap-orders: no orders found in file (expected {orders:[...]} or bare array)`);
+    process.exit(6);
+  }
+  // Sanity-check each order has the fields buildSeedPlan needs.
+  for (const o of orders) {
+    if (o.DocEntry == null || !o.CardCode) {
+      err(`--use-real-sap-orders: order missing DocEntry or CardCode: ${JSON.stringify(o).slice(0, 200)}`);
+      process.exit(6);
+    }
+  }
+  log(`loaded ${orders.length} real SAP orders from ${path.basename(filePath)}`);
+  return orders;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 const args = process.argv.slice(2);
 const isApply = args.includes('--apply');
 const isCleanup = args.includes('--cleanup');
+const realFlagArg = args.find((a) => a.startsWith('--use-real-sap-orders='));
+const REAL_ORDERS_PATH = realFlagArg ? realFlagArg.split('=').slice(1).join('=') : null;
 
 (async () => {
   if (isApply && isCleanup) { err('--apply and --cleanup are mutually exclusive'); process.exit(1); }
+  if (REAL_ORDERS_PATH && isCleanup) {
+    err('--use-real-sap-orders is for --apply only (cleanup matches by IsTest tag, no SAP data needed)');
+    process.exit(1);
+  }
+
+  // A2c-3: load real orders BEFORE any server touch — fail-fast on bad input.
+  const realOrders = REAL_ORDERS_PATH ? loadRealSapOrders(REAL_ORDERS_PATH) : null;
 
   // Dry-run preview path: no server touch, no mutation.
   if (!isApply && !isCleanup) {
     const s = loadStore();
-    const plan = buildSeedPlan(s);
-    log('=== PREVIEW (no changes) ===');
+    const plan = buildSeedPlan(s, realOrders);
+    log(`=== PREVIEW (no changes${realOrders ? ', real SAP orders mode' : ', synthetic mode'}) ===`);
     log(`Would add 1 run (RunId=${plan.run.RunId}, ${plan.run.RunNumber})`);
-    log(`Would add 2 stops (StopId ${plan.stops[0].StopId}..${plan.stops[1].StopId})`);
-    log(`Would add 2 runOrders (RunOrderId ${plan.runOrders[0].RunOrderId}..${plan.runOrders[1].RunOrderId})`);
+    log(`Would add ${plan.stops.length} stops (StopId ${plan.stops[0].StopId}..${plan.stops[plan.stops.length - 1].StopId})`);
+    log(`Would add ${plan.runOrders.length} runOrders (RunOrderId ${plan.runOrders[0].RunOrderId}..${plan.runOrders[plan.runOrders.length - 1].RunOrderId})`);
+    for (const ro of plan.runOrders) {
+      log(`  RunOrder: SapDocEntry=${ro.SapDocEntry} CardCode=${ro.SapCardCode} '${(ro.SapCardName || '').slice(0, 40)}'`);
+    }
     log(`Would add 1 wave (WaveId=${plan.wave.WaveId}, Status=${plan.wave.Status})`);
-    log(`Would add 2 waveLines (WaveLineId ${plan.waveLines[0].WaveLineId}..${plan.waveLines[1].WaveLineId})`);
-    log(`Would add 3 waveAllocations (AllocationId ${plan.waveAllocations[0].AllocationId}..${plan.waveAllocations[2].AllocationId})`);
-    log(`Would add 1 customer profile (CardCode=${TEST_CARDCODE}, DocPolicy.aggregateDN=yes)`);
+    log(`Would add ${plan.waveLines.length} waveLines`);
+    log(`Would add ${plan.waveAllocations.length} waveAllocations`);
+    if (plan.customerProfile) {
+      log(`Would add 1 customer profile (CardCode=${plan.customerProfile.CardCode}, DocPolicy.aggregateDN=${plan.customerProfile.DocPolicy.aggregateDeliveryNote})`);
+    } else {
+      log(`Reusing existing customer profile (no new profile created)`);
+    }
     log('Run with --apply to actually seed, --cleanup to remove all IsTest=true entries.');
     process.exit(0);
   }
@@ -369,7 +573,7 @@ const isCleanup = args.includes('--cleanup');
   const s = loadStore();
 
   if (isApply) {
-    const plan = buildSeedPlan(s);
+    const plan = buildSeedPlan(s, realOrders);
     applySeed(s, plan);
     saveStore(s);
     log(`seeded: run=${plan.run.RunId} orders=[${plan.runOrders.map((o) => o.RunOrderId).join(',')}] wave=${plan.wave.WaveId}`);
