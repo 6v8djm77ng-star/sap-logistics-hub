@@ -157,6 +157,35 @@ app.use(errorHandler);
 const io = initSocketServer(server);
 app.set('io', io);
 
+// A2c-1 startup gate — if SAP_WRITE_ENABLED=true, refuse to listen unless
+// the configured company DBs are explicitly in SAP_LIVE_WRITE_DB_WHITELIST.
+// Defense-in-depth against accidentally pointing live writes at production
+// after an env reload. See backend/src/demo/sapWriter.js →
+// _checkLiveWriteWhitelist for the rules.
+{
+  const { _checkLiveWriteWhitelist } = await import('./demo/sapWriter.js');
+  const gate = _checkLiveWriteWhitelist({
+    writeEnabled: process.env.SAP_WRITE_ENABLED === 'true',
+    whitelist: process.env.SAP_LIVE_WRITE_DB_WHITELIST,
+    dbA: process.env.SAP_SL_COMPANY_DB_A
+      || process.env.SAP_SERVICE_LAYER_COMPANY_A
+      || process.env.SAP_SQL_DB_A,
+    dbB: process.env.SAP_SL_COMPANY_DB_B
+      || process.env.SAP_SERVICE_LAYER_COMPANY_B
+      || process.env.SAP_SQL_DB_B,
+  });
+  if (!gate.ok) {
+    logger.error('[A2c-1 STARTUP GATE FAILED] ' + gate.message);
+    logger.error('Set SAP_LIVE_WRITE_DB_WHITELIST=<comma-separated DBs> OR unset SAP_WRITE_ENABLED (drops to dry-run mode).');
+    process.exit(1);
+  }
+  if (gate.reason === 'WRITE_DISABLED') {
+    logger.info('[A2c-1] SAP_WRITE_ENABLED is not set → dry-run mode (whitelist check skipped)');
+  } else {
+    logger.info(`[A2c-1] SAP write gate OK. Whitelist: [${gate.whitelist.join(', ')}]`);
+  }
+}
+
 // Start
 server.listen(env.PORT, () => {
   logger.info(`🚚 SAP Logistics Hub API listening on http://localhost:${env.PORT}`);

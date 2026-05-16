@@ -175,6 +175,15 @@ export async function writeDeliveryNote(dn, options = {}) {
     };
   }
 
+  // A2c-1 per-request gate. Throws 503 if env has drifted since startup
+  // and the target DB is no longer in SAP_LIVE_WRITE_DB_WHITELIST.
+  try {
+    assertLiveWriteAllowedAtRequest();
+  } catch (err) {
+    logWrite(`DN ${dn.DocNumber} GATE BLOCKED: ${err.message}`);
+    return { ok: false, dryRun: false, error: err.message, code: err.code, payload };
+  }
+
   try {
     const result = await postSAP(dn.CompanyCode, 'DeliveryNotes', payload);
     return {
@@ -218,6 +227,14 @@ export async function writeInvoice(invoice, dn, options = {}) {
     };
   }
 
+  // A2c-1 per-request gate (mirror of writeDeliveryNote).
+  try {
+    assertLiveWriteAllowedAtRequest();
+  } catch (err) {
+    logWrite(`INV ${invoice.DocNumber} GATE BLOCKED: ${err.message}`);
+    return { ok: false, dryRun: false, error: err.message, code: err.code, payload };
+  }
+
   try {
     const result = await postSAP(invoice.CompanyCode, 'Invoices', payload);
     return {
@@ -242,5 +259,81 @@ export function getWriterStatus() {
     canWrite: !!slUrl() && isWriteEnabled(),
     mode: !slUrl() || !isWriteEnabled() ? 'DRY-RUN' : 'LIVE',
     logFile: LOG_FILE,
+    whitelist: parseWhitelist(process.env.SAP_LIVE_WRITE_DB_WHITELIST),
   };
+}
+
+/**
+ * A2c-1 (2026-05-16): SAP_LIVE_WRITE_DB_WHITELIST is an explicit, comma-
+ * separated list of SAP company DB names that this server is allowed to
+ * write to when SAP_WRITE_ENABLED=true. Defense-in-depth against a config
+ * mistake where the wrong DB name ends up in SAP_SL_COMPANY_DB_A/B.
+ *
+ * Rules:
+ *   - SAP_WRITE_ENABLED != 'true'  → whitelist not required (dry-run mode)
+ *   - SAP_WRITE_ENABLED == 'true' AND whitelist empty/missing → FAIL
+ *     (the operator MUST be explicit; we won't infer a default)
+ *   - SAP_WRITE_ENABLED == 'true' AND any current DB not in whitelist → FAIL
+ *
+ * Used in two places:
+ *   1. demoServer.js startup gate — refuses to listen if the gate fails.
+ *   2. writeDeliveryNote() / writeInvoice() per-request gate — catches a
+ *      live env swap between startup and request time (so a runtime
+ *      reload that points DB to production can't sneak a write through).
+ *
+ * Exported as `_checkLiveWriteWhitelist` for unit tests.
+ */
+export function parseWhitelist(raw) {
+  return (raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+export function _checkLiveWriteWhitelist({ writeEnabled, whitelist, dbA, dbB } = {}) {
+  if (writeEnabled !== true) {
+    return { ok: true, reason: 'WRITE_DISABLED' };
+  }
+  const list = parseWhitelist(whitelist);
+  if (list.length === 0) {
+    return {
+      ok: false,
+      reason: 'WHITELIST_REQUIRED',
+      message: 'SAP_WRITE_ENABLED=true requires SAP_LIVE_WRITE_DB_WHITELIST to be set (comma-separated list of allowed DB names). Refusing to allow live writes without an explicit whitelist.',
+    };
+  }
+  const offenders = [];
+  if (dbA && !list.includes(dbA)) offenders.push({ company: 'A', db: dbA });
+  if (dbB && !list.includes(dbB)) offenders.push({ company: 'B', db: dbB });
+  if (offenders.length) {
+    return {
+      ok: false,
+      reason: 'DB_NOT_WHITELISTED',
+      message: `SAP_WRITE_ENABLED=true but these company DBs are NOT in SAP_LIVE_WRITE_DB_WHITELIST: ${offenders.map((o) => `${o.company}=${o.db}`).join(', ')}. Whitelist: [${list.join(', ')}].`,
+      offenders,
+      whitelist: list,
+    };
+  }
+  return { ok: true, reason: 'WHITELISTED', whitelist: list };
+}
+
+/**
+ * Per-request gate — called by writeDeliveryNote() / writeInvoice() right
+ * before posting to SAP. Reads env at call time (not import time) so any
+ * runtime change to SAP_LIVE_WRITE_DB_WHITELIST / SAP_SL_COMPANY_DB_*
+ * takes effect immediately. Throws an Error with .status=503 on failure.
+ *
+ * Only enforced when isWriteEnabled() — dry-run paths skip this gate.
+ */
+function assertLiveWriteAllowedAtRequest() {
+  if (!isWriteEnabled()) return; // dry-run never touches SAP, gate not relevant
+  const gate = _checkLiveWriteWhitelist({
+    writeEnabled: true,
+    whitelist: process.env.SAP_LIVE_WRITE_DB_WHITELIST,
+    dbA: getCompanyDb('A'),
+    dbB: getCompanyDb('B'),
+  });
+  if (!gate.ok) {
+    const err = new Error('[A2c-1 per-request gate] ' + gate.message);
+    err.status = 503;
+    err.code = gate.reason;
+    throw err;
+  }
 }
