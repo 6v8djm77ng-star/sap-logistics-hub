@@ -34,15 +34,33 @@ function logWrite(line) {
   } catch {}
 }
 
+/**
+ * P1 (2026-05-16): the canonical env names in .env.example are SAP_SL_*
+ * (SAP_SL_URL, SAP_SL_USERNAME, SAP_SL_PASSWORD, SAP_SL_COMPANY_DB_A/B),
+ * but this file was originally written against SAP_SERVICE_LAYER_* names
+ * that never made it into .env or .env.example. Result: even with
+ * SAP_WRITE_ENABLED=true, slUrl()/slUser()/slPass() all returned '' and
+ * login() would silently fail — a hidden safety net but also a config
+ * blocker that prevented even deliberate test-DB writes from working.
+ *
+ * Fix: read SAP_SL_* first (matches .env / .env.example), fall back to
+ * SAP_SERVICE_LAYER_* (legacy), and for the company DB also fall back to
+ * SAP_SQL_DB_A/B as a last resort. Backwards-compat: any env that worked
+ * before keeps working.
+ */
 function getCompanyDb(code) {
   return code === 'A'
-    ? process.env.SAP_SERVICE_LAYER_COMPANY_A || process.env.SAP_SQL_DB_A
-    : process.env.SAP_SERVICE_LAYER_COMPANY_B || process.env.SAP_SQL_DB_B;
+    ? process.env.SAP_SL_COMPANY_DB_A
+        || process.env.SAP_SERVICE_LAYER_COMPANY_A
+        || process.env.SAP_SQL_DB_A
+    : process.env.SAP_SL_COMPANY_DB_B
+        || process.env.SAP_SERVICE_LAYER_COMPANY_B
+        || process.env.SAP_SQL_DB_B;
 }
 
-const slUrl = () => process.env.SAP_SERVICE_LAYER_URL || '';
-const slUser = () => process.env.SAP_SERVICE_LAYER_USER || '';
-const slPass = () => process.env.SAP_SERVICE_LAYER_PASSWORD || '';
+const slUrl  = () => process.env.SAP_SL_URL      || process.env.SAP_SERVICE_LAYER_URL      || '';
+const slUser = () => process.env.SAP_SL_USERNAME || process.env.SAP_SERVICE_LAYER_USER     || '';
+const slPass = () => process.env.SAP_SL_PASSWORD || process.env.SAP_SERVICE_LAYER_PASSWORD || '';
 const isWriteEnabled = () => process.env.SAP_WRITE_ENABLED === 'true';
 
 const agent = new https.Agent({ rejectUnauthorized: false });
