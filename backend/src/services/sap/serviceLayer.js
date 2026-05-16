@@ -14,6 +14,7 @@ import axios from 'axios';
 import https from 'https';
 import { env } from '../../config/env.js';
 import { sapLogger } from '../../utils/logger.js';
+import { assertLiveWriteAllowed } from './writeWhitelist.js';
 
 const httpsAgent = new https.Agent({
   rejectUnauthorized: env.SAP_SL_SSL_REJECT_UNAUTHORIZED,
@@ -130,6 +131,26 @@ class ServiceLayerSession {
     return res.data;
   }
 
+  /**
+   * Bug 3 fix (2026-05-16) — per-request whitelist gate for any
+   * SAP-mutating call. Mirrors the per-request gate in sapWriter.js so
+   * callers going through the deliveryNotes/returnRequests services
+   * (driver-flow path) get the same protection as callers going through
+   * sapWriter (flush-aggregate path).
+   *
+   * Reads env at call time so a runtime SAP_LIVE_WRITE_DB_WHITELIST or
+   * SAP_SL_COMPANY_DB_* change takes effect immediately. No-op when
+   * SAP_WRITE_ENABLED!=true. Throws .status=503 on whitelist failure.
+   */
+  _assertLiveWriteAllowed() {
+    assertLiveWriteAllowed({
+      writeEnabled: process.env.SAP_WRITE_ENABLED === 'true',
+      whitelist: process.env.SAP_LIVE_WRITE_DB_WHITELIST,
+      dbA: env.SAP_SL_COMPANY_DB_A,
+      dbB: env.SAP_SL_COMPANY_DB_B,
+    });
+  }
+
   // ---------- Business operations ----------
 
   /**
@@ -138,6 +159,7 @@ class ServiceLayerSession {
    * SAP Entity: DeliveryNotes (ODLN)
    */
   async createDeliveryNote({ cardCode, docDate, baseOrderEntry, lines, comments }) {
+    this._assertLiveWriteAllowed();
     const body = {
       CardCode: cardCode,
       DocDate: docDate,
@@ -161,6 +183,7 @@ class ServiceLayerSession {
    * This is the "pick-up request" - created BEFORE pickup.
    */
   async createReturnRequest({ cardCode, docDate, lines, comments }) {
+    this._assertLiveWriteAllowed();
     const body = {
       CardCode: cardCode,
       DocDate: docDate,
@@ -180,6 +203,7 @@ class ServiceLayerSession {
    * SAP Entity: Returns (ORDN)
    */
   async createReturn({ cardCode, docDate, baseReturnRequestEntry, lines, comments }) {
+    this._assertLiveWriteAllowed();
     const body = {
       CardCode: cardCode,
       DocDate: docDate,

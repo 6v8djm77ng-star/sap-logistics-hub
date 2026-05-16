@@ -160,10 +160,11 @@ app.set('io', io);
 // A2c-1 startup gate — if SAP_WRITE_ENABLED=true, refuse to listen unless
 // the configured company DBs are explicitly in SAP_LIVE_WRITE_DB_WHITELIST.
 // Defense-in-depth against accidentally pointing live writes at production
-// after an env reload. See backend/src/demo/sapWriter.js →
-// _checkLiveWriteWhitelist for the rules.
+// after an env reload. Source of truth (Bug 3 — 2026-05-16): the helper
+// now lives in backend/src/services/sap/writeWhitelist.js so both the
+// sapWriter path AND the serviceLayer path enforce the same gate.
 {
-  const { _checkLiveWriteWhitelist } = await import('./demo/sapWriter.js');
+  const { _checkLiveWriteWhitelist } = await import('./services/sap/writeWhitelist.js');
   const gate = _checkLiveWriteWhitelist({
     writeEnabled: process.env.SAP_WRITE_ENABLED === 'true',
     whitelist: process.env.SAP_LIVE_WRITE_DB_WHITELIST,
