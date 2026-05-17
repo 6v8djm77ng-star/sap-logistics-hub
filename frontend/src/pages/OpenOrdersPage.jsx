@@ -10,10 +10,12 @@
  * /api/orders/open path stays the default when the toggle is OFF.
  */
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
+import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
-import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal } from 'lucide-react';
+import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, Loader2 } from 'lucide-react';
 
 const ordersApi = {
   openOrders: (params) =>
@@ -22,7 +24,17 @@ const ordersApi = {
     api.get('/orders/open-with-plan-eval', { params }).then((r) => r.data),
   orderLines: (company, docEntry) =>
     api.get(`/orders/${company}/${docEntry}/lines`).then((r) => r.data),
+  createRunsFromSelected: (body) =>
+    api.post('/runs/from-selected-orders', body).then((r) => r.data),
 };
+
+const runsApi = {
+  buildWave: (runId) => api.post(`/runs/${runId}/wave`).then((r) => r.data),
+};
+
+// orderKey is the dedup key used both in the selection Set and as the
+// stable identity in the orders list. Must match what the backend uses.
+const orderKey = (o) => `${o.CompanyCode}-${o.DocEntry}`;
 
 // ---------------------------------------------------------------------------
 // Plan-eval config — toggle + 4 sub-controls. Persisted in localStorage so
@@ -86,7 +98,7 @@ function planEvalReasonsText(pe) {
   return out.join(' · ');
 }
 
-function OrderDetailsRow({ order, planEval, showPlanEvalColumn }) {
+function OrderDetailsRow({ order, planEval, showPlanEvalColumn, showSelectColumn, isSelected, onToggleSelect }) {
   const [expanded, setExpanded] = useState(false);
 
   const { data: linesData, isLoading: linesLoading } = useQuery({
@@ -95,13 +107,24 @@ function OrderDetailsRow({ order, planEval, showPlanEvalColumn }) {
     enabled: expanded,
   });
 
-  // colSpan for the expanded row depends on whether the planEval column
-  // is shown. Base is 8; +1 when the toggle is on.
-  const expandedColSpan = showPlanEvalColumn ? 9 : 8;
+  // colSpan for the expanded row depends on which optional columns are shown.
+  // Base is 8; +1 for the select checkbox, +1 for the planEval badge.
+  const expandedColSpan = 8 + (showSelectColumn ? 1 : 0) + (showPlanEvalColumn ? 1 : 0);
 
   return (
     <>
-      <tr className="hover:bg-gray-50 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+      <tr className={`hover:bg-gray-50 cursor-pointer ${isSelected ? 'bg-blue-50' : ''}`} onClick={() => setExpanded(!expanded)}>
+        {showSelectColumn && (
+          <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+            <input
+              type="checkbox"
+              checked={!!isSelected}
+              onChange={() => onToggleSelect?.(order)}
+              className="w-4 h-4 cursor-pointer"
+              title="בחר להעברה לליקוט"
+            />
+          </td>
+        )}
         <td className="px-3 py-2">
           <button className="p-1 hover:bg-gray-200 rounded">
             {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
@@ -211,10 +234,27 @@ function OrderDetailsRow({ order, planEval, showPlanEvalColumn }) {
 }
 
 export default function OpenOrdersPage() {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [company, setCompany] = useState('');
   const [limit, setLimit] = useState(100);
   const [sortBy, setSortBy] = useState('docDate-desc'); // docDate / cardName / city / zone
+
+  // Phase 2: per-row selection for "send to picking". Set of orderKey
+  // strings (`${CompanyCode}-${DocEntry}`). Lives in state (not localStorage)
+  // because a selection from an earlier session is almost never relevant —
+  // SAP open orders change too often.
+  const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+  const toggleSelect = (order) => {
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      const k = orderKey(order);
+      if (next.has(k)) next.delete(k); else next.add(k);
+      return next;
+    });
+  };
+  const clearSelection = () => setSelectedKeys(new Set());
 
   const [planEvalCfg, setPlanEvalCfgState] = useState(loadPlanEvalCfg);
   const updatePlanEvalCfg = (field, value) => {
@@ -249,6 +289,49 @@ export default function OpenOrdersPage() {
     }),
     refetchInterval: 60_000,
     enabled: planEvalCfg.enabled,
+  });
+
+  // Phase 2: "שלח לליקוט" — POST to /api/runs/from-selected-orders.
+  // On success: chain a buildWave per created run, then redirect to
+  // /picking/<firstWaveId> so the manager lands on the picker screen with
+  // the wave already built. Errors (e.g. ALREADY_ASSIGNED, ORDERS_MISSING)
+  // are surfaced via toast so the operator can adjust the selection.
+  const sendToPickingMutation = useMutation({
+    mutationFn: async (orderRefs) => {
+      const created = await ordersApi.createRunsFromSelected({ orders: orderRefs });
+      // For each new run, kick off wave build. Failures are tolerated — the
+      // manager can build the wave manually from RunDetailsPage.
+      const waves = [];
+      for (const r of created.runsCreated || []) {
+        try {
+          const wave = await runsApi.buildWave(r.runId);
+          waves.push({ runId: r.runId, waveId: wave?.WaveId || null });
+        } catch (waveErr) {
+          waves.push({ runId: r.runId, waveId: null, error: waveErr.response?.data?.error || waveErr.message });
+        }
+      }
+      return { ...created, waves };
+    },
+    onSuccess: (data) => {
+      const firstWaveId = data.waves?.find((w) => w.waveId)?.waveId;
+      const runsCreated = data.runsCreated?.length || 0;
+      const wavesBuilt = data.waves?.filter((w) => w.waveId).length || 0;
+      toast.success(`נוצרו ${runsCreated} מסלולים, ${wavesBuilt} עם גל ליקוט מוכן`);
+      clearSelection();
+      queryClient.invalidateQueries({ queryKey: ['open-orders'] });
+      queryClient.invalidateQueries({ queryKey: ['orders-with-plan-eval'] });
+      queryClient.invalidateQueries({ queryKey: ['runs'] });
+      if (firstWaveId) {
+        navigate(`/picking/${firstWaveId}`);
+      } else if (runsCreated > 0) {
+        navigate(`/runs`);
+      }
+    },
+    onError: (err) => {
+      const body = err.response?.data;
+      const msg = body?.error || err.message || 'שגיאה בשליחה לליקוט';
+      toast.error(msg);
+    },
   });
 
   const isLoading = planEvalCfg.enabled ? planEvalLoading : legacyLoading;
@@ -301,6 +384,41 @@ export default function OpenOrdersPage() {
     companyA: acc.companyA + (o.CompanyCode === 'A' ? 1 : 0),
     companyB: acc.companyB + (o.CompanyCode === 'B' ? 1 : 0),
   }), { count: 0, lines: 0, value: 0, companyA: 0, companyB: 0 });
+
+  // Selection helpers (Phase 2): operate on the currently-visible `orders`
+  // list so "select all passing" honors the current filters.
+  const selectionEnabled = planEvalCfg.enabled;
+  const visibleSelectedCount = orders.reduce((n, o) => n + (selectedKeys.has(orderKey(o)) ? 1 : 0), 0);
+  const passingVisible = orders.filter((o) => o.planEval?.passes);
+  const selectAllPassing = () => {
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      for (const o of passingVisible) next.add(orderKey(o));
+      return next;
+    });
+  };
+  const selectAllVisible = () => {
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      for (const o of orders) next.add(orderKey(o));
+      return next;
+    });
+  };
+  const submitSelection = () => {
+    if (selectedKeys.size === 0) return;
+    const refs = [];
+    for (const o of orders) {
+      if (selectedKeys.has(orderKey(o))) {
+        refs.push({ companyCode: o.CompanyCode, docEntry: o.DocEntry });
+      }
+    }
+    if (refs.length === 0) {
+      toast.error('הבחירה ריקה מהנראה. רענן והרא שוב.');
+      return;
+    }
+    if (!window.confirm(`לשלוח ${refs.length} הזמנות לליקוט? המערכת תיצור מסלול/ים ותפיק גלי ליקוט.`)) return;
+    sendToPickingMutation.mutate(refs);
+  };
 
   return (
     <div className="p-6 max-w-7xl mx-auto">
@@ -428,6 +546,61 @@ export default function OpenOrdersPage() {
         </div>
       )}
 
+      {/* Phase 2: selection action bar — only when toggle ON */}
+      {selectionEnabled && (
+        <div className="bg-white border rounded-xl p-3 mb-4 flex flex-wrap items-center gap-3">
+          <span className="text-sm">
+            נבחרו <span className="font-bold">{selectedKeys.size}</span> הזמנות
+            {visibleSelectedCount !== selectedKeys.size && (
+              <span className="text-gray-500"> ({visibleSelectedCount} מוצגות)</span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={selectAllPassing}
+            disabled={passingVisible.length === 0}
+            className="px-3 py-1.5 text-sm border rounded-lg hover:bg-emerald-50 hover:border-emerald-300 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="סמן את כל ההזמנות העוברות תנאי במסך"
+          >
+            סמן את כל העוברות ({passingVisible.length})
+          </button>
+          <button
+            type="button"
+            onClick={selectAllVisible}
+            disabled={orders.length === 0}
+            className="px-3 py-1.5 text-sm border rounded-lg hover:bg-blue-50 hover:border-blue-300 disabled:opacity-40 disabled:cursor-not-allowed"
+            title="סמן את כל ההזמנות המוצגות (גם נכשלות)"
+          >
+            סמן הכל המוצג ({orders.length})
+          </button>
+          <button
+            type="button"
+            onClick={clearSelection}
+            disabled={selectedKeys.size === 0}
+            className="px-3 py-1.5 text-sm border rounded-lg hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            נקה בחירה
+          </button>
+          <div className="flex-1" />
+          <button
+            type="button"
+            onClick={submitSelection}
+            disabled={selectedKeys.size === 0 || sendToPickingMutation.isPending}
+            className="inline-flex items-center gap-2 px-4 py-1.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {sendToPickingMutation.isPending ? (
+              <>
+                <Loader2 size={14} className="animate-spin" /> שולח לליקוט...
+              </>
+            ) : (
+              <>
+                <Send size={14} /> שלח לליקוט ({selectedKeys.size})
+              </>
+            )}
+          </button>
+        </div>
+      )}
+
       {/* Filters */}
       <div className="bg-white border rounded-xl p-3 mb-4 flex flex-wrap items-center gap-3">
         <div className="relative flex-1 min-w-[200px]">
@@ -502,6 +675,21 @@ export default function OpenOrdersPage() {
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-gray-600 text-xs">
                 <tr>
+                  {selectionEnabled && (
+                    <th className="w-10 px-3 py-2 text-center font-medium" title="בחירה לליקוט">
+                      <input
+                        type="checkbox"
+                        checked={orders.length > 0 && visibleSelectedCount === orders.length}
+                        ref={(el) => {
+                          if (el) el.indeterminate = visibleSelectedCount > 0 && visibleSelectedCount < orders.length;
+                        }}
+                        onChange={(e) => {
+                          if (e.target.checked) selectAllVisible(); else clearSelection();
+                        }}
+                        className="w-4 h-4 cursor-pointer"
+                      />
+                    </th>
+                  )}
                   <th className="w-8"></th>
                   <th className="px-3 py-2 text-right font-medium">חברה</th>
                   <th className="px-3 py-2 text-right font-medium">הזמנה</th>
@@ -522,6 +710,9 @@ export default function OpenOrdersPage() {
                     order={order}
                     planEval={order.planEval || null}
                     showPlanEvalColumn={planEvalCfg.enabled}
+                    showSelectColumn={selectionEnabled}
+                    isSelected={selectedKeys.has(orderKey(order))}
+                    onToggleSelect={toggleSelect}
                   />
                 ))}
               </tbody>

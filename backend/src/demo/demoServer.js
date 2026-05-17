@@ -2484,6 +2484,178 @@ app.post('/api/runs/auto-plan', async (req, res) => {
     res.status(err.status || 500).json({ error: err.message });
   }
 });
+
+// Phase 2 — create runs from a hand-picked list of orders (as opposed to
+// /api/runs/auto-plan which discovers orders via computePlanExclusions).
+// Used by the OpenOrdersPage "שלח לליקוט" button after the manager has
+// previewed which orders pass the daily condition. The endpoint:
+//   1. Validates every requested (companyCode, docEntry) exists in the
+//      current SAP open-orders snapshot — refuses if any is missing
+//      (probably closed / already shipped) so the operator gets a clean
+//      diff instead of silent drops.
+//   2. Refuses if any order is already in another run (cross-run
+//      cross-day uniqueness — same guard auto-plan uses).
+//   3. Groups by zone (suggestZoneForCity) and, within a zone, by
+//      address+CardCode so multiple orders to the same destination merge
+//      into one stop.
+//   4. Creates a Run per zone (or reuses an OPEN run for that zone+date
+//      so the operator can add to an existing plan without splitting).
+//   5. Adds stops + run-orders. Does NOT build the wave — the frontend
+//      calls the existing /api/runs/:id/wave for that, which keeps wave
+//      creation logic single-sourced.
+app.post('/api/runs/from-selected-orders', async (req, res) => {
+  try {
+    const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
+    const orderRefs = Array.isArray(req.body.orders) ? req.body.orders : null;
+    if (!orderRefs || orderRefs.length === 0) {
+      return res.status(400).json({ error: 'orders array required (1+)', code: 'NO_ORDERS' });
+    }
+    if (orderRefs.length > 500) {
+      return res.status(400).json({ error: 'too many orders (max 500)', code: 'TOO_MANY' });
+    }
+    for (const ref of orderRefs) {
+      if (!ref || !ref.companyCode || ref.docEntry == null) {
+        return res.status(400).json({ error: 'each order needs companyCode + docEntry', code: 'BAD_REF' });
+      }
+    }
+
+    if (!sapLive) {
+      return res.status(400).json({ error: 'SAP לא מחובר', code: 'SAP_OFFLINE' });
+    }
+
+    // Pull current open orders and keep only the requested ones.
+    const allOpen = await sapBridge.getOpenOrdersFlat({ limit: 1000 });
+    const requestedKeys = new Set(orderRefs.map((r) => `${r.companyCode}:${r.docEntry}`));
+    const orders = allOpen.filter((o) => requestedKeys.has(`${o.CompanyCode}:${o.DocEntry}`));
+
+    const foundKeys = new Set(orders.map((o) => `${o.CompanyCode}:${o.DocEntry}`));
+    const missing = orderRefs.filter((r) => !foundKeys.has(`${r.companyCode}:${r.docEntry}`));
+    if (missing.length > 0) {
+      return res.status(400).json({
+        error: `${missing.length} הזמנות לא נמצאו ברשימה הפתוחה (כנראה נסגרו או הוזמנו לקו אחר)`,
+        code: 'ORDERS_MISSING',
+        missing: missing.slice(0, 10),
+      });
+    }
+
+    // Refuse orders that are already in some other run.
+    const storeData = store.load();
+    const allRunOrders = storeData.runOrders || [];
+    const allStops = storeData.stops || [];
+    const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
+    const alreadyAssigned = new Set(
+      allRunOrders
+        .filter((o) => stopIdToRunId.has(o.StopId))
+        .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
+    );
+    const conflicts = orders.filter((o) => alreadyAssigned.has(`${o.CompanyCode}-${o.DocEntry}`));
+    if (conflicts.length > 0) {
+      return res.status(409).json({
+        error: `${conflicts.length} הזמנות כבר שייכות למסלול קיים`,
+        code: 'ALREADY_ASSIGNED',
+        conflicts: conflicts.slice(0, 10).map((o) => ({
+          companyCode: o.CompanyCode, docNum: o.DocNum, cardName: o.CardName,
+        })),
+      });
+    }
+
+    // Group by zone (same logic as auto-plan).
+    const byZone = {};
+    const unassigned = [];
+    for (const order of orders) {
+      const addressParts = (order.ShipToAddress || '')
+        .split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
+      const city = addressParts[addressParts.length - 1] || order.CustCity || '';
+      const street = addressParts.length > 1 ? addressParts[0] : '';
+      const zone = store.suggestZoneForCity(city);
+      if (!zone) {
+        unassigned.push({ ...order, cityParsed: city });
+        continue;
+      }
+      if (!byZone[zone.Code]) byZone[zone.Code] = { zone, orders: [] };
+      byZone[zone.Code].orders.push({ ...order, cityParsed: city, streetParsed: street });
+    }
+
+    // Create runs + stops + orders.
+    const existingRuns = store.getRuns().filter(
+      (r) => r.RunDate === runDate && r.Status !== 'COMPLETED' && r.Status !== 'CANCELLED'
+    );
+    const runsCreated = [];
+    for (const { zone, orders: zoneOrders } of Object.values(byZone)) {
+      let targetRun = existingRuns.find((r) => r.ZoneId === zone.ZoneId && r.Status === 'OPEN');
+      const reusedExisting = !!targetRun;
+      if (!targetRun) {
+        targetRun = store.addRun({
+          runDate,
+          zoneId: zone.ZoneId,
+          driverId: null,
+          status: 'OPEN',
+          notes: `נשלח ידנית מהזמנות פתוחות - ${runDate}`,
+        });
+      }
+      const byAddressKey = {};
+      for (const o of zoneOrders) {
+        const key = `${o.streetParsed}|${o.cityParsed}|${o.CardCode}`;
+        if (!byAddressKey[key]) byAddressKey[key] = [];
+        byAddressKey[key].push(o);
+      }
+      for (const ordersAtAddress of Object.values(byAddressKey)) {
+        const first = ordersAtAddress[0];
+        const newStop = store.addStop(targetRun.RunId, {
+          street: first.streetParsed || first.CardName,
+          buildingNumber: '',
+          city: first.cityParsed,
+          branchName: first.CardName,
+          contactPhone: first.CustPhone,
+        });
+        for (const o of ordersAtAddress) {
+          store.addOrderToStop(newStop.StopId, {
+            companyCode: o.CompanyCode,
+            docEntry: o.DocEntry,
+            docNum: o.DocNum,
+            cardCode: o.CardCode,
+            cardName: o.CardName,
+            total: o.DocTotal,
+            linesCount: o.LinesCount,
+          });
+        }
+      }
+      const refreshed = store.getRunDetails(targetRun.RunId);
+      runsCreated.push({
+        runId: targetRun.RunId,
+        runNumber: targetRun.RunNumber,
+        zoneCode: zone.Code,
+        zoneName: zone.Name,
+        zoneId: zone.ZoneId,
+        stopCount: (refreshed?.stops || []).length,
+        orderCount: zoneOrders.length,
+        reusedExisting,
+      });
+    }
+
+    io.emit('runs:from-selected-orders', { runDate, count: runsCreated.length });
+
+    return res.json({
+      ok: true,
+      runDate,
+      runsCreated,
+      unassigned: unassigned.length > 0 ? unassigned.map((o) => ({
+        customerName: o.CardName, city: o.cityParsed, docNum: o.DocNum, companyCode: o.CompanyCode,
+      })) : null,
+      summary: {
+        ordersRequested: orderRefs.length,
+        ordersAssigned: orders.length - unassigned.length,
+        ordersUnassigned: unassigned.length,
+        runsCreated: runsCreated.length,
+        runsReused: runsCreated.filter((r) => r.reusedExisting).length,
+      },
+    });
+  } catch (err) {
+    console.error('[from-selected-orders] failed:', err.message);
+    return res.status(err.status || 500).json({ error: err.message, code: err.code || null });
+  }
+});
+
 // Create a new picking wave - pulls real SAP order lines + aggregates
 app.post('/api/runs/:id/wave', async (req, res) => {
   const runId = Number(req.params.id);
