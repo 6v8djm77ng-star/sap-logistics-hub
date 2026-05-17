@@ -3453,6 +3453,78 @@ app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, async (req, res) => {
   }
 });
 
+// A2c-4b — admin-only endpoint to invoke flushAggregateDocsForRun with
+// liveWrite=true OUTSIDE the picking -> QC-approve UI flow. Strictly for
+// validating the live SAP write path on TEST runs only.
+//
+// Defense-in-depth guards (all must pass, in this order):
+//   1. adminOnly middleware    -> JWT + role==='ADMIN' (401 / 403)
+//   2. runId positive integer  -> 400 INVALID_RUN_ID
+//   3. body.confirm === 'I-UNDERSTAND-THIS-WRITES-TO-SAP' -> 400 BAD_INPUT
+//   4. Run exists              -> 404 RUN_NOT_FOUND
+//   5. run.IsTest === true     -> 403 NOT_TEST_RUN
+//   6. SAP_WRITE_ENABLED env   -> 403 LIVE_WRITE_DISABLED
+//   7. Inside flush: serviceLayer whitelist gate (already wired)
+//   8. Inside flush: QC + DocPolicy + payload validation (already wired)
+//
+// Body schema is locked down on purpose: no liveWrite flag, no method
+// override. This endpoint is ONLY for live test-flush. Dry-run callers
+// should use the existing /api/runs/:id/flush-aggregate-docs endpoint.
+const TestFlushBodySchema = z.object({
+  confirm: z.literal('I-UNDERSTAND-THIS-WRITES-TO-SAP'),
+}).strict();
+
+app.post('/api/admin/sap-write/test-flush/:runId', adminOnly, async (req, res) => {
+  // 2. Validate runId is a positive integer.
+  const runId = Number(req.params.runId);
+  if (!Number.isInteger(runId) || runId <= 0) {
+    return res.status(400).json({ error: 'invalid runId', code: 'INVALID_RUN_ID' });
+  }
+  // 3. Validate body confirm string is the exact magic value.
+  const body = parseBody(TestFlushBodySchema, req.body, res);
+  if (!body) return;
+  // 4. Lookup run.
+  const run = store.getRuns().find((r) => r && Number(r.RunId) === runId);
+  if (!run) {
+    return res.status(404).json({ error: 'run not found', code: 'RUN_NOT_FOUND' });
+  }
+  // 5. Refuse unless run is explicitly marked IsTest=true.
+  if (run.IsTest !== true) {
+    return res.status(403).json({
+      error: 'run is not marked IsTest=true; refusing live write',
+      code: 'NOT_TEST_RUN',
+      runId,
+    });
+  }
+  // 6. Refuse if SAP_WRITE_ENABLED env is not enabled.
+  if (process.env.SAP_WRITE_ENABLED !== 'true') {
+    return res.status(403).json({
+      error: 'SAP_WRITE_ENABLED is not true; refusing live write',
+      code: 'LIVE_WRITE_DISABLED',
+    });
+  }
+  // 7 + 8 are enforced inside flushAggregateDocsForRun and the serviceLayer
+  // it calls. Let exceptions propagate with their status/code.
+  try {
+    const approvedBy = req.user?.name || req.user?.username || `user:${req.user?.sub}`;
+    const result = await store.flushAggregateDocsForRun(runId, {
+      approvedBy,
+      method: 'TEST_FLUSH_LIVE',
+      liveWrite: true,
+    });
+    io.emit('run:aggregate-flushed', { runId, source: 'test-flush' });
+    return res.json({ ok: true, source: 'test-flush', runId, result });
+  } catch (err) {
+    const payload = { error: err.message };
+    if (err.code) payload.code = err.code;
+    if (err.unapproved) payload.unapproved = err.unapproved;
+    if (err.missingPolicy) payload.missingPolicy = err.missingPolicy;
+    if (err.missingFields) payload.missingFields = err.missingFields;
+    if (err.docNumber) payload.docNumber = err.docNumber;
+    return res.status(err.status || 500).json(payload);
+  }
+});
+
 app.post('/api/picking/:waveId/qc-approve', (req, res) => {
   const auth = req.headers.authorization;
   let approvedBy = null;
