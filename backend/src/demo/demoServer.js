@@ -29,6 +29,7 @@ import * as data from './demoData.js';
 import { startSimulation } from './liveSimulation.js';
 import * as sapBridge from './sapBridge.js';
 import * as store from './persistentStore.js';
+import { evaluatePlanForOrder, hebrewDayFromDate } from './orderPlanEval.js';
 import agentsRouter from '../routes/agents.js';
 
 // Initialize persistent store
@@ -2286,6 +2287,85 @@ app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
     });
   } catch (err) {
     console.error('[preview-exclusions] failed:', err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// Phase 1 of the open-orders-with-condition feature. For each open order
+// returns the same exclusion breakdown the planner uses, PLUS a delivery-day
+// check derived from customerDeliveryProfiles. The frontend uses this to
+// paint a per-order pass/fail badge on the open-orders screen so the
+// logistics manager can preview "what would happen if I planned today"
+// without actually creating a run.
+//
+// Query params (all optional):
+//   runDate           YYYY-MM-DD (default: today UTC)
+//   minCustomerTotal  number (default: 3000 via computePlanExclusions)
+//   minLinesPerOrder  number (default: 2)
+//   requireStock      'false' disables stock check (default true)
+//   applyDeliveryDay  'false' disables the day check (default true)
+//
+// Errors propagate from computePlanExclusions (e.g. 400 if SAP is offline).
+app.get('/api/orders/open-with-plan-eval', async (req, res) => {
+  try {
+    const base = await computePlanExclusions({
+      runDate: req.query.runDate,
+      minCustomerTotal: req.query.minCustomerTotal,
+      minLinesPerOrder: req.query.minLinesPerOrder,
+      requireStock: req.query.requireStock !== 'false',
+    });
+    const applyDeliveryDay = req.query.applyDeliveryDay !== 'false';
+
+    const exclusionMap = new Map();
+    for (const ex of base.excludedOrders) {
+      exclusionMap.set(`${ex.companyCode}:${ex.docEntry}`, ex.reasons);
+    }
+
+    const todayHebrew = hebrewDayFromDate(base.runDate);
+
+    const profiles = store.load().customerDeliveryProfiles || [];
+    const profileMap = new Map();
+    for (const p of profiles) {
+      if (p?.CardCode) profileMap.set(`${p.Company || ''}:${p.CardCode}`, p);
+    }
+
+    const filters = { ...base.filters, applyDeliveryDay };
+
+    const ordersWithEval = base.allOrders.map((o) => {
+      const profile = profileMap.get(`${o.CompanyCode}:${o.CardCode}`) || null;
+      const planEval = evaluatePlanForOrder({
+        order: o,
+        exclusionReasons: exclusionMap.get(`${o.CompanyCode}:${o.DocEntry}`) || [],
+        profile,
+        todayHebrew,
+        filters,
+      });
+      return { ...o, planEval };
+    });
+
+    const passing = ordersWithEval.filter((x) => x.planEval.passes).length;
+    const failingDayOnly = ordersWithEval.filter((x) =>
+      !x.planEval.passes &&
+      x.planEval.customerTotalOK &&
+      x.planEval.linesCountOK &&
+      x.planEval.stockOK &&
+      !x.planEval.deliveryDayOK
+    ).length;
+
+    res.json({
+      runDate: base.runDate,
+      todayHebrew,
+      filters,
+      summary: {
+        total: ordersWithEval.length,
+        passing,
+        failing: ordersWithEval.length - passing,
+        failingDayOnly,
+      },
+      ordersWithEval,
+    });
+  } catch (err) {
+    console.error('[open-with-plan-eval] failed:', err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
