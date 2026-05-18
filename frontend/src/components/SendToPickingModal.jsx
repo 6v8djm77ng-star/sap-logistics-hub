@@ -380,6 +380,12 @@ function DoneView({ result }) {
   const wavesFailed = waveResults.filter((w) => !w.waveId).length;
   const allWavesOk  = wavesBuilt === runsCreated.length;
   const partial     = wavesBuilt > 0 && wavesFailed > 0;
+  // The real submit returns summary.runsCreated / summary.runsReused (counts),
+  // while the preview returns summary.runsToCreate / summary.runsToReuse.
+  // Support both shapes so the banner is correct regardless of which one
+  // populates `result.summary`.
+  const reusedCount  = summary.runsReused  ?? summary.runsToReuse  ?? 0;
+  const createdCount = summary.runsCreated ?? summary.runsToCreate ?? 0;
 
   return (
     <div className="space-y-3">
@@ -397,7 +403,7 @@ function DoneView({ result }) {
               {allWavesOk ? 'הליקוט נשלח בהצלחה' : partial ? 'הליקוט נשלח חלקית' : 'מסלולים נוצרו אך ללא גלי ליקוט'}
             </div>
             <div className="text-xs mt-1 text-gray-700">
-              {runsCreated.length} מסלולים · {summary.runsToReuse || 0} קיימים, {summary.runsToCreate || 0} חדשים
+              {runsCreated.length} מסלולים · {reusedCount} קיימים, {createdCount} חדשים
               {' · '}
               {wavesBuilt}/{runsCreated.length} גלי ליקוט מוכנים
               {wavesFailed > 0 && (
