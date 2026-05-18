@@ -30,6 +30,7 @@ import { startSimulation } from './liveSimulation.js';
 import * as sapBridge from './sapBridge.js';
 import * as store from './persistentStore.js';
 import { evaluatePlanForOrder, hebrewDayFromDate } from './orderPlanEval.js';
+import { previewSelectedOrders } from './previewSelectedOrders.js';
 import agentsRouter from '../routes/agents.js';
 
 // Initialize persistent store
@@ -2653,6 +2654,53 @@ app.post('/api/runs/from-selected-orders', async (req, res) => {
     });
   } catch (err) {
     console.error('[from-selected-orders] failed:', err.message);
+    return res.status(err.status || 500).json({ error: err.message, code: err.code || null });
+  }
+});
+
+// Phase 2 v2 — dry-run/preview for from-selected-orders. Same payload, same
+// guards, but never mutates the store. Lets the OpenOrdersPage show "you're
+// about to create X runs in Y zones with Z stops" before the operator
+// commits. Heavy lifting is in previewSelectedOrders.js so the logic is
+// unit-testable without spinning up Express or SAP.
+app.post('/api/runs/from-selected-orders/preview', async (req, res) => {
+  try {
+    const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
+    const orderRefs = Array.isArray(req.body.orders) ? req.body.orders : null;
+
+    // Cheap validation first so we don't hit SAP on obviously bad input.
+    // These three checks mirror the helper's guards 1-3; we duplicate them
+    // intentionally here to skip the SAP fetch on bad requests.
+    if (!orderRefs || orderRefs.length === 0) {
+      return res.status(400).json({ error: 'orders array required (1+)', code: 'NO_ORDERS' });
+    }
+    if (orderRefs.length > 500) {
+      return res.status(400).json({ error: 'too many orders (max 500)', code: 'TOO_MANY' });
+    }
+    for (const ref of orderRefs) {
+      if (!ref || !ref.companyCode || ref.docEntry == null) {
+        return res.status(400).json({ error: 'each order needs companyCode + docEntry', code: 'BAD_REF' });
+      }
+    }
+
+    if (!sapLive) {
+      return res.status(400).json({ error: 'SAP לא מחובר', code: 'SAP_OFFLINE' });
+    }
+
+    const allOpen = await sapBridge.getOpenOrdersFlat({ limit: 1000 });
+    const storeSnapshot = store.load();
+
+    const result = previewSelectedOrders({
+      runDate,
+      orderRefs,
+      sapOpenOrders: allOpen,
+      storeSnapshot,
+      suggestZoneForCity: (city) => store.suggestZoneForCity(city),
+    });
+
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    console.error('[preview-from-selected-orders] failed:', err.message);
     return res.status(err.status || 500).json({ error: err.message, code: err.code || null });
   }
 });
