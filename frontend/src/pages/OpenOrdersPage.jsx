@@ -9,13 +9,17 @@
  * a Run. Toggle + filters persist to localStorage. The legacy
  * /api/orders/open path stays the default when the toggle is OFF.
  */
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
-import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, Loader2 } from 'lucide-react';
+import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, Loader2, CalendarDays } from 'lucide-react';
+
+// Hebrew weekday names indexed by Date.getDay() (0=Sunday). Matches the
+// PlannerPage day filter so the two screens behave consistently.
+const HEBREW_WEEKDAYS = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
 const ordersApi = {
   openOrders: (params) =>
@@ -241,6 +245,31 @@ export default function OpenOrdersPage() {
   const [limit, setLimit] = useState(100);
   const [sortBy, setSortBy] = useState('docDate-desc'); // docDate / cardName / city / zone
 
+  // Day filter — matches the PlannerPage idiom. Defaults to today's
+  // Hebrew weekday (Sun-Thu). On Fri/Sat the default falls back to 'all'
+  // because the warehouse does not deliver on those days, so there's no
+  // sensible default day. Operator can flip via the day tabs.
+  const todayDayIdx = new Date().getDay();
+  const defaultDayKey = todayDayIdx >= 0 && todayDayIdx <= 4 ? HEBREW_WEEKDAYS[todayDayIdx] : 'all';
+  const [selectedDay, setSelectedDay] = useState(defaultDayKey);
+  const todayLabel = HEBREW_WEEKDAYS[todayDayIdx];
+
+  // Customer delivery profiles (1,500+ rows, ~1 MB). Used to join orders
+  // to their customer's DeliveryDays array. Cached for 5 min so flipping
+  // day tabs does not refetch.
+  const { data: customerProfiles = [] } = useQuery({
+    queryKey: ['customer-profiles', 'all'],
+    queryFn: () => api.get('/customer-profiles').then((r) => r.data.profiles || []),
+    staleTime: 5 * 60 * 1000,
+  });
+  const profileByKey = useMemo(() => {
+    const m = new Map();
+    for (const p of customerProfiles) {
+      if (p?.CardCode) m.set(`${p.Company || ''}:${p.CardCode}`, p);
+    }
+    return m;
+  }, [customerProfiles]);
+
   // Phase 2: per-row selection for "send to picking". Set of orderKey
   // strings (`${CompanyCode}-${DocEntry}`). Lives in state (not localStorage)
   // because a selection from an earlier session is almost never relevant —
@@ -338,10 +367,26 @@ export default function OpenOrdersPage() {
   const rawOrders = planEvalCfg.enabled
     ? (planEvalData?.ordersWithEval || [])
     : (legacyData?.orders || []);
+
+  // Helper: read the customer's delivery days for a given order, either
+  // from the planEval payload (when toggle ON) or from the profiles map.
+  // Returns [] when no profile is found — caller decides what to do with it.
+  const deliveryDaysForOrder = (o) => {
+    if (Array.isArray(o.planEval?.deliveryDayExpected)) return o.planEval.deliveryDayExpected;
+    const p = profileByKey.get(`${o.CompanyCode}:${o.CardCode}`);
+    return Array.isArray(p?.DeliveryDays) ? p.DeliveryDays : [];
+  };
+
+  // Apply the day filter BEFORE search/company so the counts in the
+  // summary banner reflect the day-scoped set. 'all' = no day filter.
+  const dayFilteredRaw = selectedDay === 'all'
+    ? rawOrders
+    : rawOrders.filter((o) => deliveryDaysForOrder(o).includes(selectedDay));
+
   // The plan-eval source doesn't honor the search/company filters server-side,
   // so apply them client-side when the toggle is ON.
   const filteredRawOrders = planEvalCfg.enabled
-    ? rawOrders.filter((o) => {
+    ? dayFilteredRaw.filter((o) => {
         if (company && o.CompanyCode !== company) return false;
         if (search) {
           const needle = search.toLowerCase();
@@ -350,7 +395,7 @@ export default function OpenOrdersPage() {
         }
         return true;
       })
-    : rawOrders;
+    : dayFilteredRaw;
 
   // Apply client-side sort.
   const orders = (() => {
@@ -459,6 +504,47 @@ export default function OpenOrdersPage() {
           <div className="text-xs text-gray-500">שווי כולל</div>
           <div className="text-lg font-bold font-mono">₪{totals.value.toLocaleString()}</div>
         </div>
+      </div>
+
+      {/* Day filter — Sunday → Thursday, plus 'all'. Default = today's
+          weekday (or 'all' on Fri/Sat). Same idiom as PlannerPage so the
+          two screens behave identically when the operator flips between
+          them. Filters orders by their customer's DeliveryDays. */}
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
+        <CalendarDays size={16} className="text-gray-500" />
+        <span className="text-gray-600">סינון לפי טבלת הפצה:</span>
+        {HEBREW_WEEKDAYS.slice(0, 5).map((day) => {
+          const active = selectedDay === day;
+          const isToday = day === todayLabel;
+          return (
+            <button
+              key={day}
+              type="button"
+              onClick={() => setSelectedDay(day)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
+                active
+                  ? (isToday
+                      ? 'bg-green-100 text-green-900 border-green-400 font-semibold'
+                      : 'bg-blue-100 text-blue-900 border-blue-400 font-semibold')
+                  : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+              }`}
+            >
+              {isToday && <span className="w-2 h-2 rounded-full bg-green-500" />}
+              {day}{isToday ? ' (היום)' : ''}
+            </button>
+          );
+        })}
+        <button
+          type="button"
+          onClick={() => setSelectedDay('all')}
+          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
+            selectedDay === 'all'
+              ? 'bg-gray-800 text-white border-gray-800 font-semibold'
+              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+          }`}
+        >
+          כל הימים
+        </button>
       </div>
 
       {/* Plan-eval toggle + controls */}
