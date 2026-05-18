@@ -31,12 +31,11 @@ export function evaluatePlanForOrder({
   const applyDeliveryDay = filters.applyDeliveryDay !== false;
 
   const failsCustomerTotal = exclusionReasons.find((r) => r && r.type === 'low_total');
-  const failsLinesCount    = exclusionReasons.find((r) => r && r.type === 'too_few_lines');
   const failsNoOpenLines   = exclusionReasons.find((r) => r && r.type === 'no_open_lines');
   const failsStock         = exclusionReasons.find((r) => r && r.type === 'missing_stock');
 
   const customerTotalOK = !failsCustomerTotal;
-  const linesCountOK    = !failsLinesCount && !failsNoOpenLines;
+  const hasOpenLines    = !failsNoOpenLines;
   const stockOK         = !failsStock;
 
   let deliveryDayOK = true;
@@ -53,16 +52,14 @@ export function evaluatePlanForOrder({
     }
   }
 
-  const passes = customerTotalOK && linesCountOK && stockOK && deliveryDayOK;
+  const passes = customerTotalOK && hasOpenLines && stockOK && deliveryDayOK;
 
   return {
     passes,
     customerTotalOK,
     customerTotalCurrent: failsCustomerTotal?.total ?? null,
     customerTotalThreshold: filters.minCustomerTotal ?? null,
-    linesCountOK,
-    linesCountCurrent: Number(order?.LinesCount || 0),
-    linesCountThreshold: filters.minLinesPerOrder ?? null,
+    hasOpenLines,
     noOpenLines: !!failsNoOpenLines,
     stockOK,
     stockMissing: failsStock?.items || null,

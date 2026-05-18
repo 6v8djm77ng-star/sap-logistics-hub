@@ -54,7 +54,6 @@ const PLAN_EVAL_STORAGE_KEY = 'openOrders.planEval.v1';
 const PLAN_EVAL_DEFAULTS = {
   enabled: false,
   minCustomerTotal: 3000,
-  minLinesPerOrder: 2,
   requireStock: true,
   applyDeliveryDay: true,
 };
@@ -72,6 +71,45 @@ function savePlanEvalCfg(cfg) {
   try { localStorage.setItem(PLAN_EVAL_STORAGE_KEY, JSON.stringify(cfg)); } catch {}
 }
 
+// Decompose planEval flags into a list of {label, detail} pairs — one entry
+// per failed criterion. Used by the "סיבה" / "פירוט" columns when the
+// plan-eval toggle is ON; an empty list means the order passes everything.
+function failedReasonsOf(pe) {
+  if (!pe || pe.passes) return [];
+  const out = [];
+
+  if (!pe.customerTotalOK && pe.customerTotalCurrent != null && pe.customerTotalThreshold != null) {
+    const current   = Number(pe.customerTotalCurrent).toLocaleString();
+    const threshold = Number(pe.customerTotalThreshold).toLocaleString();
+    const gap       = Number(pe.customerTotalThreshold - pe.customerTotalCurrent).toLocaleString();
+    out.push({ label: 'סך לקוח', detail: `₪${current} מתוך ₪${threshold} · חסר ₪${gap}` });
+  }
+
+  if (pe.noOpenLines) {
+    out.push({ label: 'שורות פתוחות', detail: 'אין שורות פתוחות ב-SAP' });
+  }
+
+  if (!pe.stockOK && Array.isArray(pe.stockMissing) && pe.stockMissing.length > 0) {
+    const sample = pe.stockMissing.slice(0, 2)
+      .map((s) => `${s.itemCode} (חסר ${(s.needed - s.available).toFixed(0)})`)
+      .join(', ');
+    const more = pe.stockMissing.length > 2 ? ` · ועוד ${pe.stockMissing.length - 2}` : '';
+    out.push({ label: 'מלאי', detail: `${sample}${more}` });
+  }
+
+  if (!pe.deliveryDayOK && pe.deliveryDayApplied) {
+    if (pe.deliveryDayProfileMissing) {
+      out.push({ label: 'יום חלוקה', detail: 'אין פרופיל לקוח' });
+    } else if (Array.isArray(pe.deliveryDayExpected) && pe.deliveryDayExpected.length > 0) {
+      out.push({ label: 'יום חלוקה', detail: `היום ${pe.deliveryDayToday} · ימי חלוקה: ${pe.deliveryDayExpected.join(', ')}` });
+    } else {
+      out.push({ label: 'יום חלוקה', detail: `היום ${pe.deliveryDayToday} · אין ימי חלוקה מוגדרים` });
+    }
+  }
+
+  return out;
+}
+
 // Convert planEval flags into a one-line human-readable reason string.
 // Used as the title attribute on the red "נכשל" badge so the operator can
 // hover and see exactly WHICH criterion blocked the order.
@@ -81,14 +119,8 @@ function planEvalReasonsText(pe) {
   if (!pe.customerTotalOK && pe.customerTotalCurrent != null && pe.customerTotalThreshold != null) {
     out.push(`סך לקוח ₪${Number(pe.customerTotalCurrent).toLocaleString()} מתחת לסף ₪${Number(pe.customerTotalThreshold).toLocaleString()}`);
   }
-  if (!pe.linesCountOK) {
-    if (pe.noOpenLines) {
-      out.push('אין שורות פתוחות בהזמנה');
-    } else if (pe.linesCountCurrent != null && pe.linesCountThreshold != null) {
-      out.push(`רק ${pe.linesCountCurrent} שורות (סף ${pe.linesCountThreshold})`);
-    } else {
-      out.push('מספר שורות חסר');
-    }
+  if (pe.noOpenLines) {
+    out.push('אין שורות פתוחות בהזמנה');
   }
   if (!pe.stockOK && Array.isArray(pe.stockMissing) && pe.stockMissing.length > 0) {
     const sample = pe.stockMissing.slice(0, 2).map((s) => `${s.itemCode} (חסר ${s.needed - s.available})`).join(', ');
@@ -117,8 +149,10 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
   });
 
   // colSpan for the expanded row depends on which optional columns are shown.
-  // Base is 9 (incl. ימי הפצה); +1 for the select checkbox, +1 for the planEval badge.
-  const expandedColSpan = 9 + (showSelectColumn ? 1 : 0) + (showPlanEvalColumn ? 1 : 0);
+  // Base is 9 (incl. ימי הפצה); +1 for the select checkbox, +3 for the
+  // planEval cluster (badge + סיבה + פירוט columns shown together).
+  const expandedColSpan = 9 + (showSelectColumn ? 1 : 0) + (showPlanEvalColumn ? 3 : 0);
+  const failedReasons = showPlanEvalColumn ? failedReasonsOf(planEval) : [];
 
   return (
     <>
@@ -194,27 +228,60 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
           {order.DocDueDate ? format(new Date(order.DocDueDate), 'dd/MM/yyyy') : '—'}
         </td>
         {showPlanEvalColumn && (
-          <td className="px-3 py-2 text-center">
-            {planEval ? (
-              planEval.passes ? (
-                <span
-                  title="עומד בכל תנאי התכנון היומי"
-                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-emerald-100 text-emerald-700 font-medium"
-                >
-                  <CheckCircle2 size={12} /> עובר
-                </span>
+          <>
+            <td className="px-3 py-2 text-center align-top">
+              {planEval ? (
+                planEval.passes ? (
+                  <span
+                    title="עומד בכל תנאי התכנון היומי"
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-emerald-100 text-emerald-700 font-medium"
+                  >
+                    <CheckCircle2 size={12} /> עובר
+                  </span>
+                ) : (
+                  <span
+                    title={planEvalReasonsText(planEval) || 'לא עומד בתנאי תכנון'}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-red-100 text-red-700 font-medium cursor-help"
+                  >
+                    <AlertTriangle size={12} /> נכשל
+                  </span>
+                )
               ) : (
-                <span
-                  title={planEvalReasonsText(planEval) || 'לא עומד בתנאי תכנון'}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-red-100 text-red-700 font-medium cursor-help"
-                >
-                  <AlertTriangle size={12} /> נכשל
-                </span>
-              )
-            ) : (
-              <span className="text-xs text-gray-400">—</span>
-            )}
-          </td>
+                <span className="text-xs text-gray-400">—</span>
+              )}
+            </td>
+            {/* סיבה — one chip per failed criterion, stacked vertically.
+                Aligned by row with the matching detail cell to the right
+                because both render in the same order from failedReasons. */}
+            <td className="px-3 py-2 text-xs align-top whitespace-nowrap">
+              {failedReasons.length === 0 ? (
+                <span className="text-gray-400">—</span>
+              ) : (
+                <div className="space-y-1">
+                  {failedReasons.map((r, i) => (
+                    <span
+                      key={i}
+                      className="block px-1.5 py-0.5 bg-red-50 text-red-700 rounded text-xs font-medium"
+                    >
+                      {r.label}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </td>
+            {/* פירוט — the concrete numbers / item list / day mismatch. */}
+            <td className="px-3 py-2 text-xs text-gray-700 align-top">
+              {failedReasons.length === 0 ? (
+                <span className="text-gray-400">—</span>
+              ) : (
+                <div className="space-y-1">
+                  {failedReasons.map((r, i) => (
+                    <div key={i} className="leading-snug">{r.detail}</div>
+                  ))}
+                </div>
+              )}
+            </td>
+          </>
         )}
       </tr>
       {expanded && (
@@ -342,10 +409,9 @@ export default function OpenOrdersPage() {
   // Plan-eval data source — used when toggle is ON. Same orders but each
   // carries a per-criterion `planEval` object from the backend.
   const { data: planEvalData, isLoading: planEvalLoading } = useQuery({
-    queryKey: ['orders-with-plan-eval', planEvalCfg.minCustomerTotal, planEvalCfg.minLinesPerOrder, planEvalCfg.requireStock, planEvalCfg.applyDeliveryDay],
+    queryKey: ['orders-with-plan-eval', planEvalCfg.minCustomerTotal, planEvalCfg.requireStock, planEvalCfg.applyDeliveryDay],
     queryFn: () => ordersApi.openWithPlanEval({
       minCustomerTotal: planEvalCfg.minCustomerTotal,
-      minLinesPerOrder: planEvalCfg.minLinesPerOrder,
       requireStock: planEvalCfg.requireStock,
       applyDeliveryDay: planEvalCfg.applyDeliveryDay,
     }),
@@ -607,7 +673,7 @@ export default function OpenOrdersPage() {
           )}
         </label>
         {planEvalCfg.enabled && (
-          <div className="mt-3 pt-3 border-t grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="mt-3 pt-3 border-t grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
               <label className="text-xs text-gray-600 block mb-1">
                 סך לקוח מינ׳: <span className="font-mono font-semibold">₪{Number(planEvalCfg.minCustomerTotal).toLocaleString()}</span>
@@ -616,17 +682,6 @@ export default function OpenOrdersPage() {
                 type="range" min="1000" max="10000" step="500"
                 value={planEvalCfg.minCustomerTotal}
                 onChange={(e) => updatePlanEvalCfg('minCustomerTotal', Number(e.target.value))}
-                className="w-full"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-gray-600 block mb-1">
-                שורות מינ׳ להזמנה: <span className="font-semibold">{planEvalCfg.minLinesPerOrder}</span>
-              </label>
-              <input
-                type="range" min="1" max="5" step="1"
-                value={planEvalCfg.minLinesPerOrder}
-                onChange={(e) => updatePlanEvalCfg('minLinesPerOrder', Number(e.target.value))}
                 className="w-full"
               />
             </div>
@@ -827,7 +882,11 @@ export default function OpenOrdersPage() {
                   <th className="px-3 py-2 text-left font-medium">סכום</th>
                   <th className="px-3 py-2 text-center font-medium">תאריך אספקה</th>
                   {planEvalCfg.enabled && (
-                    <th className="px-3 py-2 text-center font-medium">תנאי</th>
+                    <>
+                      <th className="px-3 py-2 text-center font-medium">תנאי</th>
+                      <th className="px-3 py-2 text-right font-medium">סיבה</th>
+                      <th className="px-3 py-2 text-right font-medium">פירוט</th>
+                    </>
                   )}
                 </tr>
               </thead>

@@ -2109,7 +2109,6 @@ async function computePlanExclusions(opts = {}) {
   const allOrders = await sapBridge.getOpenOrdersFlat({ limit: 500 });
 
   const MIN_CUSTOMER_TOTAL = Number(opts.minCustomerTotal ?? 3000);
-  const MIN_LINES_PER_ORDER = Number(opts.minLinesPerOrder ?? 2);
   const requireStock = opts.requireStock !== false;
 
   // (a) Customer-total aggregation key — uses CardCode, NOT CardName.
@@ -2203,12 +2202,6 @@ async function computePlanExclusions(opts = {}) {
       });
     }
     const ordLinesCount = Number(o.LinesCount || 0);
-    if (MIN_LINES_PER_ORDER > 0 && ordLinesCount > 0 && ordLinesCount < MIN_LINES_PER_ORDER) {
-      reasons.push({
-        type: 'too_few_lines', linesCount: ordLinesCount, threshold: MIN_LINES_PER_ORDER,
-        items: itemsOf(o),
-      });
-    }
     // no_open_lines — RDR1 has zero open rows for this DocEntry. Either the
     // order shipped from a previous run-day (OpenQty already drawn down by
     // a real-life DN in SAP) or the order is closed. Either way, this run
@@ -2257,7 +2250,6 @@ async function computePlanExclusions(opts = {}) {
     excludedOrders,
     filters: {
       minCustomerTotal: MIN_CUSTOMER_TOTAL,
-      minLinesPerOrder: MIN_LINES_PER_ORDER,
       requireStock,
     },
     alreadyAssigned,
@@ -2274,7 +2266,6 @@ app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
     const result = await computePlanExclusions({
       runDate: req.query.runDate,
       minCustomerTotal: req.query.minCustomerTotal,
-      minLinesPerOrder: req.query.minLinesPerOrder,
       requireStock: req.query.requireStock !== 'false',
     });
     const e = result.excludedOrders;
@@ -2286,7 +2277,6 @@ app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
         ordersPlannable: result.plannableOrders.length,
         ordersExcluded: e.length,
         excludedLowTotal:     e.filter((o) => o.reasons.some((r) => r.type === 'low_total')).length,
-        excludedTooFewLines:  e.filter((o) => o.reasons.some((r) => r.type === 'too_few_lines')).length,
         excludedMissingStock: e.filter((o) => o.reasons.some((r) => r.type === 'missing_stock')).length,
         excludedNoOpenLines:  e.filter((o) => o.reasons.some((r) => r.type === 'no_open_lines')).length,
       },
@@ -2309,7 +2299,6 @@ app.get('/api/runs/auto-plan/preview-exclusions', async (req, res) => {
 // Query params (all optional):
 //   runDate           YYYY-MM-DD (default: today UTC)
 //   minCustomerTotal  number (default: 3000 via computePlanExclusions)
-//   minLinesPerOrder  number (default: 2)
 //   requireStock      'false' disables stock check (default true)
 //   applyDeliveryDay  'false' disables the day check (default true)
 //
@@ -2319,7 +2308,6 @@ app.get('/api/orders/open-with-plan-eval', async (req, res) => {
     const base = await computePlanExclusions({
       runDate: req.query.runDate,
       minCustomerTotal: req.query.minCustomerTotal,
-      minLinesPerOrder: req.query.minLinesPerOrder,
       requireStock: req.query.requireStock !== 'false',
     });
     const applyDeliveryDay = req.query.applyDeliveryDay !== 'false';
@@ -2356,7 +2344,7 @@ app.get('/api/orders/open-with-plan-eval', async (req, res) => {
     const failingDayOnly = ordersWithEval.filter((x) =>
       !x.planEval.passes &&
       x.planEval.customerTotalOK &&
-      x.planEval.linesCountOK &&
+      x.planEval.hasOpenLines &&
       x.planEval.stockOK &&
       !x.planEval.deliveryDayOK
     ).length;
@@ -2384,7 +2372,6 @@ app.post('/api/runs/auto-plan', async (req, res) => {
     const plan = await computePlanExclusions({
       runDate: req.body.runDate,
       minCustomerTotal: req.body.minCustomerTotal,
-      minLinesPerOrder: req.body.minLinesPerOrder,
       requireStock: req.body.requireStock,
     });
     const { runDate, plannableOrders: orders, excludedOrders, alreadyAssigned, existingRuns, filters } = plan;

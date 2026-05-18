@@ -529,7 +529,6 @@ function DocPolicyBadge({ policy }) {
 function ExcludedOrdersPanel({ orders, summary, open, onToggle, onForceInclude, forcing }) {
   const lowTotal = summary?.excludedLowTotal || 0;
   const missingStock = summary?.excludedMissingStock || 0;
-  const tooFewLines = summary?.excludedTooFewLines || 0;
   const isPreview = !!summary?.previewOnly;
 
   return (
@@ -552,11 +551,9 @@ function ExcludedOrdersPanel({ orders, summary, open, onToggle, onForceInclude, 
           <span className={`text-xs ${isPreview ? 'text-blue-700' : 'text-amber-700'}`}>
             {[
               lowTotal > 0 && `${lowTotal} מתחת ל-3,000 ש״ח`,
-              tooFewLines > 0 && `${tooFewLines} פחות מ-2 פריטים`,
               missingStock > 0 && `${missingStock} חוסר במלאי`,
             ].filter(Boolean).join(' · ') && `(${[
               lowTotal > 0 && `${lowTotal} מתחת ל-3,000 ש״ח`,
-              tooFewLines > 0 && `${tooFewLines} פחות מ-2 פריטים`,
               missingStock > 0 && `${missingStock} חוסר במלאי`,
             ].filter(Boolean).join(' · ')})`}
           </span>
@@ -625,7 +622,7 @@ function ExcludedOrdersPanel({ orders, summary, open, onToggle, onForceInclude, 
   );
 }
 
-// Compact list of SKU rows shown under EVERY reason (low_total, too_few_lines,
+// Compact list of SKU rows shown under EVERY reason (low_total,
 // missing_stock). Lets the planner see "what's in this order" without
 // opening it. Capped at 5 lines + "ועוד N פריטים…" link.
 function ItemsPreview({ items, qtyLabel, hilite }) {
@@ -660,17 +657,6 @@ function ReasonsList({ reasons }) {
               <div className="flex items-center gap-1">
                 <Coins size={12} />
                 <span>סך לקוח {formatNis(r.total)} &lt; {formatNis(r.threshold)}</span>
-              </div>
-              <ItemsPreview items={r.items} qtyLabel={(it) => it.quantity ? `×${it.quantity}` : null} />
-            </div>
-          );
-        }
-        if (r.type === 'too_few_lines') {
-          return (
-            <div key={i} className="text-orange-700">
-              <div className="flex items-center gap-1">
-                <Package size={12} />
-                <span>{r.linesCount} פריטים בהזמנה (מינימום {r.threshold})</span>
               </div>
               <ItemsPreview items={r.items} qtyLabel={(it) => it.quantity ? `×${it.quantity}` : null} />
             </div>
