@@ -21,6 +21,10 @@ import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle
 // PlannerPage day filter so the two screens behave consistently.
 const HEBREW_WEEKDAYS = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
 
+// Orders carry CompanyCode 'A' | 'B'; customer profiles carry Company 'OIG' | 'UNICO'.
+// Keep both indirections so the profile lookup matches across the two sources.
+const COMPANY_CODE_TO_NAME = { A: 'OIG', B: 'UNICO' };
+
 const ordersApi = {
   openOrders: (params) =>
     api.get('/orders/open', { params }).then((r) => r.data),
@@ -102,7 +106,7 @@ function planEvalReasonsText(pe) {
   return out.join(' · ');
 }
 
-function OrderDetailsRow({ order, planEval, showPlanEvalColumn, showSelectColumn, isSelected, onToggleSelect }) {
+function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanEvalColumn, showSelectColumn, isSelected, onToggleSelect }) {
   const [expanded, setExpanded] = useState(false);
 
   const { data: linesData, isLoading: linesLoading } = useQuery({
@@ -112,8 +116,8 @@ function OrderDetailsRow({ order, planEval, showPlanEvalColumn, showSelectColumn
   });
 
   // colSpan for the expanded row depends on which optional columns are shown.
-  // Base is 8; +1 for the select checkbox, +1 for the planEval badge.
-  const expandedColSpan = 8 + (showSelectColumn ? 1 : 0) + (showPlanEvalColumn ? 1 : 0);
+  // Base is 9 (incl. ימי הפצה); +1 for the select checkbox, +1 for the planEval badge.
+  const expandedColSpan = 9 + (showSelectColumn ? 1 : 0) + (showPlanEvalColumn ? 1 : 0);
 
   return (
     <>
@@ -155,6 +159,26 @@ function OrderDetailsRow({ order, planEval, showPlanEvalColumn, showSelectColumn
         </td>
         <td className="px-3 py-2 text-sm text-gray-700">
           {order.ShipToAddress || order.CustCity || '—'}
+        </td>
+        <td className="px-3 py-2 text-xs">
+          {deliveryDays && deliveryDays.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {deliveryDays.map((d) => (
+                <span
+                  key={d}
+                  className={`px-1.5 py-0.5 rounded ${
+                    d === todayHebrew
+                      ? 'bg-green-100 text-green-800 font-semibold border border-green-300'
+                      : 'bg-gray-100 text-gray-700'
+                  }`}
+                >
+                  {d}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <span className="text-gray-400 text-xs" title="אין פרופיל לקוח / לא הוגדרו ימי הפצה">—</span>
+          )}
         </td>
         <td className="px-3 py-2 text-sm text-center">
           <span className="font-semibold">{order.LinesCount || 0}</span>
@@ -373,7 +397,8 @@ export default function OpenOrdersPage() {
   // Returns [] when no profile is found — caller decides what to do with it.
   const deliveryDaysForOrder = (o) => {
     if (Array.isArray(o.planEval?.deliveryDayExpected)) return o.planEval.deliveryDayExpected;
-    const p = profileByKey.get(`${o.CompanyCode}:${o.CardCode}`);
+    const companyName = COMPANY_CODE_TO_NAME[o.CompanyCode] || o.CompanyCode;
+    const p = profileByKey.get(`${companyName}:${o.CardCode}`);
     return Array.isArray(p?.DeliveryDays) ? p.DeliveryDays : [];
   };
 
@@ -781,6 +806,7 @@ export default function OpenOrdersPage() {
                   <th className="px-3 py-2 text-right font-medium">הזמנה</th>
                   <th className="px-3 py-2 text-right font-medium">לקוח</th>
                   <th className="px-3 py-2 text-right font-medium">כתובת</th>
+                  <th className="px-3 py-2 text-right font-medium">ימי הפצה</th>
                   <th className="px-3 py-2 text-center font-medium">שורות</th>
                   <th className="px-3 py-2 text-left font-medium">סכום</th>
                   <th className="px-3 py-2 text-center font-medium">תאריך אספקה</th>
@@ -795,6 +821,8 @@ export default function OpenOrdersPage() {
                     key={`${order.CompanyCode}-${order.DocEntry}`}
                     order={order}
                     planEval={order.planEval || null}
+                    deliveryDays={deliveryDaysForOrder(order)}
+                    todayHebrew={todayLabel}
                     showPlanEvalColumn={planEvalCfg.enabled}
                     showSelectColumn={selectionEnabled}
                     isSelected={selectedKeys.has(orderKey(order))}

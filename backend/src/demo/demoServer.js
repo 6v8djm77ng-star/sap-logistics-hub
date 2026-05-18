@@ -2332,7 +2332,8 @@ app.get('/api/orders/open-with-plan-eval', async (req, res) => {
     const filters = { ...base.filters, applyDeliveryDay };
 
     const ordersWithEval = base.allOrders.map((o) => {
-      const profile = profileMap.get(`${o.CompanyCode}:${o.CardCode}`) || null;
+      const companyName = o.CompanyCode === 'A' ? 'OIG' : o.CompanyCode === 'B' ? 'UNICO' : o.CompanyCode;
+      const profile = profileMap.get(`${companyName}:${o.CardCode}`) || null;
       const planEval = evaluatePlanForOrder({
         order: o,
         exclusionReasons: exclusionMap.get(`${o.CompanyCode}:${o.DocEntry}`) || [],
