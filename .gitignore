@@ -136,3 +136,15 @@ backend-sandbox/mock-data/*.real.json
 # tracked schema reference instead. Added 2026-05-13.
 backend/data/store.json
 backend/data/store.backup.*.json
+
+# Daily/manual store backups (created by scripts/daily-backup-store.ps1
+# and the various PRE-* helpers). Contents = full store.json copies =
+# same sensitivity as the live store. The .README.md inside is the only
+# tracked file — it documents the layout and restore procedure.
+#
+# Three-line dance: line 1 re-includes the dir (line 62 ignored it via
+# generic `backups/`); line 2 re-ignores contents; line 3 unblocks the
+# README. Order matters — last matching rule wins in git.
+!backend/data/backups/
+backend/data/backups/*
+!backend/data/backups/.README.md
