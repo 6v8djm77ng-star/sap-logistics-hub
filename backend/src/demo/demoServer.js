@@ -30,8 +30,15 @@ import { startSimulation } from './liveSimulation.js';
 import * as sapBridge from './sapBridge.js';
 import * as store from './persistentStore.js';
 import { evaluatePlanForOrder, hebrewDayFromDate } from './orderPlanEval.js';
-import { previewSelectedOrders } from './previewSelectedOrders.js';
+import { previewSelectedOrders, enrichConflict } from './previewSelectedOrders.js';
+import { createIdempotencyCache, idempotencyMiddleware } from './idempotency.js';
 import agentsRouter from '../routes/agents.js';
+
+// Phase 2 v2 — module-level Idempotency-Key cache shared by the
+// from-selected-orders endpoint and its /preview sibling. In-memory only;
+// 10-minute TTL is set inside createIdempotencyCache. Survives within a
+// single PM2 process and is wiped on reload, which is fine for this window.
+const idempotencyCache = createIdempotencyCache();
 
 // Initialize persistent store
 store.load();
@@ -2505,7 +2512,10 @@ app.post('/api/runs/auto-plan', async (req, res) => {
 //   5. Adds stops + run-orders. Does NOT build the wave — the frontend
 //      calls the existing /api/runs/:id/wave for that, which keeps wave
 //      creation logic single-sourced.
-app.post('/api/runs/from-selected-orders', async (req, res) => {
+app.post(
+  '/api/runs/from-selected-orders',
+  idempotencyMiddleware(idempotencyCache, 'POST /api/runs/from-selected-orders'),
+  async (req, res) => {
   try {
     const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
     const orderRefs = Array.isArray(req.body.orders) ? req.body.orders : null;
@@ -2542,8 +2552,10 @@ app.post('/api/runs/from-selected-orders', async (req, res) => {
 
     // Refuse orders that are already in some other run.
     const storeData = store.load();
+    const allRuns = storeData.runs || [];
     const allRunOrders = storeData.runOrders || [];
     const allStops = storeData.stops || [];
+    const allWaves = storeData.waves || [];
     const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
     const alreadyAssigned = new Set(
       allRunOrders
@@ -2552,12 +2564,11 @@ app.post('/api/runs/from-selected-orders', async (req, res) => {
     );
     const conflicts = orders.filter((o) => alreadyAssigned.has(`${o.CompanyCode}-${o.DocEntry}`));
     if (conflicts.length > 0) {
+      const conflictCtx = { runs: allRuns, stops: allStops, runOrders: allRunOrders, waves: allWaves };
       return res.status(409).json({
         error: `${conflicts.length} הזמנות כבר שייכות למסלול קיים`,
         code: 'ALREADY_ASSIGNED',
-        conflicts: conflicts.slice(0, 10).map((o) => ({
-          companyCode: o.CompanyCode, docNum: o.DocNum, cardName: o.CardName,
-        })),
+        conflicts: conflicts.slice(0, 10).map((o) => enrichConflict(o, conflictCtx)),
       });
     }
 
@@ -2663,7 +2674,13 @@ app.post('/api/runs/from-selected-orders', async (req, res) => {
 // about to create X runs in Y zones with Z stops" before the operator
 // commits. Heavy lifting is in previewSelectedOrders.js so the logic is
 // unit-testable without spinning up Express or SAP.
-app.post('/api/runs/from-selected-orders/preview', async (req, res) => {
+//
+// Honors Idempotency-Key on its own cache namespace so a client can reuse
+// a key across the preview + real submit without conflict.
+app.post(
+  '/api/runs/from-selected-orders/preview',
+  idempotencyMiddleware(idempotencyCache, 'POST /api/runs/from-selected-orders/preview'),
+  async (req, res) => {
   try {
     const runDate = req.body.runDate || new Date().toISOString().slice(0, 10);
     const orderRefs = Array.isArray(req.body.orders) ? req.body.orders : null;

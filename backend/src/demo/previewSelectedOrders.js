@@ -24,6 +24,41 @@ function parseAddress(order) {
   return { city, street };
 }
 
+// Build a rich conflict descriptor for an order that is already on some
+// existing run. The caller passes the order + a snapshot of runs / stops /
+// runOrders / waves; we walk runOrder → stop → run, then pick the most
+// recently created non-COMPLETED/CANCELLED wave on that run if any. Exported
+// so both the preview helper and the live from-selected-orders endpoint can
+// share the same shape.
+export function enrichConflict(order, { runs = [], stops = [], runOrders = [], waves = [] } = {}) {
+  const runOrder = runOrders.find(
+    (ro) => ro.CompanyCode === order.CompanyCode && ro.SapDocEntry === order.DocEntry
+  );
+  const stop = runOrder ? stops.find((s) => s.StopId === runOrder.StopId) : null;
+  const run = stop ? runs.find((r) => r.RunId === stop.RunId) : null;
+  const activeWaves = run
+    ? waves.filter((w) =>
+        w.RunId === run.RunId && w.Status !== 'COMPLETED' && w.Status !== 'CANCELLED'
+      )
+    : [];
+  const wave = activeWaves.length > 0
+    ? activeWaves.reduce((latest, w) => (w.WaveId > latest.WaveId ? w : latest))
+    : null;
+  return {
+    companyCode: order.CompanyCode,
+    docEntry: order.DocEntry,
+    docNum: order.DocNum,
+    cardName: order.CardName,
+    key: `${order.CompanyCode}-${order.DocEntry}`,
+    existingRunId: run ? run.RunId : null,
+    existingRunNumber: run ? run.RunNumber : null,
+    existingRunDate: run ? run.RunDate : null,
+    existingRunStatus: run ? run.Status : null,
+    existingWaveId: wave ? wave.WaveId : null,
+    existingWaveNumber: wave ? wave.WaveNumber : null,
+  };
+}
+
 export function previewSelectedOrders({
   runDate,
   orderRefs,
@@ -75,10 +110,13 @@ export function previewSelectedOrders({
   }
 
   // ── Guard: ALREADY_ASSIGNED ──────────────────────────────────────────
-  // Same uniqueness check as the live endpoint. Commit-1 surfaces only
-  // the conflicting key fields; Commit-2 will add existingRunId / Number.
+  // Same uniqueness check as the live endpoint, now enriched with the
+  // existing run/wave identifiers so the UI can deep-link the operator to
+  // wherever the order is already parked.
+  const allRuns = (storeSnapshot && storeSnapshot.runs) || [];
   const allStops = (storeSnapshot && storeSnapshot.stops) || [];
   const allRunOrders = (storeSnapshot && storeSnapshot.runOrders) || [];
+  const allWaves = (storeSnapshot && storeSnapshot.waves) || [];
   const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
   const alreadyAssigned = new Set(
     allRunOrders
@@ -87,14 +125,13 @@ export function previewSelectedOrders({
   );
   const conflicts = orders.filter((o) => alreadyAssigned.has(`${o.CompanyCode}-${o.DocEntry}`));
   if (conflicts.length > 0) {
+    const conflictCtx = { runs: allRuns, stops: allStops, runOrders: allRunOrders, waves: allWaves };
     return {
       status: 409,
       body: {
         error: `${conflicts.length} הזמנות כבר שייכות למסלול קיים`,
         code: 'ALREADY_ASSIGNED',
-        conflicts: conflicts.slice(0, 10).map((o) => ({
-          companyCode: o.CompanyCode, docNum: o.DocNum, cardName: o.CardName,
-        })),
+        conflicts: conflicts.slice(0, 10).map((o) => enrichConflict(o, conflictCtx)),
       },
     };
   }

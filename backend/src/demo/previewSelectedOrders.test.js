@@ -11,7 +11,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { previewSelectedOrders } from './previewSelectedOrders.js';
+import { previewSelectedOrders, enrichConflict } from './previewSelectedOrders.js';
 
 // ──────────────────────────────────────────────────────────────────────
 // Test fixtures
@@ -131,7 +131,7 @@ test('ORDERS_MISSING: requested order not in SAP snapshot → 400 with missing l
   assert.equal(r.body.missing[0].docEntry, 999);
 });
 
-test('ALREADY_ASSIGNED: order already on an existing run → 409 with conflicts', () => {
+test('ALREADY_ASSIGNED: order already on an existing run → 409 with enriched conflict', () => {
   const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
   const storeWithExistingAssignment = {
     runs: [{ RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'OPEN', RunNumber: 'RUN-2026-05-18-01' }],
@@ -148,8 +148,76 @@ test('ALREADY_ASSIGNED: order already on an existing run → 409 with conflicts'
   assert.equal(r.status, 409);
   assert.equal(r.body.code, 'ALREADY_ASSIGNED');
   assert.equal(r.body.conflicts.length, 1);
-  assert.equal(r.body.conflicts[0].companyCode, 'A');
-  assert.equal(r.body.conflicts[0].docNum, 10);
+  const c = r.body.conflicts[0];
+  // Commit 2 — enriched conflict shape
+  assert.equal(c.companyCode, 'A');
+  assert.equal(c.docEntry, 100);
+  assert.equal(c.docNum, 10);
+  assert.equal(c.cardName, 'Alpha');
+  assert.equal(c.key, 'A-100');
+  assert.equal(c.existingRunId, 5);
+  assert.equal(c.existingRunNumber, 'RUN-2026-05-18-01');
+  assert.equal(c.existingRunDate, '2026-05-18');
+  assert.equal(c.existingRunStatus, 'OPEN');
+  // No wave was attached to the run, so wave fields are null
+  assert.equal(c.existingWaveId, null);
+  assert.equal(c.existingWaveNumber, null);
+});
+
+test('ALREADY_ASSIGNED: enriched conflict surfaces the active wave when present', () => {
+  const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
+  const storeSnap = {
+    runs: [{ RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'PICKING', RunNumber: 'RUN-2026-05-18-01' }],
+    stops: [{ StopId: 10, RunId: 5 }],
+    runOrders: [{ StopId: 10, CompanyCode: 'A', SapDocEntry: 100 }],
+    waves: [
+      // A cancelled wave on the same run — must be ignored
+      { WaveId: 70, WaveNumber: 'WV-70', RunId: 5, Status: 'CANCELLED' },
+      // The active wave — must be surfaced
+      { WaveId: 71, WaveNumber: 'WV-71', RunId: 5, Status: 'PENDING' },
+      // A wave on a different run — must be ignored
+      { WaveId: 72, WaveNumber: 'WV-72', RunId: 9, Status: 'PENDING' },
+    ],
+  };
+  const r = previewSelectedOrders({
+    runDate: '2026-05-18',
+    orderRefs: [{ companyCode: 'A', docEntry: 100 }],
+    sapOpenOrders: [order],
+    storeSnapshot: storeSnap,
+    suggestZoneForCity,
+  });
+  assert.equal(r.status, 409);
+  const c = r.body.conflicts[0];
+  assert.equal(c.existingWaveId, 71);
+  assert.equal(c.existingWaveNumber, 'WV-71');
+  assert.equal(c.existingRunStatus, 'PICKING');
+});
+
+test('enrichConflict (helper export): picks the latest active wave when multiple are PENDING', () => {
+  const order = { CompanyCode: 'A', DocEntry: 100, DocNum: 10, CardName: 'Alpha' };
+  const out = enrichConflict(order, {
+    runs: [{ RunId: 5, RunDate: '2026-05-18', Status: 'PICKING', RunNumber: 'RUN-X' }],
+    stops: [{ StopId: 10, RunId: 5 }],
+    runOrders: [{ StopId: 10, CompanyCode: 'A', SapDocEntry: 100 }],
+    waves: [
+      { WaveId: 80, WaveNumber: 'WV-80', RunId: 5, Status: 'PENDING' },
+      { WaveId: 81, WaveNumber: 'WV-81', RunId: 5, Status: 'PENDING' },
+    ],
+  });
+  assert.equal(out.existingWaveId, 81);
+  assert.equal(out.existingWaveNumber, 'WV-81');
+});
+
+test('enrichConflict (helper export): order not in store → all existing* fields null', () => {
+  const order = { CompanyCode: 'A', DocEntry: 100, DocNum: 10, CardName: 'Alpha' };
+  const out = enrichConflict(order, { runs: [], stops: [], runOrders: [], waves: [] });
+  assert.equal(out.key, 'A-100');
+  assert.equal(out.existingRunId, null);
+  assert.equal(out.existingRunNumber, null);
+  assert.equal(out.existingRunDate, null);
+  assert.equal(out.existingRunStatus, null);
+  assert.equal(out.existingWaveId, null);
+  assert.equal(out.existingWaveNumber, null);
 });
 
 // ──────────────────────────────────────────────────────────────────────
