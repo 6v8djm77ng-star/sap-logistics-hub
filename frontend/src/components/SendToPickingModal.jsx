@@ -1,28 +1,64 @@
 /**
- * SendToPickingModal — Commit 3a (preview only).
+ * SendToPickingModal — Commit 3b (real submit + progress).
  *
- * Replaces the legacy window.confirm in OpenOrdersPage. Calls
- * /api/runs/from-selected-orders/preview on open, shows a structured
- * preview (per-zone breakdown, reuse vs create, unassigned warning,
- * ALREADY_ASSIGNED conflict table). The "אשר ושלח" button is rendered
- * but kept inert in 3a — Commit 3b will wire the real submit, progress
- * surfacing, and Idempotency-Key.
+ * Flow lives in this single component:
+ *   1. open  → mint a fresh Idempotency-Key (one per modal opening),
+ *              fetch /api/runs/from-selected-orders/preview, show the
+ *              structured preview (per-zone, reuse/create, unassigned,
+ *              conflicts).
+ *   2. אשר ושלח → phase='submitting': POST /api/runs/from-selected-orders
+ *              with the same Idempotency-Key (so a double-click or network
+ *              retry replays the backend's prior response rather than
+ *              double-creating runs), then sequentially POST /runs/:id/wave
+ *              per created run. Each wave update bumps the progress counter
+ *              so the operator sees "בונה גל N/M…".
+ *   3. done   → summary card with runs/waves built + failed, per-run rows,
+ *              "פתח גל ליקוט ראשון" button. The modal stays open until the
+ *              operator dismisses it.
+ *   4. error  → submission-level error card with a retry button (same
+ *              Idempotency-Key, so the backend may replay the cached
+ *              response if the prior request actually went through).
  *
- * Errors:
+ * Errors handled separately at the preview step:
  *   - 409 ALREADY_ASSIGNED → conflict table with existing run/wave links
  *   - 400 ORDERS_MISSING   → explicit notice (refresh-from-SAP cue)
  *   - other (incl. network) → generic error card + retry button
  */
 import { useEffect, useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
-import { toast } from 'sonner';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useNavigate } from 'react-router-dom';
 import {
-  X, Loader2, AlertTriangle, Send, MapPin, Truck, Info,
+  X, Loader2, AlertTriangle, Send, MapPin, Truck, CheckCircle2, ChevronLeft,
 } from 'lucide-react';
 import { runsApi } from '../services/api.js';
 
+// Phase machine — kept as plain strings so the JSX can switch on them
+// without a state-machine library. Order: preview → submitting → done|error.
+const PHASE_PREVIEW    = 'preview';
+const PHASE_SUBMITTING = 'submitting';
+const PHASE_DONE       = 'done';
+const PHASE_ERROR      = 'error';
+
+// crypto.randomUUID is available in every browser this app targets
+// (Chrome 92+, Firefox 95+, Safari 15.4+). Tiny fallback retained just so
+// a stale browser does not lose idempotency protection entirely.
+function newIdempotencyKey() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `fallback-${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export default function SendToPickingModal({ open, orderRefs, onClose }) {
-  const [errorBody, setErrorBody] = useState(null);
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+
+  const [phase, setPhase]             = useState(PHASE_PREVIEW);
+  const [errorBody, setErrorBody]     = useState(null);           // preview-step errors only
+  const [idempotencyKey, setKey]      = useState(null);
+  const [progress, setProgress]       = useState({ runsTotal: 0, wavesBuilt: 0, wavesFailed: 0, currentStep: '' });
+  const [finalResult, setFinalResult] = useState(null);           // { runsCreated, waveResults, summary, unassigned }
+  const [finalError, setFinalError]   = useState(null);           // submit-step error body
 
   const previewMutation = useMutation({
     mutationFn: () => runsApi.previewFromSelectedOrders({ orders: orderRefs || [] }),
@@ -34,12 +70,17 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
     },
   });
 
-  // Refire preview whenever the modal opens or the selection changes.
-  // JSON.stringify is fine here — the refs list is small (max 500 entries
-  // by the backend guard) and we only want to detect identity changes.
+  // Refire preview whenever the modal opens or the selection changes. Also
+  // mint a brand-new Idempotency-Key per opening so a previous successful
+  // submit can never replay-merge into a new selection.
   useEffect(() => {
     if (open && Array.isArray(orderRefs) && orderRefs.length > 0) {
+      setPhase(PHASE_PREVIEW);
       setErrorBody(null);
+      setFinalResult(null);
+      setFinalError(null);
+      setProgress({ runsTotal: 0, wavesBuilt: 0, wavesFailed: 0, currentStep: '' });
+      setKey(newIdempotencyKey());
       previewMutation.mutate();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -47,14 +88,99 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
 
   if (!open) return null;
 
-  const preview = previewMutation.data;
-  const isLoading = previewMutation.isPending;
-  const hasError = !!errorBody;
-  const conflicts = errorBody?.code === 'ALREADY_ASSIGNED' ? errorBody.conflicts : null;
-  const ordersMissing = errorBody?.code === 'ORDERS_MISSING' ? errorBody.missing : null;
-  const canConfirm = !isLoading && !hasError && preview && (preview.summary?.ordersAssigned || 0) > 0;
+  const preview        = previewMutation.data;
+  const isLoading      = previewMutation.isPending;
+  const hasPreviewError = !!errorBody;
+  const conflicts      = errorBody?.code === 'ALREADY_ASSIGNED' ? errorBody.conflicts : null;
+  const ordersMissing  = errorBody?.code === 'ORDERS_MISSING' ? errorBody.missing : null;
+
+  // Confirm is allowed only when: we're in the preview phase, the preview
+  // succeeded, there are no conflicts, no missing orders, and at least one
+  // order is in a recognized zone (ordersAssigned > 0). Unassigned-only
+  // selections still surface in preview but cannot move forward — there is
+  // nothing for the backend to create.
+  const canConfirm =
+    phase === PHASE_PREVIEW &&
+    !isLoading &&
+    !hasPreviewError &&
+    preview &&
+    (preview.summary?.ordersAssigned || 0) > 0;
 
   const totalStops = (preview?.runsPreview || []).reduce((sum, r) => sum + (r.stopCount || 0), 0);
+
+  async function handleConfirm() {
+    if (!canConfirm || !idempotencyKey) return;
+    setPhase(PHASE_SUBMITTING);
+    setProgress({ runsTotal: 0, wavesBuilt: 0, wavesFailed: 0, currentStep: 'יוצר מסלולים…' });
+
+    let submitResult;
+    try {
+      submitResult = await runsApi.fromSelectedOrders({ orders: orderRefs }, idempotencyKey);
+    } catch (err) {
+      setFinalError(err.response?.data || { error: err.message || 'שגיאת רשת', code: 'NETWORK_ERROR' });
+      setPhase(PHASE_ERROR);
+      return;
+    }
+
+    const runsCreated = submitResult.runsCreated || [];
+    const waveResults = [];
+    setProgress({ runsTotal: runsCreated.length, wavesBuilt: 0, wavesFailed: 0, currentStep: 'בונה גלי ליקוט…' });
+
+    // Sequential — SAP-friendly + lets us update the progress bar one wave
+    // at a time. Parallel would shave seconds at the cost of harder error
+    // surfacing and heavier SAP load.
+    for (let i = 0; i < runsCreated.length; i++) {
+      const run = runsCreated[i];
+      setProgress((prev) => ({ ...prev, currentStep: `בונה גל ליקוט ${i + 1}/${runsCreated.length}…` }));
+      try {
+        const wave = await runsApi.buildWave(run.runId);
+        waveResults.push({
+          runId: run.runId, runNumber: run.runNumber, zoneName: run.zoneName, zoneCode: run.zoneCode,
+          reusedExisting: !!run.reusedExisting, stopCount: run.stopCount, orderCount: run.orderCount,
+          waveId: wave?.WaveId || null, waveNumber: wave?.WaveNumber || null, error: null,
+        });
+        setProgress((prev) => ({ ...prev, wavesBuilt: prev.wavesBuilt + 1 }));
+      } catch (waveErr) {
+        waveResults.push({
+          runId: run.runId, runNumber: run.runNumber, zoneName: run.zoneName, zoneCode: run.zoneCode,
+          reusedExisting: !!run.reusedExisting, stopCount: run.stopCount, orderCount: run.orderCount,
+          waveId: null, waveNumber: null,
+          error: waveErr.response?.data?.error || waveErr.message || 'שגיאה לא ידועה',
+        });
+        setProgress((prev) => ({ ...prev, wavesFailed: prev.wavesFailed + 1 }));
+      }
+    }
+
+    setFinalResult({
+      runsCreated, waveResults,
+      summary: submitResult.summary || {},
+      unassigned: submitResult.unassigned || [],
+    });
+    setPhase(PHASE_DONE);
+
+    // Refresh adjacent caches so OpenOrdersPage sees the new state when
+    // the modal is dismissed. Runs are also invalidated for RunsPage.
+    queryClient.invalidateQueries({ queryKey: ['open-orders'] });
+    queryClient.invalidateQueries({ queryKey: ['orders-with-plan-eval'] });
+    queryClient.invalidateQueries({ queryKey: ['runs'] });
+  }
+
+  function handleOpenFirstWave() {
+    const firstWave = (finalResult?.waveResults || []).find((w) => w.waveId);
+    if (firstWave) navigate(`/picking/${firstWave.waveId}`);
+  }
+
+  function handleClose() {
+    // Block close mid-submit so we don't leave the user wondering whether
+    // the run was created. Header X + footer "סגור" both call this.
+    if (phase === PHASE_SUBMITTING) return;
+    // Tell the parent whether a real submit happened. Only PHASE_DONE
+    // means runs were actually created — PHASE_ERROR is "POST rejected
+    // before any state changed" (e.g. ALREADY_ASSIGNED) and PHASE_PREVIEW
+    // close is a plain cancel. The parent uses this to decide whether to
+    // clear the checkbox selection.
+    onClose?.({ submitted: phase === PHASE_DONE });
+  }
 
   return (
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
@@ -63,17 +189,21 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
         <div className="flex items-center justify-between p-4 border-b">
           <div>
             <h2 className="text-lg font-bold flex items-center gap-2">
-              <Send size={18} className="text-emerald-600" />
-              תצוגה מקדימה לשליחה לליקוט
+              <Send size={18} className={phase === PHASE_DONE ? 'text-emerald-600' : phase === PHASE_ERROR ? 'text-red-600' : 'text-emerald-600'} />
+              {phase === PHASE_DONE   ? 'נשלח לליקוט' :
+               phase === PHASE_ERROR  ? 'שגיאה בשליחה' :
+                                        'תצוגה מקדימה לשליחה לליקוט'}
             </h2>
             <div className="text-xs text-gray-500 mt-1">
               {orderRefs?.length || 0} הזמנות נבחרו
             </div>
           </div>
           <button
-            onClick={onClose}
-            className="p-1.5 hover:bg-gray-100 rounded-lg"
+            onClick={handleClose}
+            disabled={phase === PHASE_SUBMITTING}
+            className="p-1.5 hover:bg-gray-100 rounded-lg disabled:opacity-30 disabled:cursor-not-allowed"
             aria-label="סגור"
+            title={phase === PHASE_SUBMITTING ? 'לא ניתן לסגור באמצע שליחה' : 'סגור'}
           >
             <X size={18} />
           </button>
@@ -81,61 +211,98 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
 
         {/* Body */}
         <div className="flex-1 overflow-auto p-4 space-y-3">
-          {isLoading && (
+          {/* PREVIEW phase */}
+          {phase === PHASE_PREVIEW && isLoading && (
             <div className="text-center py-12 text-gray-500">
               <Loader2 size={32} className="animate-spin mx-auto mb-3" />
               <div className="text-sm">טוען תצוגה מקדימה...</div>
             </div>
           )}
-
-          {!isLoading && conflicts && (
+          {phase === PHASE_PREVIEW && !isLoading && conflicts && (
             <ConflictsView conflicts={conflicts} />
           )}
-
-          {!isLoading && ordersMissing && !conflicts && (
+          {phase === PHASE_PREVIEW && !isLoading && ordersMissing && !conflicts && (
             <OrdersMissingView count={ordersMissing.length} />
           )}
-
-          {!isLoading && hasError && !conflicts && !ordersMissing && (
+          {phase === PHASE_PREVIEW && !isLoading && hasPreviewError && !conflicts && !ordersMissing && (
             <GenericErrorView
+              title="שגיאה בטעינת תצוגה מקדימה"
               errorBody={errorBody}
               onRetry={() => previewMutation.mutate()}
             />
           )}
-
-          {!isLoading && !hasError && preview && (
+          {phase === PHASE_PREVIEW && !isLoading && !hasPreviewError && preview && (
             <PreviewView preview={preview} totalStops={totalStops} />
           )}
 
-          {/* Commit 3a tag — explains that "Confirm" is intentionally inert */}
-          {!isLoading && !hasError && preview && (
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-xs text-blue-800 flex items-start gap-2">
-              <Info size={14} className="flex-shrink-0 mt-0.5" />
-              <span>
-                שלב 3a — תצוגה מקדימה בלבד. לחצן "אשר ושלח" יהפוך פעיל ב-Commit 3b
-                (יוסיף את ה-progress + Idempotency-Key).
-              </span>
-            </div>
+          {/* SUBMITTING phase */}
+          {phase === PHASE_SUBMITTING && (
+            <SubmittingView progress={progress} />
+          )}
+
+          {/* DONE phase */}
+          {phase === PHASE_DONE && finalResult && (
+            <DoneView result={finalResult} />
+          )}
+
+          {/* ERROR phase (submit-step only — preview errors render inline above) */}
+          {phase === PHASE_ERROR && finalError && (
+            <GenericErrorView
+              title="שגיאה בשליחה לליקוט"
+              errorBody={finalError}
+              onRetry={() => handleConfirm()}
+              retryLabel="נסה שוב (אותו Idempotency-Key)"
+            />
           )}
         </div>
 
-        {/* Footer */}
+        {/* Footer — buttons change with the phase */}
         <div className="flex items-center justify-end gap-2 p-4 border-t bg-gray-50">
-          <button
-            onClick={onClose}
-            className="px-4 py-2 text-sm border rounded-lg hover:bg-white"
-          >
-            בטל
-          </button>
-          <button
-            disabled={!canConfirm}
-            onClick={() => toast.info('שליחה בפועל תתווסף ב-Commit 3b')}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="שליחה בפועל תתווסף ב-Commit 3b"
-          >
-            <Send size={14} />
-            אשר ושלח (Commit 3b)
-          </button>
+          {phase === PHASE_PREVIEW && (
+            <>
+              <button onClick={handleClose} className="px-4 py-2 text-sm border rounded-lg hover:bg-white">
+                בטל
+              </button>
+              <button
+                disabled={!canConfirm}
+                onClick={handleConfirm}
+                className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Send size={14} />
+                אשר ושלח ({preview?.summary?.ordersAssigned ?? 0})
+              </button>
+            </>
+          )}
+          {phase === PHASE_SUBMITTING && (
+            <button
+              disabled
+              className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-lg opacity-60 cursor-not-allowed"
+            >
+              <Loader2 size={14} className="animate-spin" />
+              שולח...
+            </button>
+          )}
+          {phase === PHASE_DONE && (
+            <>
+              <button onClick={handleClose} className="px-4 py-2 text-sm border rounded-lg hover:bg-white">
+                סגור
+              </button>
+              {(finalResult?.waveResults || []).some((w) => w.waveId) && (
+                <button
+                  onClick={handleOpenFirstWave}
+                  className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700"
+                >
+                  <ChevronLeft size={14} />
+                  פתח גל ליקוט ראשון
+                </button>
+              )}
+            </>
+          )}
+          {phase === PHASE_ERROR && (
+            <button onClick={handleClose} className="px-4 py-2 text-sm border rounded-lg hover:bg-white">
+              סגור
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -143,14 +310,12 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Sub-views — kept inline rather than separate files since they only
-// belong to this modal and are not used elsewhere.
+// Sub-views
 // ──────────────────────────────────────────────────────────────────────
 
 function PreviewView({ preview, totalStops }) {
   return (
     <>
-      {/* Stat tiles */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
         <Stat label="הזמנות נבחרו" value={preview.selectedCount} color="blue" />
         <Stat
@@ -163,12 +328,10 @@ function PreviewView({ preview, totalStops }) {
         <Stat label="הזמנות משויכות" value={preview.summary.ordersAssigned} color="gray" />
       </div>
 
-      {/* Unassigned warning */}
       {preview.unassigned && preview.unassigned.length > 0 && (
         <UnassignedWarning unassigned={preview.unassigned} />
       )}
 
-      {/* Per-zone breakdown */}
       <div>
         <h3 className="text-sm font-semibold mb-2 flex items-center gap-1.5">
           <Truck size={14} /> פירוט לפי אזור
@@ -180,6 +343,117 @@ function PreviewView({ preview, totalStops }) {
         </div>
       </div>
     </>
+  );
+}
+
+function SubmittingView({ progress }) {
+  const { runsTotal, wavesBuilt, wavesFailed, currentStep } = progress;
+  const wavesTouched = wavesBuilt + wavesFailed;
+  const pct = runsTotal > 0 ? Math.round((wavesTouched / runsTotal) * 100) : 0;
+  return (
+    <div className="py-8 space-y-4">
+      <div className="text-center">
+        <Loader2 size={36} className="animate-spin mx-auto mb-3 text-emerald-600" />
+        <div className="text-sm font-medium">{currentStep || 'שולח...'}</div>
+      </div>
+      {runsTotal > 0 && (
+        <div className="px-2">
+          <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-emerald-500 transition-all duration-200"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <div className="mt-2 flex items-center justify-between text-xs text-gray-600">
+            <span>{wavesTouched} / {runsTotal} גלי ליקוט</span>
+            {wavesFailed > 0 && <span className="text-red-700">{wavesFailed} נכשלו</span>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DoneView({ result }) {
+  const { runsCreated = [], waveResults = [], summary = {}, unassigned = [] } = result;
+  const wavesBuilt  = waveResults.filter((w) => w.waveId).length;
+  const wavesFailed = waveResults.filter((w) => !w.waveId).length;
+  const allWavesOk  = wavesBuilt === runsCreated.length;
+  const partial     = wavesBuilt > 0 && wavesFailed > 0;
+
+  return (
+    <div className="space-y-3">
+      <div className={`rounded-lg p-3 border ${
+        allWavesOk ? 'bg-emerald-50 border-emerald-300'
+        : partial  ? 'bg-amber-50 border-amber-300'
+                   : 'bg-red-50 border-red-300'
+      }`}>
+        <div className="flex items-start gap-2">
+          {allWavesOk
+            ? <CheckCircle2 size={18} className="text-emerald-600 flex-shrink-0 mt-0.5" />
+            : <AlertTriangle size={18} className={`${partial ? 'text-amber-600' : 'text-red-600'} flex-shrink-0 mt-0.5`} />}
+          <div className="text-sm">
+            <div className={`font-bold ${allWavesOk ? 'text-emerald-900' : partial ? 'text-amber-900' : 'text-red-900'}`}>
+              {allWavesOk ? 'הליקוט נשלח בהצלחה' : partial ? 'הליקוט נשלח חלקית' : 'מסלולים נוצרו אך ללא גלי ליקוט'}
+            </div>
+            <div className="text-xs mt-1 text-gray-700">
+              {runsCreated.length} מסלולים · {summary.runsToReuse || 0} קיימים, {summary.runsToCreate || 0} חדשים
+              {' · '}
+              {wavesBuilt}/{runsCreated.length} גלי ליקוט מוכנים
+              {wavesFailed > 0 && (
+                <span className="text-red-700"> · {wavesFailed} נכשלו</span>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-white border border-gray-200 rounded-lg overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-gray-50 text-gray-600 text-xs">
+            <tr>
+              <th className="px-3 py-2 text-right font-medium">מסלול</th>
+              <th className="px-3 py-2 text-right font-medium">אזור</th>
+              <th className="px-3 py-2 text-center font-medium">תחנות</th>
+              <th className="px-3 py-2 text-center font-medium">הזמנות</th>
+              <th className="px-3 py-2 text-right font-medium">גל ליקוט</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {waveResults.map((w) => (
+              <tr key={w.runId}>
+                <td className="px-3 py-2 font-mono text-xs">
+                  {w.runNumber}
+                  {w.reusedExisting && (
+                    <span className="ml-1 px-1 py-0.5 bg-blue-50 text-blue-700 rounded text-[10px]">
+                      קיים
+                    </span>
+                  )}
+                </td>
+                <td className="px-3 py-2 text-xs">{w.zoneName}</td>
+                <td className="px-3 py-2 text-center text-xs">{w.stopCount}</td>
+                <td className="px-3 py-2 text-center text-xs">{w.orderCount}</td>
+                <td className="px-3 py-2 text-xs">
+                  {w.waveId ? (
+                    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-emerald-50 text-emerald-700 rounded">
+                      <CheckCircle2 size={10} /> {w.waveNumber}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-red-700" title={w.error}>
+                      <AlertTriangle size={10} /> {w.error?.slice(0, 40) || 'נכשל'}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {unassigned && unassigned.length > 0 && (
+        <UnassignedWarning unassigned={unassigned} />
+      )}
+    </div>
   );
 }
 
@@ -320,27 +594,29 @@ function OrdersMissingView({ count }) {
   );
 }
 
-function GenericErrorView({ errorBody, onRetry }) {
+function GenericErrorView({ title = 'שגיאה', errorBody, onRetry, retryLabel = 'נסה שוב' }) {
   return (
     <div className="bg-red-50 border border-red-300 rounded-lg p-3">
       <div className="flex items-start gap-2">
         <AlertTriangle size={18} className="text-red-600 flex-shrink-0 mt-0.5" />
         <div className="text-sm flex-1">
-          <div className="font-bold text-red-900">שגיאה בטעינת תצוגה מקדימה</div>
+          <div className="font-bold text-red-900">{title}</div>
           <div className="text-red-700 text-xs mt-1">
-            {errorBody.error || 'נסה שוב'}
-            {errorBody.code && (
+            {errorBody?.error || 'נסה שוב'}
+            {errorBody?.code && (
               <span className="ml-2 font-mono">({errorBody.code})</span>
             )}
           </div>
         </div>
       </div>
-      <button
-        onClick={onRetry}
-        className="mt-3 px-3 py-1.5 text-sm border rounded-lg hover:bg-white"
-      >
-        נסה שוב
-      </button>
+      {onRetry && (
+        <button
+          onClick={onRetry}
+          className="mt-3 px-3 py-1.5 text-sm border rounded-lg hover:bg-white"
+        >
+          {retryLabel}
+        </button>
+      )}
     </div>
   );
 }

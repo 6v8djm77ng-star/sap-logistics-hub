@@ -10,12 +10,11 @@
  * /api/orders/open path stays the default when the toggle is OFF.
  */
 import { useState, useMemo } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
-import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, Loader2, CalendarDays } from 'lucide-react';
+import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, CalendarDays } from 'lucide-react';
 import SendToPickingModal from '../components/SendToPickingModal.jsx';
 
 // Hebrew weekday names indexed by Date.getDay() (0=Sunday). Matches the
@@ -33,13 +32,9 @@ const ordersApi = {
     api.get('/orders/open-with-plan-eval', { params }).then((r) => r.data),
   orderLines: (company, docEntry) =>
     api.get(`/orders/${company}/${docEntry}/lines`).then((r) => r.data),
-  createRunsFromSelected: (body) =>
-    api.post('/runs/from-selected-orders', body).then((r) => r.data),
 };
-
-const runsApi = {
-  buildWave: (runId) => api.post(`/runs/${runId}/wave`).then((r) => r.data),
-};
+// "שלח לליקוט" lives entirely inside SendToPickingModal now (Commit 3b) —
+// it owns the preview → submit → wave-build chain and the Idempotency-Key.
 
 // orderKey is the dedup key used both in the selection Set and as the
 // stable identity in the orders list. Must match what the backend uses.
@@ -330,8 +325,6 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
 }
 
 export default function OpenOrdersPage() {
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const [search, setSearch] = useState('');
   const [company, setCompany] = useState('');
   const [limit, setLimit] = useState(100);
@@ -417,49 +410,6 @@ export default function OpenOrdersPage() {
     }),
     refetchInterval: 60_000,
     enabled: planEvalCfg.enabled,
-  });
-
-  // Phase 2: "שלח לליקוט" — POST to /api/runs/from-selected-orders.
-  // On success: chain a buildWave per created run, then redirect to
-  // /picking/<firstWaveId> so the manager lands on the picker screen with
-  // the wave already built. Errors (e.g. ALREADY_ASSIGNED, ORDERS_MISSING)
-  // are surfaced via toast so the operator can adjust the selection.
-  const sendToPickingMutation = useMutation({
-    mutationFn: async (orderRefs) => {
-      const created = await ordersApi.createRunsFromSelected({ orders: orderRefs });
-      // For each new run, kick off wave build. Failures are tolerated — the
-      // manager can build the wave manually from RunDetailsPage.
-      const waves = [];
-      for (const r of created.runsCreated || []) {
-        try {
-          const wave = await runsApi.buildWave(r.runId);
-          waves.push({ runId: r.runId, waveId: wave?.WaveId || null });
-        } catch (waveErr) {
-          waves.push({ runId: r.runId, waveId: null, error: waveErr.response?.data?.error || waveErr.message });
-        }
-      }
-      return { ...created, waves };
-    },
-    onSuccess: (data) => {
-      const firstWaveId = data.waves?.find((w) => w.waveId)?.waveId;
-      const runsCreated = data.runsCreated?.length || 0;
-      const wavesBuilt = data.waves?.filter((w) => w.waveId).length || 0;
-      toast.success(`נוצרו ${runsCreated} מסלולים, ${wavesBuilt} עם גל ליקוט מוכן`);
-      clearSelection();
-      queryClient.invalidateQueries({ queryKey: ['open-orders'] });
-      queryClient.invalidateQueries({ queryKey: ['orders-with-plan-eval'] });
-      queryClient.invalidateQueries({ queryKey: ['runs'] });
-      if (firstWaveId) {
-        navigate(`/picking/${firstWaveId}`);
-      } else if (runsCreated > 0) {
-        navigate(`/runs`);
-      }
-    },
-    onError: (err) => {
-      const body = err.response?.data;
-      const msg = body?.error || err.message || 'שגיאה בשליחה לליקוט';
-      toast.error(msg);
-    },
   });
 
   const isLoading = planEvalCfg.enabled ? planEvalLoading : legacyLoading;
@@ -568,11 +518,18 @@ export default function OpenOrdersPage() {
       toast.error('הבחירה ריקה מהנראה. רענן והרא שוב.');
       return;
     }
-    // Commit 3a — open the preview modal. The real submit (sendToPickingMutation)
-    // is still defined above and will be re-wired from the modal in Commit 3b,
-    // together with progress surfacing and the Idempotency-Key plumbing.
+    // Commit 3b — open the modal. The modal owns the preview → submit →
+    // wave-build chain and the Idempotency-Key. We just hand it the refs.
     setPreviewOrderRefs(refs);
     setPreviewModalOpen(true);
+  };
+
+  // When the modal closes, only clear the selection if a real submit
+  // happened. The modal passes { submitted: true } in that case; on a
+  // plain cancel we keep the operator's selection so they can adjust.
+  const handleModalClose = ({ submitted } = {}) => {
+    setPreviewModalOpen(false);
+    if (submitted) clearSelection();
   };
 
   return (
@@ -770,18 +727,10 @@ export default function OpenOrdersPage() {
           <button
             type="button"
             onClick={submitSelection}
-            disabled={selectedKeys.size === 0 || sendToPickingMutation.isPending}
+            disabled={selectedKeys.size === 0 || previewModalOpen}
             className="inline-flex items-center gap-2 px-4 py-1.5 text-sm font-medium bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            {sendToPickingMutation.isPending ? (
-              <>
-                <Loader2 size={14} className="animate-spin" /> שולח לליקוט...
-              </>
-            ) : (
-              <>
-                <Send size={14} /> שלח לליקוט ({selectedKeys.size})
-              </>
-            )}
+            <Send size={14} /> שלח לליקוט ({selectedKeys.size})
           </button>
         </div>
       )}
@@ -920,7 +869,7 @@ export default function OpenOrdersPage() {
       <SendToPickingModal
         open={previewModalOpen}
         orderRefs={previewOrderRefs}
-        onClose={() => setPreviewModalOpen(false)}
+        onClose={handleModalClose}
       />
     </div>
   );

@@ -62,11 +62,17 @@ export const runsApi = {
   buildWave: (id) => api.post(`/runs/${id}/wave`).then((r) => r.data),
   getWave: (id) => api.get(`/runs/${id}/wave`).then((r) => r.data),
   // Phase 2 v2 — dry-run preview for "send selected orders to picking".
-  // Returns a runsPreview/summary without mutating any store. The matching
-  // POST /runs/from-selected-orders (real submit) stays inline in
-  // OpenOrdersPage until Commit 3b takes over from here.
+  // Returns a runsPreview/summary without mutating any store.
   previewFromSelectedOrders: (body) =>
     api.post('/runs/from-selected-orders/preview', body).then((r) => r.data),
+  // Phase 2 v2, Commit 3b — the real submit. Accepts an optional
+  // Idempotency-Key (a UUID generated client-side per modal opening) so
+  // a double-click or network retry replays the server's prior response
+  // instead of creating duplicate runs.
+  fromSelectedOrders: (body, idempotencyKey) => {
+    const config = idempotencyKey ? { headers: { 'Idempotency-Key': idempotencyKey } } : {};
+    return api.post('/runs/from-selected-orders', body, config).then((r) => r.data);
+  },
 };
 
 export const returnsApi = {
