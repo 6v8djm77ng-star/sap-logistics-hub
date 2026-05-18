@@ -437,11 +437,18 @@ export default function OpenOrdersPage() {
       'city-asc':      (a, b) => String(cityOf(a)).localeCompare(String(cityOf(b)), 'he'),
       'docTotal-desc': (a, b) => Number(b.DocTotal || 0) - Number(a.DocTotal || 0),
       'docTotal-asc':  (a, b) => Number(a.DocTotal || 0) - Number(b.DocTotal || 0),
-      // When plan-eval is active, sort passing orders first so the operator
-      // sees them at the top of the list.
-      'planPass-first': (a, b) => Number(!!b.planEval?.passes) - Number(!!a.planEval?.passes),
     };
-    if (cmp[sortBy]) arr.sort(cmp[sortBy]);
+    const baseSort = cmp[sortBy] || cmp['docDate-desc'];
+    // When plan-eval is active, always pin passing orders to the top so the
+    // operator's attention goes there first. The user-selected sort then acts
+    // as a secondary order within each group (passing / failing).
+    const finalSort = planEvalCfg.enabled
+      ? (a, b) => {
+          const passDiff = Number(!!b.planEval?.passes) - Number(!!a.planEval?.passes);
+          return passDiff !== 0 ? passDiff : baseSort(a, b);
+        }
+      : baseSort;
+    arr.sort(finalSort);
     return arr;
   })();
 
@@ -754,9 +761,6 @@ export default function OpenOrdersPage() {
           <option value="city-asc">🏙️ עיר - א→ת</option>
           <option value="docTotal-desc">💰 סכום - גבוה→נמוך</option>
           <option value="docTotal-asc">💰 סכום - נמוך→גבוה</option>
-          {planEvalCfg.enabled && (
-            <option value="planPass-first">✅ עוברות תנאי קודם</option>
-          )}
         </select>
         {!planEvalCfg.enabled && (
           <select
