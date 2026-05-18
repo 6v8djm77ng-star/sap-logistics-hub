@@ -1718,6 +1718,11 @@ export function createWaveFromLines(runId, orderLines) {
       byItem.set(aggKey, {
         ItemCode: line.ItemCode,
         ItemName: line.ItemName,
+        // Phase 3: ItemGroup (OITM.ItmsGrpCod) is captured here so the
+        // wave line can carry it and the sort below can group by it.
+        // Picker walks one warehouse zone at a time instead of
+        // bouncing between mixers / blenders / accessories.
+        ItemGroup: line.ItemGroup != null ? Number(line.ItemGroup) : null,
         Barcode: line.Barcode || null,
         WarehouseCode: line.WarehouseCode,
         UomCode: line.UomCode,
@@ -1768,9 +1773,23 @@ export function createWaveFromLines(runId, orderLines) {
     });
   }
 
-  // Sort wave lines: primary key = first allocation's city in drive order,
-  // secondary = warehouse location, tertiary = item code (stable).
+  // Sort wave lines. Phase 3 (2026-05-18) re-ordered priorities:
+  //   1. ItemGroup ASC (NEW)        - keep mixers / blenders / accessories
+  //                                   together so the picker walks one
+  //                                   warehouse zone at a time. Items with
+  //                                   no group code fall to the bottom.
+  //   2. City drive order            - existing zone-based truck sequence
+  //   3. City name (he locale)       - tiebreaker within same drive-rank
+  //   4. Warehouse code              - existing
+  //   5. Item code                   - stable order within a group
+  //
+  // The user-decided rule was "weight + volume" but OITM coverage is 0%
+  // (verified by scripts/discover-item-dimensions.js, 2026-05-18). Until
+  // that data is populated, ItemGroup is the proxy.
   const sorted = Array.from(byItem.values()).sort((a, b) => {
+    const ga = a.ItemGroup != null ? a.ItemGroup : 999999;
+    const gb = b.ItemGroup != null ? b.ItemGroup : 999999;
+    if (ga !== gb) return ga - gb;
     const ca = a.Allocations[0]?.City || '';
     const cb = b.Allocations[0]?.City || '';
     const ra = cityRank(ca);
@@ -1789,6 +1808,10 @@ export function createWaveFromLines(runId, orderLines) {
       WaveId: newWave.WaveId,
       SapItemCode: agg.ItemCode,
       SapItemName: agg.ItemName || '',
+      // Phase 3: ItemGroup is persisted on the wave line so the picker UI
+      // can show a category pill and group items visually. Pre-Phase-3
+      // wave lines have null here — that's intentional, no migration.
+      ItemGroup: agg.ItemGroup != null ? agg.ItemGroup : null,
       Barcode: agg.Barcode,
       UomCode: agg.UomCode || '',
       BinLocation: agg.WarehouseCode || '',

@@ -611,6 +611,17 @@ export default function PickingPage() {
                         {line.BinLocation}
                       </span>
                     )}
+                    {/* Phase 3: ItemGroup pill (OITM.ItmsGrpCod). Lines are
+                        sorted by this so groups stay together; the pill is
+                        the visual cue that a "section" started. */}
+                    {line.ItemGroup != null && (
+                      <span
+                        className="bg-purple-100 text-purple-700 px-1.5 rounded font-medium"
+                        title="קבוצת פריט (ItmsGrpCod)"
+                      >
+                        קב׳ {line.ItemGroup}
+                      </span>
+                    )}
                     <span className="font-mono">{line.SapItemCode}</span>
                     {line.Barcode && (
                       <span className="text-[10px] text-gray-400 font-mono">#{line.Barcode}</span>
