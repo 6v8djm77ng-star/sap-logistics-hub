@@ -16,6 +16,7 @@ import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
 import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, Loader2, CalendarDays } from 'lucide-react';
+import SendToPickingModal from '../components/SendToPickingModal.jsx';
 
 // Hebrew weekday names indexed by Date.getDay() (0=Sunday). Matches the
 // PlannerPage day filter so the two screens behave consistently.
@@ -299,6 +300,14 @@ export default function OpenOrdersPage() {
   // because a selection from an earlier session is almost never relevant —
   // SAP open orders change too often.
   const [selectedKeys, setSelectedKeys] = useState(() => new Set());
+
+  // Phase 2 v2, Commit 3a — modal state for "שלח לליקוט". We capture the
+  // refs at submit-time (rather than reading selectedKeys live) so the
+  // modal's preview reflects exactly the selection the operator clicked
+  // on, even if they tweak filters or the underlying SAP set changes
+  // while the dialog is open.
+  const [previewModalOpen, setPreviewModalOpen] = useState(false);
+  const [previewOrderRefs, setPreviewOrderRefs] = useState([]);
   const toggleSelect = (order) => {
     setSelectedKeys((prev) => {
       const next = new Set(prev);
@@ -493,8 +502,11 @@ export default function OpenOrdersPage() {
       toast.error('הבחירה ריקה מהנראה. רענן והרא שוב.');
       return;
     }
-    if (!window.confirm(`לשלוח ${refs.length} הזמנות לליקוט? המערכת תיצור מסלול/ים ותפיק גלי ליקוט.`)) return;
-    sendToPickingMutation.mutate(refs);
+    // Commit 3a — open the preview modal. The real submit (sendToPickingMutation)
+    // is still defined above and will be re-wired from the modal in Commit 3b,
+    // together with progress surfacing and the Idempotency-Key plumbing.
+    setPreviewOrderRefs(refs);
+    setPreviewModalOpen(true);
   };
 
   return (
@@ -842,6 +854,15 @@ export default function OpenOrdersPage() {
       <p className="text-xs text-gray-400 text-center mt-3">
         לחץ על שורה כדי להציג את שורות ההזמנה
       </p>
+
+      {/* Phase 2 v2, Commit 3a — preview modal. The actual submit is still
+          owned by sendToPickingMutation above and will move into the modal
+          in Commit 3b. */}
+      <SendToPickingModal
+        open={previewModalOpen}
+        orderRefs={previewOrderRefs}
+        onClose={() => setPreviewModalOpen(false)}
+      />
     </div>
   );
 }

@@ -61,6 +61,12 @@ export const runsApi = {
   optimizeOrder: (id) => api.post(`/runs/${id}/optimize-order`).then((r) => r.data),
   buildWave: (id) => api.post(`/runs/${id}/wave`).then((r) => r.data),
   getWave: (id) => api.get(`/runs/${id}/wave`).then((r) => r.data),
+  // Phase 2 v2 — dry-run preview for "send selected orders to picking".
+  // Returns a runsPreview/summary without mutating any store. The matching
+  // POST /runs/from-selected-orders (real submit) stays inline in
+  // OpenOrdersPage until Commit 3b takes over from here.
+  previewFromSelectedOrders: (body) =>
+    api.post('/runs/from-selected-orders/preview', body).then((r) => r.data),
 };
 
 export const returnsApi = {
