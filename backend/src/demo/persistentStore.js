@@ -11,7 +11,10 @@ import bcrypt from 'bcryptjs';
 // Phase A2-2: dry-run SAP write inside flush-aggregate-docs. The sapWriter
 // itself enforces dry-run when SAP_WRITE_ENABLED is not 'true', so this
 // import is safe even though SAP writes are still globally disabled.
-import { writeDeliveryNote } from './sapWriter.js';
+// Phase A2d (2026-05-19): writeInvoice now mirrors writeDeliveryNote for
+// the Invoice side of flushAggregateDocsForRun. Same dry-run-default and
+// whitelist gating apply — see sapWriter.js header.
+import { writeDeliveryNote, writeInvoice } from './sapWriter.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = path.resolve(__dirname, '../../data/store.json');
@@ -2490,6 +2493,12 @@ export function generateInvoiceFromDeliveryNote(deliveryNoteId, options = {}) {
     VatAmount: Number((dn.TotalAmount * 0.17).toFixed(2)),
     GrossAmount: Number((dn.TotalAmount * 1.17).toFixed(2)),
     LineCount: dn.LineCount,
+    // A2d (2026-05-19): copy aggregated picked lines + source-order refs from
+    // the parent DN so writeInvoice can build a standalone payload when the
+    // DN hasn't been written to SAP yet (dry-run). Empty arrays for non-
+    // aggregate DNs are harmless — the live-mode payload doesn't read them.
+    Lines: Array.isArray(dn.Lines) ? dn.Lines.map((l) => ({ ...l })) : [],
+    SourceOrders: Array.isArray(dn.SourceOrders) ? dn.SourceOrders.map((s) => ({ ...s })) : [],
     Status: 'PENDING_EXPORT',
     SapInvoiceDocEntry: null,
     SapInvoiceDocNum: null,
@@ -2497,6 +2506,13 @@ export function generateInvoiceFromDeliveryNote(deliveryNoteId, options = {}) {
     SentToSapAt: null,
     ConfirmedAt: null,
     ErrorMessage: null,
+    // A2d audit fields — mirror of the DN audit set. Populated by
+    // _applyWriteResultToInv after writeInvoice runs (dry-run or live).
+    LastDryRunPayloadAt: null,
+    LastDryRunPayloadPreview: null,
+    SapWriteAttempts: 0,
+    SapWriteAttemptedAt: null,
+    SapWriteLastError: null,
     InvoiceDate: new Date().toISOString().slice(0, 10),
     CreatedAt: new Date().toISOString(),
     Method: options.method || 'AUTO',
@@ -2970,6 +2986,44 @@ export function _applyWriteResultToDn(dn, wr) {
   }
 }
 
+/**
+ * A2d (2026-05-19): mirror of _applyWriteResultToDn for Invoice records.
+ *
+ * The Invoice has its own SAP DocEntry/DocNum pair (SapInvoiceDocEntry /
+ * SapInvoiceDocNum) and the same audit fields as the DN. Status transitions
+ * are identical:
+ *   dry-run success    → audit fields set, Status stays PENDING_EXPORT
+ *   live success       → SapInvoiceDocEntry persisted, Status='EXPORTED'
+ *   failure (any mode) → SapWriteLastError set, Status NOT advanced
+ *
+ * Like the DN helper: idempotency is "do not undo prior live success" —
+ * a dry-run replay on an already-EXPORTED invoice keeps the live state.
+ *
+ * Pure helper, exported for unit tests.
+ */
+export function _applyWriteResultToInv(inv, wr) {
+  if (!inv || !wr) return;
+  if (wr.ok && wr.payload) {
+    const now = new Date().toISOString();
+    inv.LastDryRunPayloadAt = now;
+    inv.LastDryRunPayloadPreview = JSON.stringify(wr.payload).slice(0, 1000);
+    inv.SapWriteLastError = null;
+    if (wr.dryRun === false && wr.sapDocEntry != null) {
+      inv.SapInvoiceDocEntry = wr.sapDocEntry;
+      inv.SapInvoiceDocNum = wr.sapDocNum != null ? wr.sapDocNum : null;
+      inv.Status = 'EXPORTED';
+      inv.ExportedAt = now;
+      inv.SentToSapAt = now;
+    }
+  } else if (!wr.ok) {
+    inv.SapWriteLastError = wr.error
+      || (wr.dryRun === false ? 'unknown live write failure' : 'unknown dry-run failure');
+    // Status stays unchanged (PENDING_EXPORT) — caller can retry by re-running
+    // the flush after fixing whatever broke. DN that already succeeded is NOT
+    // affected — the DN call already returned before this Invoice attempt.
+  }
+}
+
 // Phase A2-2: became `async` so it can `await writeDeliveryNote()` in dry-run
 // mode. Every caller must use `await store.flushAggregateDocsForRun(...)`.
 // The write happens AFTER the DN is committed to the local store, so a
@@ -3229,6 +3283,46 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
       if (inv) {
         invoicesCreated.push(inv);
         for (const o of orders) o.InvoiceId = inv.InvoiceId;
+        // A2d (2026-05-19): mirror of the DN write block above. Default
+        // options.liveWrite=false → dryRun:true. The A2c-1 whitelist gate
+        // inside writeInvoice still blocks the actual POST unless
+        // SAP_WRITE_ENABLED=true AND the configured DBs are in the
+        // whitelist. Audit fields are populated regardless of mode.
+        // A live DN write earlier in this iteration will have set
+        // dn.SapDeliveryDocEntry — writeInvoice picks that up automatically
+        // and switches to BaseType=15 payload. Otherwise it falls back to
+        // a standalone ItemCode/Quantity payload built from dn.Lines.
+        inv.SapWriteAttempts = (inv.SapWriteAttempts || 0) + 1;
+        inv.SapWriteAttemptedAt = new Date().toISOString();
+        try {
+          const wr = await writeInvoice(inv, dn, { dryRun: !liveWrite });
+          if (wr.ok && wr.payload) {
+            const missing = [];
+            if (!wr.payload.CardCode) missing.push('CardCode');
+            if (!wr.payload.DocDate)  missing.push('DocDate');
+            if (!Array.isArray(wr.payload.DocumentLines) || wr.payload.DocumentLines.length === 0) {
+              missing.push('DocumentLines');
+            }
+            if (missing.length) {
+              const e = new Error(
+                `חשבונית ${inv.DocNumber} חסרה שדות קריטיים ב-payload: ${missing.join(', ')}`
+              );
+              e.status = 422;
+              e.code = 'INVALID_PAYLOAD';
+              e.missingFields = missing;
+              e.docNumber = inv.DocNumber;
+              throw e;
+            }
+          }
+          _applyWriteResultToInv(inv, wr);
+        } catch (err) {
+          // Scope rule 4: a writeInvoice failure must NOT disturb the DN
+          // that already went through its dry-run/apply step. Record the
+          // error on the Invoice and continue. Re-throw only the structured
+          // 422 INVALID_PAYLOAD so the operator sees which field broke.
+          inv.SapWriteLastError = err?.message || String(err);
+          if (err?.code === 'INVALID_PAYLOAD') throw err;
+        }
       }
     } else if (emitINV && !dn) {
       // INV without DN — rare but legal: chain wants only consolidated INV
@@ -3249,12 +3343,52 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
         AggregationKey: groupKey,
         Lines: pickedLines,
         Status: 'PENDING_EXPORT',
+        SapInvoiceDocEntry: null,
+        SapInvoiceDocNum: null,
+        ExportedAt: null,
+        SentToSapAt: null,
+        ConfirmedAt: null,
+        // A2d audit fields (mirror of generateInvoiceFromDeliveryNote).
+        LastDryRunPayloadAt: null,
+        LastDryRunPayloadPreview: null,
+        SapWriteAttempts: 0,
+        SapWriteAttemptedAt: null,
+        SapWriteLastError: null,
         CreatedAt: new Date().toISOString(),
         Method: options.method || 'AUTO_AGGREGATE_FLUSH',
       };
       s.invoices.push(inv);
       invoicesCreated.push(inv);
       for (const o of orders) o.InvoiceId = inv.InvoiceId;
+      // A2d: dry-run / live write for the INV-without-DN path. writeInvoice
+      // sees no dn → falls back to inv.Lines for the standalone payload.
+      inv.SapWriteAttempts = (inv.SapWriteAttempts || 0) + 1;
+      inv.SapWriteAttemptedAt = new Date().toISOString();
+      try {
+        const wr = await writeInvoice(inv, null, { dryRun: !liveWrite });
+        if (wr.ok && wr.payload) {
+          const missing = [];
+          if (!wr.payload.CardCode) missing.push('CardCode');
+          if (!wr.payload.DocDate)  missing.push('DocDate');
+          if (!Array.isArray(wr.payload.DocumentLines) || wr.payload.DocumentLines.length === 0) {
+            missing.push('DocumentLines');
+          }
+          if (missing.length) {
+            const e = new Error(
+              `חשבונית ${inv.DocNumber} חסרה שדות קריטיים ב-payload: ${missing.join(', ')}`
+            );
+            e.status = 422;
+            e.code = 'INVALID_PAYLOAD';
+            e.missingFields = missing;
+            e.docNumber = inv.DocNumber;
+            throw e;
+          }
+        }
+        _applyWriteResultToInv(inv, wr);
+      } catch (err) {
+        inv.SapWriteLastError = err?.message || String(err);
+        if (err?.code === 'INVALID_PAYLOAD') throw err;
+      }
     }
 
     // Clear the pending flag now that the docs are written.

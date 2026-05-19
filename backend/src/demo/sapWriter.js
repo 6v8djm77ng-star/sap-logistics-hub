@@ -129,20 +129,62 @@ function buildDnPayload(dn) {
   };
 }
 
-function buildInvoicePayload(invoice, dn) {
-  return {
+/**
+ * A2d (2026-05-19): the Invoice payload has two valid shapes depending on
+ * whether the parent DN has already been written to SAP (live mode) or not
+ * (dry-run mode where dn.SapDeliveryDocEntry is null).
+ *
+ *   Live mode  (dn?.SapDeliveryDocEntry truthy):
+ *     DocumentLines reference the DN via BaseType=15 + BaseEntry/BaseLine.
+ *     SAP copies item/quantity/price from the source DN.
+ *
+ *   Dry-run / standalone mode (no SapDeliveryDocEntry):
+ *     DocumentLines list the picked items directly (ItemCode + Quantity).
+ *     Lets the operator see exactly what would be sent to SAP without
+ *     requiring a real DN DocEntry that doesn't exist yet in dry-run.
+ *
+ *   No DN at all (rare INV-without-DN policy path):
+ *     Falls back to invoice.Lines (built directly from picked lines in
+ *     flushAggregateDocsForRun's INV-only branch).
+ *
+ * Exported as _buildInvoicePayload for unit tests in
+ * sapWriter.invoicePayload.test.js. Internal callers use it as
+ * buildInvoicePayload(...) below.
+ */
+export function _buildInvoicePayload(invoice, dn) {
+  const today = new Date().toISOString().slice(0, 10);
+  const base = {
     CardCode: invoice.SapCardCode,
-    DocDate: new Date().toISOString().slice(0, 10),
-    DocDueDate: new Date().toISOString().slice(0, 10),
-    Comments: `Auto-generated from DN ${dn?.DocNumber || ''}`,
-    DocumentLines: dn?.SourceOrders?.flatMap((src) =>
+    DocDate: today,
+    DocDueDate: today,
+    Comments: `Auto-generated from DN ${dn?.DocNumber || ''}`.trim(),
+  };
+
+  // Live mode: reference the SAP-side DN.
+  if (dn?.SapDeliveryDocEntry) {
+    const lines = (dn.SourceOrders || []).flatMap((src) =>
       (src.lines || [{}]).map((ln, idx) => ({
         BaseType: 15,                      // 15 = delivery note
         BaseEntry: dn.SapDeliveryDocEntry,
         BaseLine: ln.LineNum != null ? ln.LineNum : idx,
       }))
-    ) || [],
-  };
+    );
+    return { ...base, DocumentLines: lines };
+  }
+
+  // Standalone mode: emit ItemCode/Quantity from picked lines. Prefer dn.Lines
+  // (the aggregated per-item view from flushAggregateDocsForRun) and fall back
+  // to invoice.Lines for the INV-without-DN branch.
+  const pickedLines = (dn?.Lines && dn.Lines.length) ? dn.Lines : (invoice.Lines || []);
+  const documentLines = pickedLines.map((ln) => ({
+    ItemCode: ln.ItemCode,
+    Quantity: ln.Picked != null ? ln.Picked : ln.Quantity,
+  }));
+  return { ...base, DocumentLines: documentLines };
+}
+
+function buildInvoicePayload(invoice, dn) {
+  return _buildInvoicePayload(invoice, dn);
 }
 
 /**
