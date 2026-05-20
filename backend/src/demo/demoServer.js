@@ -2781,8 +2781,19 @@ app.post('/api/runs/:id/wave', async (req, res) => {
 });
 
 app.get('/api/runs/:id/wave', (req, res) => {
+  // A2g-FIX-WHITE-SCREEN (2026-05-20): when a run was deleted (or cancelled)
+  // but a wave row still exists with its RunId, the previous version of this
+  // handler happily returned that orphan wave. Frontend then tried to render
+  // a picking page whose parent run is gone → uncaught render error → blank
+  // page. Guard: 404 unless the run still exists in a state that owns waves.
+  const runId = Number(req.params.id);
+  const run = (store.getRuns() || []).find((r) => r && Number(r.RunId) === runId);
+  if (!run) return res.status(404).json({ error: 'Run not found', code: 'RUN_NOT_FOUND' });
+  if (run.Status === 'CANCELLED') {
+    return res.status(404).json({ error: 'Run cancelled', code: 'RUN_CANCELLED' });
+  }
   const wave = store.getWaveForRun(req.params.id);
-  if (!wave) return res.status(404).json({ error: 'No active wave for this run' });
+  if (!wave) return res.status(404).json({ error: 'No active wave for this run', code: 'WAVE_NOT_FOUND' });
   res.json(wave);
 });
 app.post('/api/runs/:id/optimize-order', (req, res) => {
