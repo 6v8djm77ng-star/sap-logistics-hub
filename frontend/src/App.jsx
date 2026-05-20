@@ -46,6 +46,7 @@ import ResetPasswordPage from './pages/ResetPasswordPage.jsx';
 import CompleteProfilePage from './pages/CompleteProfilePage.jsx';
 import { useEffect } from 'react';
 import { initAutoFlush } from './services/offlineQueue.js';
+import ErrorBoundary from './components/ErrorBoundary.jsx';
 
 function RequireAuth({ children, roles }) {
   const { user, token } = useAuthStore();
@@ -83,6 +84,7 @@ export default function App() {
   }, []);
 
   return (
+    <ErrorBoundary>
     <Routes>
       {/* Public */}
       <Route path="/login" element={<LoginPage />} />
@@ -170,5 +172,6 @@ export default function App() {
         <Route path="davo-mix" element={<DavoMixPage />} />
       </Route>
     </Routes>
+    </ErrorBoundary>
   );
 }
