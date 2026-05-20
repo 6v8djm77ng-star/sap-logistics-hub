@@ -321,7 +321,16 @@ export {
   _checkLiveWriteWhitelist,
 } from '../services/sap/writeWhitelist.js';
 
-import { assertLiveWriteAllowed } from '../services/sap/writeWhitelist.js';
+// A2g-FIX-WRITER-STATUS (2026-05-20): the `export {} from` block above
+// re-exports parseWhitelist to outside consumers (tests, server.js gate),
+// but does NOT bring it into the local module scope. getWriterStatus()
+// directly calls parseWhitelist(...) — without this import line the
+// runtime hits ReferenceError on every /api/sap/writer/status request,
+// which manifested as a hung A2f banner once a real admin token reached
+// the endpoint. Adding parseWhitelist to the named import keeps the
+// re-export intact (external imports still work) and gives the local
+// function the binding it actually uses.
+import { assertLiveWriteAllowed, parseWhitelist } from '../services/sap/writeWhitelist.js';
 
 /**
  * Per-request gate for writeDeliveryNote() / writeInvoice(). Reads env at
