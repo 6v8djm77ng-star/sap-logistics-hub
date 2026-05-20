@@ -3470,6 +3470,68 @@ export function listInvoices({ runId, stopId, companyCode, status, runDate } = {
   return result.sort((a, b) => b.InvoiceId - a.InvoiceId);
 }
 
+/**
+ * A2e (2026-05-20): pure aggregate over the A2-1 + A2d audit fields.
+ *
+ * Surfaces three things operators need to see at a glance:
+ *
+ *   - withErrors:  how many DNs/INVs currently carry a SapWriteLastError.
+ *     This is the "stuck writes" counter. Includes both dry-run validation
+ *     failures (rare — INVALID_PAYLOAD only) and live HTTP failures (will
+ *     start happening once SAP_WRITE_ENABLED flips). When > 0, operator
+ *     should inspect the offending docs before approving more flushes.
+ *
+ *   - totalAttempts: cumulative SapWriteAttempts across all docs. A
+ *     proxy for writer activity — useful to spot a runaway retry loop
+ *     or to confirm that a flush actually ran.
+ *
+ *   - lastWriteAttemptAt: most recent LastDryRunPayloadAt across BOTH
+ *     doc types. Tells the operator when the SAP writer last produced
+ *     a payload (dry-run OR live). Helps detect a dead writer.
+ *
+ * Pure function — takes arrays in, no env, no store reads. Exported as
+ * _computeAuditSummary for unit tests in persistentStore.auditSummary.test.js.
+ */
+export function _computeAuditSummary(deliveryNotes, invoices) {
+  const dns = Array.isArray(deliveryNotes) ? deliveryNotes : [];
+  const invs = Array.isArray(invoices) ? invoices : [];
+
+  const dnWithErrors = dns.filter((d) => d && d.SapWriteLastError).length;
+  const invWithErrors = invs.filter((d) => d && d.SapWriteLastError).length;
+  // `Number('not-a-number') || 0` evaluates to NaN (because the string is
+  // truthy, so the || never fires), which poisons the sum. Coerce then
+  // gate on Number.isFinite so anything non-numeric contributes 0.
+  const toCount = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const dnAttempts = dns.reduce((sum, d) => sum + toCount(d?.SapWriteAttempts), 0);
+  const invAttempts = invs.reduce((sum, d) => sum + toCount(d?.SapWriteAttempts), 0);
+
+  // Most recent LastDryRunPayloadAt across both doc types. We treat the
+  // strings as ISO-8601 (which is the format used everywhere the field is
+  // set), so lexicographic max == chronological max. null/undefined entries
+  // are skipped.
+  let lastAt = null;
+  for (const d of dns) {
+    if (d?.LastDryRunPayloadAt && (lastAt == null || d.LastDryRunPayloadAt > lastAt)) {
+      lastAt = d.LastDryRunPayloadAt;
+    }
+  }
+  for (const d of invs) {
+    if (d?.LastDryRunPayloadAt && (lastAt == null || d.LastDryRunPayloadAt > lastAt)) {
+      lastAt = d.LastDryRunPayloadAt;
+    }
+  }
+
+  return {
+    deliveryNotes: { withErrors: dnWithErrors, totalAttempts: dnAttempts },
+    invoices:      { withErrors: invWithErrors, totalAttempts: invAttempts },
+    lastWriteAttemptAt: lastAt,
+    combinedErrorsCount: dnWithErrors + invWithErrors,
+  };
+}
+
 export function getDocumentStats({ runDate } = {}) {
   const s = ensureDocsStore();
   const filterByDate = (docs) => {
@@ -3511,6 +3573,9 @@ export function getDocumentStats({ runDate } = {}) {
       vatAmount: invs.reduce((sum, d) => sum + Number(d.VatAmount || 0), 0),
       grossAmount: invs.reduce((sum, d) => sum + Number(d.GrossAmount || 0), 0),
     },
+    // A2e: audit summary over A2-1 + A2d audit fields. Additive — existing
+    // consumers ignore this block.
+    audit: _computeAuditSummary(dns, invs),
   };
 }
 
