@@ -37,6 +37,13 @@ import trackPublicRoutes from './routes/trackPublic.js';
 import sapRoutes from './routes/sap.js';
 import settingsRoutes from './routes/settings.js';
 import addressesRoutes from './routes/addresses.js';
+// Phase A2g-1 (2026-05-20): Documents/DN/INV route parity for hardened
+// server. Restores the three read-only endpoints DocumentsPage relies on
+// (and that A2f banner consumes). See routes/documents.js header for the
+// broader migration plan.
+import documentsRoutes from './routes/documents.js';
+import deliveryNotesRoutes from './routes/deliveryNotes.js';
+import invoicesRoutes from './routes/invoices.js';
 import { startDigestWorker, stopDigestWorker } from './workers/dailyDigestWorker.js';
 import { startCleanupWorker, stopCleanupWorker } from './workers/cleanupWorker.js';
 import { startCeoBriefScheduler, stopCeoBriefScheduler } from './workers/ceoBriefScheduler.js';
@@ -125,6 +132,10 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/sap', sapRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/addresses', addressesRoutes);
+// A2g-1: read-only documents parity (was only in demoServer.js)
+app.use('/api/documents', documentsRoutes);
+app.use('/api/delivery-notes', deliveryNotesRoutes);
+app.use('/api/invoices', invoicesRoutes);
 app.use('/api/agents', agentsRoutes);
 app.use('/api/davo-mix', davoMixRoutes);
 // Public tracking - no auth required
