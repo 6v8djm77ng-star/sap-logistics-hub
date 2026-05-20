@@ -2092,12 +2092,28 @@ async function computePlanExclusions(opts = {}) {
   // would create a "ghost" run-order whose SAP lines may already be closed
   // (OpenQty=0), causing buildWave to fail with "no open lines". The
   // operator can still pull a specific order back via /api/runs/force-include.
+  //
+  // A2g-FIX-CANCEL-EXCLUSION (2026-05-20): CANCELLED entities (runs OR
+  // their child run-orders) DO NOT lock the SAP order. The original design
+  // predates the CANCELLED concept; without this exclusion, any bulk
+  // run/wave cancellation leaves the SAP orders permanently "ghost-blocked"
+  // from re-planning even though no live run owns them. Mirrored in
+  // previewSelectedOrders.js (same logic, shared test coverage).
   const allRunOrders = store.load().runOrders || [];
   const allStops = store.load().stops || [];
+  const allRunsForStatus = store.getRuns() || [];
   const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
+  const runStatusById = new Map(allRunsForStatus.map((r) => [r.RunId, r.Status]));
   const alreadyAssigned = new Set(
     allRunOrders
-      .filter((o) => stopIdToRunId.has(o.StopId))
+      .filter((o) => {
+        // A2g-FIX-CANCEL-EXCLUSION: skip cancelled run-orders and orders on cancelled runs.
+        if (o.Status === 'CANCELLED') return false;
+        const runId = stopIdToRunId.get(o.StopId);
+        if (runId == null) return false;
+        if (runStatusById.get(runId) === 'CANCELLED') return false;
+        return true;
+      })
       .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
   );
 

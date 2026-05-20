@@ -113,14 +113,30 @@ export function previewSelectedOrders({
   // Same uniqueness check as the live endpoint, now enriched with the
   // existing run/wave identifiers so the UI can deep-link the operator to
   // wherever the order is already parked.
+  //
+  // A2g-FIX-CANCEL-EXCLUSION (2026-05-20): a run-order whose Status is
+  // 'CANCELLED' — or whose parent run is 'CANCELLED' — no longer locks
+  // the SAP order. Without this filter the operator would be stuck after
+  // any bulk cancellation: every previously-allocated SAP order would
+  // still appear in `alreadyAssigned` even though no live run owns it.
+  // All other run statuses (OPEN / PICKING / LOADED / PENDING_QC /
+  // COMPLETED) keep the existing lock — a completed run still owns its
+  // delivered SAP orders, per the original cross-day design comment.
   const allRuns = (storeSnapshot && storeSnapshot.runs) || [];
   const allStops = (storeSnapshot && storeSnapshot.stops) || [];
   const allRunOrders = (storeSnapshot && storeSnapshot.runOrders) || [];
   const allWaves = (storeSnapshot && storeSnapshot.waves) || [];
   const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
+  const runStatusById = new Map(allRuns.map((r) => [r.RunId, r.Status]));
   const alreadyAssigned = new Set(
     allRunOrders
-      .filter((o) => stopIdToRunId.has(o.StopId))
+      .filter((o) => {
+        if (o.Status === 'CANCELLED') return false;
+        const runId = stopIdToRunId.get(o.StopId);
+        if (runId == null) return false;
+        if (runStatusById.get(runId) === 'CANCELLED') return false;
+        return true;
+      })
       .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
   );
   const conflicts = orders.filter((o) => alreadyAssigned.has(`${o.CompanyCode}-${o.DocEntry}`));

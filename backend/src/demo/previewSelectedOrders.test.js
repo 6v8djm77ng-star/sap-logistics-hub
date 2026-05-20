@@ -164,6 +164,112 @@ test('ALREADY_ASSIGNED: order already on an existing run → 409 with enriched c
   assert.equal(c.existingWaveNumber, null);
 });
 
+// ──────────────────────────────────────────────────────────────────────
+// A2g-FIX-CANCEL-EXCLUSION (2026-05-20): CANCELLED entities do NOT lock
+// the SAP order. Without these guards a bulk reset would leave every
+// SAP order "ghost-blocked" forever even though no live run owns it.
+// ──────────────────────────────────────────────────────────────────────
+
+test('A2g-FIX: parent Run is CANCELLED → order NOT considered already assigned', () => {
+  const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
+  const storeSnap = {
+    // Run is cancelled — must release its run-order lock
+    runs: [{ RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'CANCELLED', RunNumber: 'RUN-2026-05-18-01' }],
+    stops: [{ StopId: 10, RunId: 5 }],
+    // run-order itself is still PENDING (just the parent is cancelled)
+    runOrders: [{ StopId: 10, CompanyCode: 'A', SapDocEntry: 100, Status: 'PENDING' }],
+  };
+  const r = previewSelectedOrders({
+    runDate: '2026-05-18',
+    orderRefs: [{ companyCode: 'A', docEntry: 100 }],
+    sapOpenOrders: [order],
+    storeSnapshot: storeSnap,
+    suggestZoneForCity,
+  });
+  // Should NOT hit the ALREADY_ASSIGNED guard — happy path through to 200
+  assert.equal(r.status, 200, 'cancelled-parent-run must not block re-assignment');
+  assert.equal(r.body.ok, true);
+  assert.equal(r.body.summary.ordersRequested, 1);
+});
+
+test('A2g-FIX: runOrder is CANCELLED inside an active Run → still NOT locked', () => {
+  const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
+  const storeSnap = {
+    // Parent run is alive
+    runs: [{ RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'OPEN', RunNumber: 'RUN-2026-05-18-01' }],
+    stops: [{ StopId: 10, RunId: 5 }],
+    // The run-order specifically was cancelled (e.g. operator pulled it from this run)
+    runOrders: [{ StopId: 10, CompanyCode: 'A', SapDocEntry: 100, Status: 'CANCELLED' }],
+  };
+  const r = previewSelectedOrders({
+    runDate: '2026-05-18',
+    orderRefs: [{ companyCode: 'A', docEntry: 100 }],
+    sapOpenOrders: [order],
+    storeSnapshot: storeSnap,
+    suggestZoneForCity,
+  });
+  assert.equal(r.status, 200, 'cancelled run-order on a live run must not block');
+  assert.equal(r.body.ok, true);
+});
+
+test('A2g-FIX (regression): live Run + active runOrder still produces ALREADY_ASSIGNED', () => {
+  // Same fixture as the existing "ALREADY_ASSIGNED" test, but with the
+  // runOrder Status pinned to PENDING so the new filter MUST NOT release
+  // the lock. Guards against a too-loose CANCELLED filter.
+  const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
+  const storeSnap = {
+    runs: [{ RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'OPEN', RunNumber: 'RUN-2026-05-18-01' }],
+    stops: [{ StopId: 10, RunId: 5 }],
+    runOrders: [{ StopId: 10, CompanyCode: 'A', SapDocEntry: 100, Status: 'PENDING' }],
+  };
+  const r = previewSelectedOrders({
+    runDate: '2026-05-18',
+    orderRefs: [{ companyCode: 'A', docEntry: 100 }],
+    sapOpenOrders: [order],
+    storeSnapshot: storeSnap,
+    suggestZoneForCity,
+  });
+  assert.equal(r.status, 409, 'live run + active run-order must still be a conflict');
+  assert.equal(r.body.code, 'ALREADY_ASSIGNED');
+  assert.equal(r.body.conflicts.length, 1);
+});
+
+test('A2g-FIX: mixed batch — 2 orders, one CANCELLED-locked, one live-locked → only the live one blocks', () => {
+  const orderA = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
+  const orderB = makeOrder({ docEntry: 200, docNum: 20, cardCode: 'C2', cardName: 'Beta',  city: 'נהריה' });
+  const storeSnap = {
+    runs: [
+      { RunId: 5, RunDate: '2026-05-18', ZoneId: 1, Status: 'CANCELLED', RunNumber: 'RUN-OLD' },  // released
+      { RunId: 6, RunDate: '2026-05-18', ZoneId: 1, Status: 'PICKING',   RunNumber: 'RUN-NEW' },  // still locking
+    ],
+    stops: [
+      { StopId: 10, RunId: 5 },
+      { StopId: 20, RunId: 6 },
+    ],
+    runOrders: [
+      { StopId: 10, CompanyCode: 'A', SapDocEntry: 100, Status: 'CANCELLED' },  // both cancelled
+      { StopId: 20, CompanyCode: 'A', SapDocEntry: 200, Status: 'PENDING'   },  // still live
+    ],
+  };
+  const r = previewSelectedOrders({
+    runDate: '2026-05-18',
+    orderRefs: [{ companyCode: 'A', docEntry: 100 }, { companyCode: 'A', docEntry: 200 }],
+    sapOpenOrders: [orderA, orderB],
+    storeSnapshot: storeSnap,
+    suggestZoneForCity,
+  });
+  // Order 200 is still on an active run → ALREADY_ASSIGNED
+  assert.equal(r.status, 409);
+  assert.equal(r.body.code, 'ALREADY_ASSIGNED');
+  assert.equal(r.body.conflicts.length, 1, 'only the live-locked order is reported');
+  assert.equal(r.body.conflicts[0].docEntry, 200);
+  // The cancelled-locked one (100) must NOT appear
+  assert.ok(
+    !r.body.conflicts.some((c) => c.docEntry === 100),
+    'cancelled-locked order must not appear in conflicts',
+  );
+});
+
 test('ALREADY_ASSIGNED: enriched conflict surfaces the active wave when present', () => {
   const order = makeOrder({ docEntry: 100, docNum: 10, cardCode: 'C1', cardName: 'Alpha', city: 'חיפה' });
   const storeSnap = {
