@@ -49,11 +49,34 @@ module.exports = {
     },
     {
       name: 'sap-logistics',
-      // Phase 2 hardened production server — replaces ./src/demo/demoServer.js,
-      // which defined its own /api/users etc. routes inline without requireAuth.
-      // src/server.js wires every route file through the auth middleware and
-      // applies Helmet CSP + scoped CORS. Switched 2026-05-05.
-      script: './src/server.js',
+      // A2g-HOTFIX (2026-05-20): reverted to demoServer.js because the
+      // hardened src/server.js cannot serve traffic — its auth route + every
+      // SQL-backed endpoint require database SAP_Logistics_Hub on
+      // 192.168.0.220:1433 which DOES NOT EXIST. 2026-05-20 enumeration of
+      // sys.databases (via the excel SQL user) found 24 DBs, none named
+      // *Logistic*. Migration 001 was never run on this server; the
+      // 2026-05-05 PM2 switch to src/server.js was never followed by the
+      // DB+seed work, but it didn't surface because sap-logistics wasn't
+      // actually being kept up in PM2 between then and now.
+      //
+      // Until the DB is provisioned (CREATE DATABASE + migrations 001-012
+      // + seed users + grant rights to a SQL login that the env points
+      // to), demoServer.js — which stores everything in backend/data/
+      // store.json and was the actual runtime that all the Phase A work
+      // was developed against — is the only working option.
+      //
+      // To restore the hardened server:
+      //   1. Have a DBA create SAP_Logistics_Hub on 192.168.0.220
+      //   2. Grant the configured LOGISTICS_SQL_USER db_owner on it
+      //   3. cd backend && npm run migrate (or run database/migrations/*.sql)
+      //   4. Seed at least an admin Users row with bcrypt(admin123)
+      //   5. Land Phase A2g-1..4 route parity (A2g-1 is already on
+      //      feature/sap-write-a2g-1-documents-routes branch)
+      //   6. Flip this script path back to './src/server.js'
+      //   7. pm2 restart sap-logistics
+      // See cowork/INCIDENTS.md "2026-05-20 ~10:50 — hardened server
+      // unreachable without SAP_Logistics_Hub DB" for the full timeline.
+      script: './src/demo/demoServer.js',
       // Run from the backend directory so `dotenv/config` finds backend/.env
       cwd: __dirname + '/backend',
       instances: 1,
