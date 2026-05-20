@@ -4883,8 +4883,20 @@ io.on('connection', (socket) => {
   socket.on('disconnect', () => console.log(`[demo] Socket disconnected: ${socket.id}`));
 });
 
-// Rich live simulation (driver movement + stop progression)
-startSimulation(io, data);
+// Rich live simulation (driver movement + stop progression).
+//
+// A2g-DISABLE-SIM (2026-05-20): can be opted out via DISABLE_LIVE_SIMULATION=
+// true in backend/.env. The sim mutates only the in-memory demoData.js
+// module (driver GPS, stop status, returns) — it never writes to
+// store.json — but the socket noise + fake "deliveries" confuse non-demo
+// audiences once real operators are logged in. Default behaviour
+// (env unset or anything other than the literal string "true") is
+// unchanged: simulation runs as before.
+if (process.env.DISABLE_LIVE_SIMULATION !== 'true') {
+  startSimulation(io, data);
+} else {
+  console.log('[demo] Live simulation DISABLED via DISABLE_LIVE_SIMULATION env');
+}
 
 server.listen(PORT, () => {
   console.log(`
