@@ -15,6 +15,7 @@ import {
   FileText, Receipt, Download, Building2, CheckCircle, Clock,
   AlertTriangle, ExternalLink, FilePlus2, Filter, RefreshCw,
 } from 'lucide-react';
+import SapWriteAuditBanner from '../components/SapWriteAuditBanner.jsx';
 
 const docsApi = {
   listDeliveryNotes: (params) => api.get('/delivery-notes', { params }).then((r) => r.data.deliveryNotes),
@@ -178,6 +179,11 @@ export default function DocumentsPage() {
           className="px-3 py-1.5 border rounded-lg text-sm"
         />
       </div>
+
+      {/* A2f — SAP write mode + audit summary banner. Reads `audit` from
+          the existing /api/documents/stats query and writer mode from a
+          separate hook. Purely presentational. */}
+      <SapWriteAuditBanner stats={stats} />
 
       {/* Stats - separated per company */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">

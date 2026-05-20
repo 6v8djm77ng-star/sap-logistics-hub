@@ -130,6 +130,9 @@ export const sapApi = {
   testSql: (company) => api.get(`/sap/test/sql/${company}`).then((r) => r.data),
   testSL: (company) => api.get(`/sap/test/sl/${company}`).then((r) => r.data),
   sample: (company) => api.get(`/sap/sample/${company}`).then((r) => r.data),
+  // A2f (2026-05-20): writer mode + whitelist + log file path. Used by
+  // SapWriteAuditBanner to render DRY-RUN vs LIVE plus the A2e audit summary.
+  writerStatus: () => api.get('/sap/writer/status').then((r) => r.data),
 };
 
 export const settingsApi = {
