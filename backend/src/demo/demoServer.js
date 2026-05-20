@@ -2554,15 +2554,32 @@ app.post(
     }
 
     // Refuse orders that are already in some other run.
+    //
+    // A2g-FIX-CANCEL-EXCLUSION-2 (2026-05-20): mirror of the same fix
+    // landed in previewSelectedOrders.js (preview path) and
+    // computePlanExclusions (auto-plan / open-with-plan-eval path). This
+    // is the third copy of the same alreadyAssigned algorithm — the LIVE
+    // submit handler for POST /api/runs/from-selected-orders. Without
+    // this carve-out a cancelled run-order or a run-order on a CANCELLED
+    // run is still treated as a permanent lock, so any bulk reset leaves
+    // its SAP orders ghost-blocked forever. All other statuses (OPEN /
+    // PICKING / LOADED / PENDING_QC / COMPLETED) keep the original lock.
     const storeData = store.load();
     const allRuns = storeData.runs || [];
     const allRunOrders = storeData.runOrders || [];
     const allStops = storeData.stops || [];
     const allWaves = storeData.waves || [];
     const stopIdToRunId = new Map(allStops.map((s) => [s.StopId, s.RunId]));
+    const runStatusById = new Map(allRuns.map((r) => [r.RunId, r.Status]));
     const alreadyAssigned = new Set(
       allRunOrders
-        .filter((o) => stopIdToRunId.has(o.StopId))
+        .filter((o) => {
+          if (o.Status === 'CANCELLED') return false;
+          const runId = stopIdToRunId.get(o.StopId);
+          if (runId == null) return false;
+          if (runStatusById.get(runId) === 'CANCELLED') return false;
+          return true;
+        })
         .map((o) => `${o.CompanyCode}-${o.SapDocEntry}`)
     );
     const conflicts = orders.filter((o) => alreadyAssigned.has(`${o.CompanyCode}-${o.DocEntry}`));
