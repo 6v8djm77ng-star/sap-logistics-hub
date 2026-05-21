@@ -27,6 +27,21 @@ export default defineConfig({
       },
       workbox: {
         navigateFallback: '/index.html',
+        // A2g-FIX-SW-AUTOUPDATE (2026-05-21): without skipWaiting+clientsClaim
+        // a freshly-built SW sits in "waiting" state until ALL tabs of the
+        // site close. Operators who keep a tab open all day never see new
+        // bundles — they get whatever was cached on first visit. After the
+        // 2026-05-20 parseWhitelist incident we found two operators on the
+        // 08:13 bundle even though we'd rebuilt twice since.
+        // skipWaiting: tell the new SW to activate immediately, no waiting.
+        // clientsClaim: take control of already-open tabs on activation so
+        // the very next fetch goes through the new SW (and thus new cache).
+        // Trade-off: a page that's mid-load when an update lands can see a
+        // mix of old/new chunks for one tick — acceptable for a tool with
+        // no critical mid-flow state and a clear "reload" CTA in the
+        // ErrorBoundary panel.
+        skipWaiting: true,
+        clientsClaim: true,
         runtimeCaching: [
           {
             urlPattern: /\/api\//,
