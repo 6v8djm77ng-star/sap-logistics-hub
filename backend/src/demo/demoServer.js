@@ -430,6 +430,19 @@ app.delete('/api/pickers/:id', adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 
+// Per-zone-picker-assignment (2026-05-21): list of USER accounts that may
+// be chosen as the picker for a run in the SendToPicking modal. Distinct
+// from /api/pickers above (warehouse handhelds), and intentionally at a
+// different path so PickersPage keeps working untouched. Gated to
+// ADMIN+PLANNER since only they open the SendToPicking modal — pickers
+// themselves shouldn't be assigning runs.
+app.get('/api/pickable-users', requireAuthBasic, (req, res) => {
+  if (req.user.role !== 'ADMIN' && req.user.role !== 'PLANNER') {
+    return res.status(403).json({ error: 'ADMIN or PLANNER role required' });
+  }
+  res.json({ pickers: store.getPickableUsers() });
+});
+
 // Short-id → JWT lookup table (in-memory). Stays valid until restart.
 // We use this to give the user a SHORT link that's easy to click on chat apps.
 const mobileShortLinks = new Map();
@@ -2742,11 +2755,50 @@ app.post(
   }
 });
 
-// Create a new picking wave - pulls real SAP order lines + aggregates
+// Create a new picking wave - pulls real SAP order lines + aggregates.
+//
+// Per-zone-picker-assignment (2026-05-21): accepts an optional body
+//   { assignedPickerId: <UserId> }
+// to record which user the planner picked for this zone/run in the
+// SendToPicking modal. The id must point to an active pickable user
+// (role ∈ WAREHOUSE/ADMIN/PLANNER) — invalid ids return 400 INVALID_PICKER
+// and no wave is created. Omitting the field keeps the legacy path
+// (unassigned wave, exactly as before this feature).
+//
+// Reused-run case: if a wave already exists on this run in IN_PROGRESS or
+// PENDING_QC, createWaveFromLines throws WAVE_IN_PROGRESS — we surface that
+// as 409 so the planner can resolve it manually (cancel the live wave or
+// pick a different run). PENDING waves are still cancelled silently as
+// before — they represent a wave that was just created but never started.
 app.post('/api/runs/:id/wave', async (req, res) => {
   const runId = Number(req.params.id);
   const runDetails = store.getRunDetails(runId);
   if (!runDetails) return res.status(404).json({ error: 'Run not found' });
+
+  // Validate picker BEFORE touching SAP — otherwise a bad pickerId would
+  // burn a SAP getBulkOrderLines call for nothing.
+  const assignedPickerIdRaw = req.body?.assignedPickerId;
+  let assignedPickerId = null;
+  let assignedPickerName = null;
+  if (assignedPickerIdRaw != null) {
+    const id = Number(assignedPickerIdRaw);
+    if (!Number.isInteger(id) || !store.isPickableUser(id)) {
+      return res.status(400).json({
+        error: 'משתמש שנבחר כמלקט לא קיים, לא פעיל, או לא מתאים לליקוט',
+        code: 'INVALID_PICKER',
+      });
+    }
+    const user = store.getUserById(id);
+    assignedPickerId = id;
+    assignedPickerName = user.FullName;
+  }
+  // assignedBy is the planner who pressed "אשר ושלח" — pulled from the JWT
+  // already verified by the global requireAuthBasic gate registered for
+  // /api/runs/*. Picker tokens carry sub='picker-N' (a string that becomes
+  // NaN under Number()) — those callers shouldn't be triggering this path
+  // in practice, but the guard keeps AssignedBy a clean number-or-null.
+  const subAsNumber = req.user?.sub != null ? Number(req.user.sub) : null;
+  const assignedBy = Number.isFinite(subAsNumber) ? subAsNumber : null;
 
   const orderRefs = [];
   for (const stop of runDetails.stops || []) {
@@ -2768,13 +2820,25 @@ app.post('/api/runs/:id/wave', async (req, res) => {
       return res.status(400).json({ error: 'לא נמצאו שורות פתוחות בהזמנות' });
     }
 
-    const wave = store.createWaveFromLines(runId, lines);
+    const wave = store.createWaveFromLines(runId, lines, {
+      assignedPickerId,
+      assignedPickerName,
+      assignedBy,
+    });
     if (!wave) return res.status(500).json({ error: 'Failed to create wave' });
 
     store.updateRun(runId, { status: 'PICKING' });
     io.emit('wave:created', { runId, waveId: wave.WaveId });
     res.status(201).json(store.getWave(wave.WaveId));
   } catch (err) {
+    if (err.code === 'WAVE_IN_PROGRESS') {
+      return res.status(409).json({
+        error: err.message,
+        code: 'WAVE_IN_PROGRESS',
+        activeWaveId: err.activeWaveId,
+        activeWaveStatus: err.activeWaveStatus,
+      });
+    }
     console.error('[wave] creation failed:', err.message);
     res.status(500).json({ error: err.message });
   }

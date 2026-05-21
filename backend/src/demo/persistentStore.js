@@ -483,6 +483,24 @@ export function getUserById(id) {
   return load().users.find((u) => u.UserId === Number(id));
 }
 
+// Per-zone-picker-assignment (2026-05-21): the set of users that may be
+// chosen as the picker for a run in SendToPicking. Distinct from the
+// `pickers` table (those are warehouse handhelds, not user accounts) — see
+// the Discovery doc on this branch. MVP keeps the list broad so the
+// dropdown has options even before WAREHOUSE users are seeded.
+const PICKABLE_ROLES = new Set(['WAREHOUSE', 'ADMIN', 'PLANNER']);
+
+export function getPickableUsers() {
+  return load().users
+    .filter((u) => u.IsActive === true && PICKABLE_ROLES.has(u.Role))
+    .map((u) => ({ userId: u.UserId, fullName: u.FullName, role: u.Role }));
+}
+
+export function isPickableUser(userId) {
+  const u = load().users.find((x) => x.UserId === Number(userId));
+  return !!(u && u.IsActive === true && PICKABLE_ROLES.has(u.Role));
+}
+
 export async function verifyUserPassword(username, password) {
   const user = getUserByUsername(username);
   if (!user || !user.IsActive || !user.PasswordHash) return null;
@@ -1641,7 +1659,19 @@ function ensureWavesStore() {
  * Takes pre-fetched SAP order lines and aggregates them by ItemCode.
  * lines: [{ CompanyCode, DocEntry, LineNum, ItemCode, ItemName, OpenQty, WarehouseCode, Barcode, DocNum, CardName, ... }]
  */
-export function createWaveFromLines(runId, orderLines) {
+// Per-zone-picker-assignment (2026-05-21): third arg accepts an optional
+// assignment payload. The signature stays backwards compatible — older
+// 2-arg callers continue to create unassigned waves (AssignedPicker* = null,
+// matching pre-feature behaviour). When `assignedPickerId` is provided, the
+// new wave carries the 4 Assigned* fields so SendToPicking can record which
+// picker the planner chose for this zone/run.
+//
+// Throws a typed error (`{ code: 'WAVE_IN_PROGRESS', activeWaveId, status }`)
+// when the run already has an active wave whose Status is IN_PROGRESS or
+// PENDING_QC — those represent live picker work and shouldn't be silently
+// cancelled by another planner reusing the run. All other in-flight statuses
+// (PENDING) are still cancelled as before.
+export function createWaveFromLines(runId, orderLines, options = {}) {
   const s = ensureWavesStore();
   const run = s.runs.find((r) => r.RunId === Number(runId));
   if (!run) return null;
@@ -1683,12 +1713,36 @@ export function createWaveFromLines(runId, orderLines) {
   //                         which is the bug this branch fixes.
   const palletMode = run.PalletMode || 'SINGLE';
 
-  // Cancel any existing active wave for this run
+  // Per-zone-picker-assignment guard: refuse to cancel a wave that is mid-
+  // pick or waiting for QC. Otherwise the new wave silently destroys a live
+  // picker's progress (PENDING_QC) or in-flight session (IN_PROGRESS).
+  const blockingWave = s.waves.find(
+    (w) => w.RunId === run.RunId && (w.Status === 'IN_PROGRESS' || w.Status === 'PENDING_QC')
+  );
+  if (blockingWave) {
+    const err = new Error(
+      `Run ${run.RunNumber} כבר משויך לגל ליקוט פעיל (${blockingWave.Status}). בטל אותו לפני יצירת חדש.`
+    );
+    err.code = 'WAVE_IN_PROGRESS';
+    err.activeWaveId = blockingWave.WaveId;
+    err.activeWaveStatus = blockingWave.Status;
+    throw err;
+  }
+
+  // Cancel any existing active wave for this run (only PENDING reaches here
+  // after the guard above).
   for (const w of s.waves) {
     if (w.RunId === run.RunId && w.Status !== 'CANCELLED' && w.Status !== 'COMPLETED') {
       w.Status = 'CANCELLED';
     }
   }
+
+  // Per-zone-picker-assignment: pull picker info from options. Falsy values
+  // (null/undefined) → wave is unassigned, identical to pre-feature behaviour.
+  const assignedPickerId   = options.assignedPickerId   != null ? options.assignedPickerId   : null;
+  const assignedPickerName = options.assignedPickerName != null ? options.assignedPickerName : null;
+  const assignedBy         = options.assignedBy         != null ? options.assignedBy         : null;
+  const assignedAt         = assignedPickerId != null ? new Date().toISOString() : null;
 
   const waveNumber = `WAVE-${run.RunNumber}-${String(s.waves.filter((w) => w.RunId === run.RunId).length + 1).padStart(2, '0')}`;
   const newWave = {
@@ -1700,6 +1754,10 @@ export function createWaveFromLines(runId, orderLines) {
     Status: 'PENDING',
     PickedBy: null,
     PickedByName: null,
+    AssignedPickerId: assignedPickerId,
+    AssignedPickerName: assignedPickerName,
+    AssignedBy: assignedBy,
+    AssignedAt: assignedAt,
     StartedAt: null,
     CompletedAt: null,
     CreatedAt: new Date().toISOString(),
