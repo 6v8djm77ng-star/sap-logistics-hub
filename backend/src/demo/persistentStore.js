@@ -779,57 +779,81 @@ export function getRunDetails(runId) {
   return { ...run, stops };
 }
 
-// Mapping of common Israeli cities to zone codes (used for auto-assign)
+// Mapping of common Israeli cities to zone codes (used for auto-assign
+// when an order arrives for a customer that has no profile yet).
+//
+// A2h-CITY-TO-ZONE (2026-05-21): rebuilt from the actual customer→zone
+// distribution after the 2026-05-20 Zone Migration. Each city → the
+// dominant new zone code among the customers we already have in that
+// city. Surprised by some — בני ברק/רמת גן/גבעתיים all turned out to
+// be CENTER_FAR, not CENTER_NEAR. רחובות/ראשון/מודיעין moved out of
+// the old SHFELA (now empty) into CENTER_NEAR. באר שבע + ערד + דימונה
+// rolled up to SOUTH-1 (old SOUTH-2 is empty). The legacy codes
+// CENTER / NORTH / SHFELA / SOUTH-2 / NORTHWEST are kept inactive in
+// the zones table but no longer referenced here — new orders will
+// get a *current* code.
 const CITY_TO_ZONE = {
-  // NORTH (חיפה, קריות, גליל)
-  'חיפה': 'NORTH', 'נשר': 'NORTH', 'טירת הכרמל': 'NORTH', 'טירת כרמל': 'NORTH',
-  'קריית אתא': 'NORTH', 'קרית אתא': 'NORTH', 'קריית ביאליק': 'NORTH', 'קרית ביאליק': 'NORTH',
-  'קריית מוצקין': 'NORTH', 'קרית מוצקין': 'NORTH', 'קריית ים': 'NORTH', 'קרית ים': 'NORTH',
-  'נהריה': 'NORTH', 'עכו': 'NORTH', 'כרמיאל': 'NORTH', 'מעלות': 'NORTH',
-  'מעלות תרשיחא': 'NORTH', 'תרשיחא': 'NORTH', 'מעיליא': 'NORTH', 'חורפיש': 'NORTH',
-  'רגבה': 'NORTH', 'קיבוץ רגבה': 'NORTH', 'עין המפרץ': 'NORTH', 'מתחם עין המפרץ': 'NORTH',
-  'תל חנן': 'NORTH', 'עפולה': 'NORTH', 'טבריה': 'NORTH', 'צפת': 'NORTH',
-  'קרית שמונה': 'NORTH', 'קריית שמונה': 'NORTH', 'נוף הגליל': 'NORTH', 'נצרת': 'NORTH',
-  'נצרת עילית': 'NORTH', 'זכרון יעקב': 'NORTH', 'חדרה': 'NORTH', 'פרדס חנה': 'NORTH',
-  'בנימינה': 'NORTH', 'קיסריה': 'NORTH', 'אור עקיבא': 'NORTH', 'כפר כנא': 'NORTH',
-  'מגדל העמק': 'NORTH', 'בית שאן': 'NORTH', 'כפר קרע': 'NORTH', 'באקה אל גרבייה': 'NORTH',
-  'באקה': 'NORTH', 'טייבה': 'NORTH', 'טירה': 'NORTH', 'אום אל פחם': 'NORTH',
-  'ג\'דיידה': 'NORTH', 'כאבול': 'NORTH', 'יקנעם': 'NORTH', 'יקנעם עילית': 'NORTH',
-  // SHARON (נתניה, רעננה, הרצליה)
+  // ── NORTH_NEAR (חיפה + מפרץ + חוף הכרמל + שומרון צפוני) ────────────
+  'חיפה': 'NORTH_NEAR', 'נשר': 'NORTH_NEAR', 'טירת הכרמל': 'NORTH_NEAR', 'טירת כרמל': 'NORTH_NEAR',
+  'קריית אתא': 'NORTH_NEAR', 'קרית אתא': 'NORTH_NEAR', 'קריית ביאליק': 'NORTH_NEAR', 'קרית ביאליק': 'NORTH_NEAR',
+  'קריית מוצקין': 'NORTH_NEAR', 'קרית מוצקין': 'NORTH_NEAR', 'קריית ים': 'NORTH_NEAR', 'קרית ים': 'NORTH_NEAR',
+  'נהריה': 'NORTH_NEAR', 'עכו': 'NORTH_NEAR', 'רגבה': 'NORTH_NEAR', 'קיבוץ רגבה': 'NORTH_NEAR',
+  'עין המפרץ': 'NORTH_NEAR', 'מתחם עין המפרץ': 'NORTH_NEAR', 'תל חנן': 'NORTH_NEAR',
+  'זכרון יעקב': 'NORTH_NEAR', 'חדרה': 'NORTH_NEAR', 'פרדס חנה': 'NORTH_NEAR',
+  'פרדס חנה כרכור': 'NORTH_NEAR', 'בנימינה': 'NORTH_NEAR', 'קיסריה': 'NORTH_NEAR',
+  'אור עקיבא': 'NORTH_NEAR', 'רכסים': 'NORTH_NEAR', 'חריש': 'NORTH_NEAR', 'טמרה': 'NORTH_NEAR',
+  'יקנעם': 'NORTH_NEAR', 'יקנעם עילית': 'NORTH_NEAR',
+  // ── NORTH_FAR (גליל, עמק יזרעאל, כינרת, גולן) ────────────────────────
+  'כרמיאל': 'NORTH_FAR', 'מעלות': 'NORTH_FAR', 'מעלות תרשיחא': 'NORTH_FAR', 'תרשיחא': 'NORTH_FAR',
+  'מעיליא': 'NORTH_FAR', 'חורפיש': 'NORTH_FAR', 'עפולה': 'NORTH_FAR', 'טבריה': 'NORTH_FAR',
+  'צפת': 'NORTH_FAR', 'קרית שמונה': 'NORTH_FAR', 'קריית שמונה': 'NORTH_FAR',
+  'נוף הגליל': 'NORTH_FAR', 'נצרת': 'NORTH_FAR', 'נצרת עילית': 'NORTH_FAR',
+  'כפר כנא': 'NORTH_FAR', 'מגדל העמק': 'NORTH_FAR', 'בית שאן': 'NORTH_FAR',
+  'סכנין': 'NORTH_FAR', 'חצור הגלילית': 'NORTH_FAR', 'כפר קרע': 'NORTH_FAR',
+  'באקה אל גרבייה': 'NORTH_FAR', 'באקה': 'NORTH_FAR', 'אום אל פחם': 'NORTH_FAR',
+  "ג'דיידה": 'NORTH_FAR', 'כאבול': 'NORTH_FAR',
+  // ── SHARON (חוף השרון + שומרון מערבי + משולש) ─────────────────────────
   'נתניה': 'SHARON', 'הרצליה': 'SHARON', 'רעננה': 'SHARON', 'כפר סבא': 'SHARON',
   'הוד השרון': 'SHARON', 'רמת השרון': 'SHARON', 'ראש העין': 'SHARON',
-  'אבן יהודה': 'SHARON', 'כפר יונה': 'SHARON', 'תל מונד': 'SHARON', 'חריש': 'SHARON',
-  'אלפי מנשה': 'SHARON',
-  // CENTER (ת"א, ר"ג, גבעתיים)
-  'תל אביב': 'CENTER', 'תל אביב יפו': 'CENTER', 'תל אביב-יפו': 'CENTER',
-  'רמת גן': 'CENTER', 'גבעתיים': 'CENTER', 'בני ברק': 'CENTER', 'בת ים': 'CENTER',
-  'פתח תקווה': 'CENTER', 'פתח תקוה': 'CENTER', 'חולון': 'CENTER',
-  'גני תקווה': 'CENTER', 'גני תקוה': 'CENTER', 'קרית אונו': 'CENTER',
-  'קריית אונו': 'CENTER', 'אור יהודה': 'CENTER', 'יהוד': 'CENTER',
-  'יהוד מונוסון': 'CENTER', 'איירפורט סיטי': 'CENTER', 'נתב"ג': 'CENTER',
-  'נתבג': 'CENTER', 'אזור': 'CENTER', 'גבעת שמואל': 'CENTER', 'סביון': 'CENTER',
-  // JERUSALEM (ירושלים והסביבה)
+  'אבן יהודה': 'SHARON', 'כפר יונה': 'SHARON', 'תל מונד': 'SHARON',
+  'אלפי מנשה': 'SHARON', 'אלעד': 'SHARON', 'כפר קאסם': 'SHARON',
+  'טירה': 'SHARON', 'טייבה': 'SHARON', 'צור יצחק': 'SHARON',
+  // ── TEL_AVIV (תל אביב בלבד — variants כולן) ──────────────────────────
+  'תל אביב': 'TEL_AVIV', 'תל אביב יפו': 'TEL_AVIV', 'תל אביב-יפו': 'TEL_AVIV',
+  'ת"א': 'TEL_AVIV', 'יפו': 'TEL_AVIV',
+  // ── CENTER_NEAR (טבעת פנימית של גוש דן + שפלה צפונית) ──────────────
+  'חולון': 'CENTER_NEAR', 'בת ים': 'CENTER_NEAR',
+  'ראשון לציון': 'CENTER_NEAR', 'ראשל"צ': 'CENTER_NEAR', 'ראשלצ': 'CENTER_NEAR',
+  'רחובות': 'CENTER_NEAR', 'נס ציונה': 'CENTER_NEAR', 'באר יעקב': 'CENTER_NEAR',
+  'רמלה': 'CENTER_NEAR', 'לוד': 'CENTER_NEAR',
+  'מודיעין': 'CENTER_NEAR', 'מודיעין מכבים רעות': 'CENTER_NEAR', 'מודיעין עילית': 'CENTER_NEAR',
+  'בילו': 'CENTER_NEAR', 'מזכרת בתיה': 'CENTER_NEAR', 'צומת שילת': 'CENTER_NEAR', 'שילת': 'CENTER_NEAR',
+  // ── CENTER_FAR (טבעת חיצונית מזרחית של גוש דן) ───────────────────────
+  'רמת גן': 'CENTER_FAR', 'גבעתיים': 'CENTER_FAR', 'בני ברק': 'CENTER_FAR',
+  'פתח תקווה': 'CENTER_FAR', 'פתח תקוה': 'CENTER_FAR',
+  'גני תקווה': 'CENTER_FAR', 'גני תקוה': 'CENTER_FAR',
+  'קרית אונו': 'CENTER_FAR', 'קריית אונו': 'CENTER_FAR',
+  'אור יהודה': 'CENTER_FAR', 'יהוד': 'CENTER_FAR', 'יהוד מונוסון': 'CENTER_FAR',
+  'איירפורט סיטי': 'CENTER_FAR', 'נתב"ג': 'CENTER_FAR', 'נתבג': 'CENTER_FAR',
+  'אזור': 'CENTER_FAR', 'גבעת שמואל': 'CENTER_FAR', 'סביון': 'CENTER_FAR',
+  'אריאל': 'CENTER_FAR', 'שוהם': 'CENTER_FAR', 'צומת סגולה': 'CENTER_FAR', 'סגולה': 'CENTER_FAR',
+  // ── JERUSALEM (ירושלים + פאתי ירושלים) ─────────────────────────────
   'ירושלים': 'JERUSALEM', 'בית שמש': 'JERUSALEM', 'מבשרת ציון': 'JERUSALEM',
-  'מעלה אדומים': 'JERUSALEM', 'גבעת זאב': 'JERUSALEM', 'ביתר עילית': 'JERUSALEM',
-  'אפרת': 'JERUSALEM',
-  // SHFELA (רחובות, ראשון, מודיעין)
-  'רחובות': 'SHFELA', 'ראשון לציון': 'SHFELA', 'ראשל"צ': 'SHFELA', 'ראשלצ': 'SHFELA',
-  'רמלה': 'SHFELA', 'לוד': 'SHFELA', 'נס ציונה': 'SHFELA',
-  'מודיעין': 'SHFELA', 'מודיעין מכבים רעות': 'SHFELA', 'יבנה': 'SHFELA',
-  'גדרה': 'SHFELA', 'בילו': 'SHFELA', 'קסטינה': 'SHFELA', 'ביג קסטינה': 'SHFELA',
-  'צומת סגולה': 'SHFELA', 'סגולה': 'SHFELA', 'באר טוביה': 'SHFELA',
-  'מזכרת בתיה': 'SHFELA', 'צומת שילת': 'SHFELA', 'שילת': 'SHFELA',
-  'אריאל': 'SHFELA', 'שוהם': 'SHFELA', 'צור יצחק': 'SHFELA',
-  // SOUTH-1 (אשדוד, אשקלון, קרית גת)
-  'אשדוד': 'SOUTH-1', 'אשקלון': 'SOUTH-1', 'קרית גת': 'SOUTH-1',
-  'קריית גת': 'SOUTH-1', 'כרמי גת': 'SOUTH-1', 'ביג כרמי גת': 'SOUTH-1',
-  'קרית מלאכי': 'SOUTH-1', 'קריית מלאכי': 'SOUTH-1', 'שדרות': 'SOUTH-1',
-  'נתיבות': 'SOUTH-1', 'ניר עם': 'SOUTH-1', 'קיבוץ ניר עם': 'SOUTH-1',
-  'שדרות': 'SOUTH-1', 'אופקים': 'SOUTH-1',
-  // SOUTH-2 (ב"ש ודרום)
-  'באר שבע': 'SOUTH-2', 'ב"ש': 'SOUTH-2', 'בש': 'SOUTH-2', 'ערד': 'SOUTH-2',
-  'דימונה': 'SOUTH-2', 'אילת': 'SOUTH-2', 'מצפה רמון': 'SOUTH-2', 'ירוחם': 'SOUTH-2',
-  'רהט': 'SOUTH-2', 'תל שבע': 'SOUTH-2', 'להבים': 'SOUTH-2', 'מיתר': 'SOUTH-2',
+  'מעלה אדומים': 'JERUSALEM', 'מישור אדומים': 'JERUSALEM', 'גבעת זאב': 'JERUSALEM',
+  'ביתר עילית': 'JERUSALEM', 'אפרת': 'JERUSALEM',
+  // ── SOUTH-1 (כל הדרום — שפלת יהודה, נגב מערבי, ב"ש + בקעה) ─────────
+  'אשדוד': 'SOUTH-1', 'אשקלון': 'SOUTH-1',
+  'קרית גת': 'SOUTH-1', 'קריית גת': 'SOUTH-1', 'כרמי גת': 'SOUTH-1', 'ביג כרמי גת': 'SOUTH-1',
+  'קרית מלאכי': 'SOUTH-1', 'קריית מלאכי': 'SOUTH-1',
+  'שדרות': 'SOUTH-1', 'נתיבות': 'SOUTH-1', 'אופקים': 'SOUTH-1',
+  'ניר עם': 'SOUTH-1', 'קיבוץ ניר עם': 'SOUTH-1',
+  'יבנה': 'SOUTH-1', 'גדרה': 'SOUTH-1', 'באר טוביה': 'SOUTH-1', 'קסטינה': 'SOUTH-1', 'ביג קסטינה': 'SOUTH-1',
+  'באר שבע': 'SOUTH-1', 'ב"ש': 'SOUTH-1', 'בש': 'SOUTH-1',
+  'ערד': 'SOUTH-1', 'דימונה': 'SOUTH-1',
+  'מצפה רמון': 'SOUTH-1', 'ירוחם': 'SOUTH-1',
+  'רהט': 'SOUTH-1', 'תל שבע': 'SOUTH-1', 'להבים': 'SOUTH-1', 'מיתר': 'SOUTH-1',
+  // ── EILAT (אילת בלבד) ────────────────────────────────────────────
+  'אילת': 'EILAT',
 };
 
 function findZoneByCity(city) {
