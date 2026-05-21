@@ -150,6 +150,12 @@ export default function App() {
         <Route path="drivers" element={<DriversPage />} />
         <Route path="warehouse" element={<WarehousePage />} />
         <Route path="warehouse/runs/:runId" element={<PickingPage />} />
+        {/* A2g-FIX-PICKING-ROUTE (2026-05-21): SendToPickingModal redirects to
+            /picking/<waveId> after creating a Run+Wave (per commit ea9036e
+            from 2026-05-18) but this route was never declared, producing a
+            blank page on every submit. PickingPage accepts the param via
+            its useParams fallback (waveId || runId). */}
+        <Route path="picking/:waveId" element={<PickingPage />} />
         <Route path="exceptions" element={<ExceptionsPage />} />
         <Route path="live" element={<LiveTrackingPage />} />
         <Route path="map" element={<LiveMapPage />} />

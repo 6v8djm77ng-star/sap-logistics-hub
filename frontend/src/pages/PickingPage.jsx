@@ -146,7 +146,14 @@ function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
 }
 
 export default function PickingPage() {
-  const { runId } = useParams();
+  // A2g-FIX-PICKING-ROUTE (2026-05-21): mounted under TWO routes —
+  //   /warehouse/runs/:runId  (legacy, gives runId)
+  //   /picking/:waveId        (post-submit redirect, gives waveId)
+  // Detect which and fetch via the right endpoint. Avoids the
+  // 'wave-for-run(<waveId>)' miss that produced the post-submit blank page.
+  const params = useParams();
+  const waveIdParam = params.waveId;
+  const runId = params.runId;
   const queryClient = useQueryClient();
   const [pickingValues, setPickingValues] = useState({});
   const [scannerOpen, setScannerOpen] = useState(false);
@@ -154,8 +161,8 @@ export default function PickingPage() {
   const [hideCompleted, setHideCompleted] = useState(false);
 
   const { data: wave, isLoading, refetch, isRefetching } = useQuery({
-    queryKey: ['wave-for-run', runId],
-    queryFn: () => pickingApi.getWaveForRun(runId),
+    queryKey: waveIdParam ? ['wave', waveIdParam] : ['wave-for-run', runId],
+    queryFn: () => (waveIdParam ? pickingApi.get(waveIdParam) : pickingApi.getWaveForRun(runId)),
     refetchInterval: 10_000,
   });
 
