@@ -40,6 +40,7 @@ import PickersPage from './pages/PickersPage.jsx';
 import DavoMixPage from './pages/DavoMixPage.jsx';
 import DriverRunsPage from './pages/driver/DriverRunsPage.jsx';
 import DriverManifestPage from './pages/driver/DriverManifestPage.jsx';
+import PickerTasksPage from './pages/PickerTasksPage.jsx';
 import ForceChangePasswordPage from './pages/ForceChangePasswordPage.jsx';
 import ForgotPasswordPage from './pages/ForgotPasswordPage.jsx';
 import ResetPasswordPage from './pages/ResetPasswordPage.jsx';
@@ -128,6 +129,19 @@ export default function App() {
         element={
           <RequireAuth roles={['DRIVER', 'ADMIN']}>
             <DriverManifestPage />
+          </RequireAuth>
+        }
+      />
+
+      {/* Picker Task Inbox (2026-05-22) — mobile-first inbox where a
+          warehouse picker (or a planner viewing on their behalf) sees
+          only the waves currently assigned to them via AssignedPickerId.
+          Standalone (no DashboardLayout) so it fits a handheld. */}
+      <Route
+        path="/picker/tasks"
+        element={
+          <RequireAuth roles={['WAREHOUSE', 'ADMIN', 'PLANNER']}>
+            <PickerTasksPage />
           </RequireAuth>
         }
       />

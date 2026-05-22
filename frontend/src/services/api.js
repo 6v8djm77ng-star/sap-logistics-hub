@@ -101,6 +101,16 @@ export const pickableUsersApi = {
   list: () => api.get('/pickable-users').then((r) => r.data.pickers),
 };
 
+// Picker Task Inbox (2026-05-22): per-picker queue of waves to pick.
+// Backs /picker/tasks page. Validates pickerId server-side — 400
+// INVALID_PICKER for non-integer, 404 PICKER_NOT_FOUND for missing/
+// inactive picker. Each row carries denormalised run + line aggregates,
+// see GET /api/pickers/:pickerId/assigned-waves in demoServer.
+export const pickerTasksApi = {
+  listAssignedWaves: (pickerId) =>
+    api.get(`/pickers/${pickerId}/assigned-waves`).then((r) => r.data.waves),
+};
+
 export const driverApi = {
   myRuns: () => api.get('/driver/my-runs').then((r) => r.data.runs),
   manifest: (runId) => api.get(`/driver/runs/${runId}/manifest`).then((r) => r.data),
