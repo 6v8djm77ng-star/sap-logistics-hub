@@ -59,7 +59,11 @@ export const runsApi = {
   autoPlan: (runDate, opts = {}) => api.post('/runs/auto-plan', { runDate, ...opts }).then((r) => r.data),
   updateStatus: (id, status) => api.patch(`/runs/${id}/status`, { status }).then((r) => r.data),
   optimizeOrder: (id) => api.post(`/runs/${id}/optimize-order`).then((r) => r.data),
-  buildWave: (id) => api.post(`/runs/${id}/wave`).then((r) => r.data),
+  // body is optional. Per-zone-picker-assignment (2026-05-21): when the
+  // planner picked someone in the SendToPicking modal, pass
+  // { assignedPickerId } so the backend records it on the new wave.
+  // Omitting body keeps the legacy unassigned-wave behaviour.
+  buildWave: (id, body) => api.post(`/runs/${id}/wave`, body || undefined).then((r) => r.data),
   getWave: (id) => api.get(`/runs/${id}/wave`).then((r) => r.data),
   // Phase 2 v2 — dry-run preview for "send selected orders to picking".
   // Returns a runsPreview/summary without mutating any store.
@@ -86,6 +90,15 @@ export const returnsApi = {
 export const pickingApi = {
   getWave: (id) => api.get(`/picking/${id}`).then((r) => r.data),
   pickLine: (lineId, qty) => api.post(`/picking/lines/${lineId}/pick`, { pickedQuantity: qty }).then((r) => r.data),
+};
+
+// Per-zone-picker-assignment (2026-05-21): list of user accounts the
+// SendToPicking modal can offer as the picker for a zone/run. Distinct from
+// /api/pickers (warehouse-handheld entity used by PickersPage). Gated on
+// the backend to ADMIN+PLANNER — planners are the only ones opening the
+// SendToPicking modal.
+export const pickableUsersApi = {
+  list: () => api.get('/pickable-users').then((r) => r.data.pickers),
 };
 
 export const driverApi = {

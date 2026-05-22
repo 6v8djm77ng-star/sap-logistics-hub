@@ -450,7 +450,29 @@ export default function PickingPage() {
                wave.Status === 'PENDING_QC' ? 'ממתין לבקרה' :
                wave.Status === 'IN_PROGRESS' ? 'בתהליך' : 'ממתין'}
             </span>
-            {wave.PickedByName && (
+            {/* Per-zone-picker-assignment (2026-05-21): AssignedPickerName
+                is the planner's choice at SendToPicking time; PickedByName
+                is the user who actually started picking. Both can appear
+                independently — the wave keeps them as separate fields. */}
+            {wave.AssignedPickerName && (
+              <>
+                <span>·</span>
+                <span className="text-xs">הוקצה: {wave.AssignedPickerName}</span>
+              </>
+            )}
+            {wave.PickedByName && wave.PickedByName !== wave.AssignedPickerName && (
+              <>
+                <span>·</span>
+                <span className="text-xs">ליקט בפועל: {wave.PickedByName}</span>
+              </>
+            )}
+            {wave.PickedByName && wave.PickedByName === wave.AssignedPickerName && (
+              <>
+                <span>·</span>
+                <span className="text-xs">✓ ליקט</span>
+              </>
+            )}
+            {!wave.AssignedPickerName && wave.PickedByName && (
               <>
                 <span>·</span>
                 <span className="text-xs">לקט: {wave.PickedByName}</span>

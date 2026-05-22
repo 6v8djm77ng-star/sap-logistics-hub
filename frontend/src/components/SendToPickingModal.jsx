@@ -25,12 +25,12 @@
  *   - other (incl. network) → generic error card + retry button
  */
 import { useEffect, useState } from 'react';
-import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
-  X, Loader2, AlertTriangle, Send, MapPin, Truck, CheckCircle2, ChevronLeft,
+  X, Loader2, AlertTriangle, Send, MapPin, Truck, CheckCircle2, ChevronLeft, User,
 } from 'lucide-react';
-import { runsApi } from '../services/api.js';
+import { runsApi, pickableUsersApi } from '../services/api.js';
 
 // Phase machine — kept as plain strings so the JSX can switch on them
 // without a state-machine library. Order: preview → submitting → done|error.
@@ -59,6 +59,19 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
   const [progress, setProgress]       = useState({ runsTotal: 0, wavesBuilt: 0, wavesFailed: 0, currentStep: '' });
   const [finalResult, setFinalResult] = useState(null);           // { runsCreated, waveResults, summary, unassigned }
   const [finalError, setFinalError]   = useState(null);           // submit-step error body
+  // Per-zone picker assignment: { [zoneCode]: userId }. Cleared on each
+  // modal open so a previous selection can't bleed into a new submit.
+  const [pickerByZoneCode, setPickerByZoneCode] = useState({});
+
+  // List of users the planner can assign as the picker for a zone. Fetched
+  // once on mount + on each modal open. The query is cheap (≤ a few rows).
+  const pickableUsersQuery = useQuery({
+    queryKey: ['pickable-users'],
+    queryFn:  pickableUsersApi.list,
+    enabled:  open,
+    staleTime: 60_000,
+  });
+  const pickableUsers = pickableUsersQuery.data || [];
 
   const previewMutation = useMutation({
     mutationFn: () => runsApi.previewFromSelectedOrders({ orders: orderRefs || [] }),
@@ -81,6 +94,7 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
       setFinalError(null);
       setProgress({ runsTotal: 0, wavesBuilt: 0, wavesFailed: 0, currentStep: '' });
       setKey(newIdempotencyKey());
+      setPickerByZoneCode({});
       previewMutation.mutate();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -96,15 +110,20 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
 
   // Confirm is allowed only when: we're in the preview phase, the preview
   // succeeded, there are no conflicts, no missing orders, and at least one
-  // order is in a recognized zone (ordersAssigned > 0). Unassigned-only
-  // selections still surface in preview but cannot move forward — there is
-  // nothing for the backend to create.
+  // order is in a recognized zone (ordersAssigned > 0). Per-zone-picker-
+  // assignment (2026-05-21) adds a final gate — every runsPreview row must
+  // have a picker assigned in pickerByZoneCode.
+  const runsPreviewRows = preview?.runsPreview || [];
+  const everyZoneHasPicker =
+    runsPreviewRows.length > 0 &&
+    runsPreviewRows.every((r) => pickerByZoneCode[r.zoneCode]);
   const canConfirm =
     phase === PHASE_PREVIEW &&
     !isLoading &&
     !hasPreviewError &&
     preview &&
-    (preview.summary?.ordersAssigned || 0) > 0;
+    (preview.summary?.ordersAssigned || 0) > 0 &&
+    everyZoneHasPicker;
 
   const totalStops = (preview?.runsPreview || []).reduce((sum, r) => sum + (r.stopCount || 0), 0);
 
@@ -129,11 +148,16 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
     // Sequential — SAP-friendly + lets us update the progress bar one wave
     // at a time. Parallel would shave seconds at the cost of harder error
     // surfacing and heavier SAP load.
+    //
+    // Per-zone-picker-assignment: pair each created run with the picker
+    // the planner selected for its zone. The submit response carries
+    // zoneCode on each runsCreated[i], which keys back into pickerByZoneCode.
     for (let i = 0; i < runsCreated.length; i++) {
       const run = runsCreated[i];
+      const assignedPickerId = pickerByZoneCode[run.zoneCode] || null;
       setProgress((prev) => ({ ...prev, currentStep: `בונה גל ליקוט ${i + 1}/${runsCreated.length}…` }));
       try {
-        const wave = await runsApi.buildWave(run.runId);
+        const wave = await runsApi.buildWave(run.runId, assignedPickerId ? { assignedPickerId } : undefined);
         waveResults.push({
           runId: run.runId, runNumber: run.runNumber, zoneName: run.zoneName, zoneCode: run.zoneCode,
           reusedExisting: !!run.reusedExisting, stopCount: run.stopCount, orderCount: run.orderCount,
@@ -232,7 +256,17 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
             />
           )}
           {phase === PHASE_PREVIEW && !isLoading && !hasPreviewError && preview && (
-            <PreviewView preview={preview} totalStops={totalStops} />
+            <PreviewView
+              preview={preview}
+              totalStops={totalStops}
+              pickableUsers={pickableUsers}
+              pickersLoading={pickableUsersQuery.isLoading}
+              pickersError={pickableUsersQuery.error}
+              pickerByZoneCode={pickerByZoneCode}
+              onPickerChange={(zoneCode, userId) =>
+                setPickerByZoneCode((prev) => ({ ...prev, [zoneCode]: userId }))
+              }
+            />
           )}
 
           {/* SUBMITTING phase */}
@@ -313,7 +347,11 @@ export default function SendToPickingModal({ open, orderRefs, onClose }) {
 // Sub-views
 // ──────────────────────────────────────────────────────────────────────
 
-function PreviewView({ preview, totalStops }) {
+function PreviewView({
+  preview, totalStops,
+  pickableUsers, pickersLoading, pickersError,
+  pickerByZoneCode, onPickerChange,
+}) {
   return (
     <>
       <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -334,11 +372,23 @@ function PreviewView({ preview, totalStops }) {
 
       <div>
         <h3 className="text-sm font-semibold mb-2 flex items-center gap-1.5">
-          <Truck size={14} /> פירוט לפי אזור
+          <Truck size={14} /> פירוט לפי אזור — בחר מלקט לכל אזור
         </h3>
+        {pickersError && (
+          <div className="bg-amber-50 border border-amber-300 text-amber-800 text-xs rounded p-2 mb-2">
+            לא ניתן לטעון רשימת מלקטים. נסה לרענן את העמוד.
+          </div>
+        )}
         <div className="space-y-2">
           {(preview.runsPreview || []).map((r) => (
-            <ZoneCard key={r.zoneCode} run={r} />
+            <ZoneCard
+              key={r.zoneCode}
+              run={r}
+              pickableUsers={pickableUsers}
+              pickersLoading={pickersLoading}
+              selectedPickerId={pickerByZoneCode[r.zoneCode] || ''}
+              onPickerChange={(userId) => onPickerChange(r.zoneCode, userId)}
+            />
           ))}
         </div>
       </div>
@@ -480,26 +530,54 @@ function Stat({ label, value, color, sub }) {
   );
 }
 
-function ZoneCard({ run }) {
+function ZoneCard({ run, pickableUsers, pickersLoading, selectedPickerId, onPickerChange }) {
+  const hasPicker = !!selectedPickerId;
   return (
-    <div className="border border-gray-200 rounded-lg p-3 flex items-center justify-between">
-      <div>
-        <div className="font-semibold text-sm">{run.zoneName}</div>
-        <div className="text-xs text-gray-500 font-mono">{run.zoneCode}</div>
-      </div>
-      <div className="text-left">
-        {run.wouldReuseExistingRunId ? (
-          <div className="text-xs text-blue-700">
-            <span className="font-semibold">+ צירוף ל-{run.wouldReuseExistingRunNumber}</span>
+    <div className={`border rounded-lg p-3 ${hasPicker ? 'border-gray-200' : 'border-amber-300 bg-amber-50/40'}`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="font-semibold text-sm">{run.zoneName}</div>
+          <div className="text-xs text-gray-500 font-mono">{run.zoneCode}</div>
+        </div>
+        <div className="text-left">
+          {run.wouldReuseExistingRunId ? (
+            <div className="text-xs text-blue-700">
+              <span className="font-semibold">+ צירוף ל-{run.wouldReuseExistingRunNumber}</span>
+            </div>
+          ) : (
+            <div className="text-xs text-emerald-700 font-semibold">מסלול חדש</div>
+          )}
+          <div className="text-xs text-gray-600 mt-0.5">
+            <MapPin size={10} className="inline ml-0.5" />
+            {run.stopCount} תחנות · {run.orderCount} הזמנות
           </div>
-        ) : (
-          <div className="text-xs text-emerald-700 font-semibold">מסלול חדש</div>
-        )}
-        <div className="text-xs text-gray-600 mt-0.5">
-          <MapPin size={10} className="inline ml-0.5" />
-          {run.stopCount} תחנות · {run.orderCount} הזמנות
         </div>
       </div>
+
+      <div className="mt-2 pt-2 border-t border-gray-100 flex items-center gap-2">
+        <User size={12} className={hasPicker ? 'text-emerald-600' : 'text-amber-700'} />
+        <label className="text-xs text-gray-700 whitespace-nowrap">מלקט:</label>
+        <select
+          value={selectedPickerId}
+          onChange={(e) => onPickerChange(e.target.value ? Number(e.target.value) : null)}
+          disabled={pickersLoading}
+          className={`flex-1 text-sm px-2 py-1 border rounded ${
+            hasPicker ? 'border-gray-300 bg-white' : 'border-amber-400 bg-white'
+          } disabled:opacity-60`}
+        >
+          <option value="">{pickersLoading ? 'טוען מלקטים…' : '— בחר מלקט —'}</option>
+          {(pickableUsers || []).map((u) => (
+            <option key={u.userId} value={u.userId}>
+              {u.fullName} ({u.role === 'WAREHOUSE' ? 'מחסן' : u.role === 'PLANNER' ? 'מתכנן' : 'מנהל'})
+            </option>
+          ))}
+        </select>
+      </div>
+      {run.wouldReuseExistingRunId && (
+        <div className="mt-1 text-[11px] text-blue-700/80">
+          ⓘ אם קיים גל ליקוט פעיל ל-{run.wouldReuseExistingRunNumber}, השליחה תיחסם (WAVE_IN_PROGRESS)
+        </div>
+      )}
     </div>
   );
 }
