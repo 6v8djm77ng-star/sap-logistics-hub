@@ -63,46 +63,142 @@ const slUser = () => process.env.SAP_SL_USERNAME || process.env.SAP_SERVICE_LAYE
 const slPass = () => process.env.SAP_SL_PASSWORD || process.env.SAP_SERVICE_LAYER_PASSWORD || '';
 const isWriteEnabled = () => process.env.SAP_WRITE_ENABLED === 'true';
 
-const agent = new https.Agent({ rejectUnauthorized: false });
+// Transport fix (2026-05-22): Node 18+ global fetch does NOT honour the
+// `agent` option — it uses an internal undici dispatcher and silently
+// drops anything it doesn't recognise. The previous implementation set
+// `new https.Agent({ rejectUnauthorized:false })` on fetch options,
+// expecting SSL verification to be disabled for SAP B1's self-signed cert.
+// In practice the agent was ignored, the TLS handshake failed with the
+// self-signed cert, and fetch threw the cryptic "fetch failed" with no
+// useful detail. We replace fetch with the built-in `https.request`,
+// which honours rejectUnauthorized correctly and lets us surface
+// detailed network errors (ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH, etc).
+//
+// SSL behaviour is now controlled exclusively by SAP_SL_SSL_REJECT_UNAUTHORIZED:
+//   - 'false' (string) → rejectUnauthorized=false  (accept self-signed)
+//   - anything else / unset → rejectUnauthorized=true  (strict, the safe default)
+// Matches the contract already used by serviceLayer.js and the standalone
+// test-sl-login.js helper.
+export function _slRejectUnauthorized() {
+  return process.env.SAP_SL_SSL_REJECT_UNAUTHORIZED !== 'false';
+}
+
+/**
+ * Build the option object for `https.request`. Exported (with underscore
+ * prefix marking it as test-internal) so transport unit tests can verify
+ * the SSL flag mapping without making real network calls.
+ */
+export function _buildHttpsRequestOpts(method, urlString, body, headers) {
+  const parsed = new URL(urlString);
+  const opts = {
+    method,
+    hostname: parsed.hostname,
+    port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+    path: parsed.pathname + parsed.search,
+    headers: { ...(headers || {}) },
+    rejectUnauthorized: _slRejectUnauthorized(),
+    timeout: 30000,
+  };
+  if (body != null) opts.headers['Content-Length'] = Buffer.byteLength(body);
+  return opts;
+}
+
+/**
+ * Minimal Promise wrapper around `https.request`. Resolves with
+ * `{ statusCode, headers, body }`. Rejects with a *categorised* error
+ * (HTTP_*, TIMEOUT, NETWORK_*, etc.) so callers don't get the opaque
+ * "fetch failed" we used to see.
+ */
+function httpsRequest(method, urlString, body, headers) {
+  return new Promise((resolve, reject) => {
+    let opts;
+    try { opts = _buildHttpsRequestOpts(method, urlString, body, headers); }
+    catch (e) { reject(new Error(`Invalid URL '${urlString}': ${e.message}`)); return; }
+    const target = `${opts.method} ${opts.hostname}:${opts.port}${opts.path}`;
+    const req = https.request(opts, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({
+        statusCode: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.on('error', (e) => {
+      reject(new Error(`${target} → ${e.code || 'NETWORK_ERROR'}: ${e.message}`));
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error(`${target} → TIMEOUT after ${opts.timeout}ms`));
+    });
+    if (body != null) req.write(body);
+    req.end();
+  });
+}
 
 async function login(companyCode) {
   const existing = sessions.get(companyCode);
   if (existing && existing.expiresAt > Date.now()) return existing.cookie;
+  const companyDb = getCompanyDb(companyCode);
+  // Hard gate: refuse to even attempt login if the resolved CompanyDB is not
+  // in the explicit whitelist. This stops accidental connections to production
+  // before a single packet hits SAP.
+  if (!isCompanyDbWhitelisted(companyDb)) {
+    const whitelist = getWriteWhitelist();
+    throw new Error(
+      `SAP login refused: CompanyDB '${companyDb || '(empty)'}' is not in ` +
+      `SAP_LIVE_WRITE_DB_WHITELIST (current=${whitelist.join(',') || '(empty)'})`
+    );
+  }
   const body = JSON.stringify({
     UserName: slUser(),
     Password: slPass(),
-    CompanyDB: getCompanyDb(companyCode),
+    CompanyDB: companyDb,
   });
-  const res = await fetch(`${slUrl()}/Login`, {
-    method: 'POST',
-    body,
-    headers: { 'Content-Type': 'application/json' },
-    // @ts-ignore - node fetch supports agent through dispatcher in newer versions; for older versions use https module
-    agent,
+  const res = await httpsRequest('POST', `${slUrl()}/Login`, body, {
+    'Content-Type': 'application/json',
   });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`SAP Login failed (${res.status}): ${txt}`);
+  if (res.statusCode !== 200) {
+    let sapMsg = '';
+    try { sapMsg = JSON.parse(res.body)?.error?.message?.value || ''; } catch {}
+    // NEVER include the request body in the error - it contains the password.
+    throw new Error(`SAP Login failed: HTTP ${res.statusCode}${sapMsg ? ` "${sapMsg}"` : ''}`);
   }
-  const cookie = res.headers.get('set-cookie') || '';
+  const setCookie = res.headers['set-cookie'] || [];
+  const cookie = Array.isArray(setCookie)
+    ? setCookie.map((c) => String(c).split(';')[0]).join('; ')
+    : '';
+  if (!cookie) throw new Error('SAP Login: 200 OK but no Set-Cookie header');
   // SAP sessions last 30 mins by default
   sessions.set(companyCode, { cookie, expiresAt: Date.now() + 25 * 60 * 1000 });
   return cookie;
 }
 
 async function postSAP(companyCode, endpoint, payload) {
+  // Defense-in-depth: re-check whitelist here even though login() already does.
+  // Protects against any future code path that obtains a cookie by other means.
+  const companyDb = getCompanyDb(companyCode);
+  if (!isCompanyDbWhitelisted(companyDb)) {
+    throw new Error(
+      `SAP write refused: CompanyDB '${companyDb || '(empty)'}' is not in SAP_LIVE_WRITE_DB_WHITELIST`
+    );
+  }
   const cookie = await login(companyCode);
-  const res = await fetch(`${slUrl()}/${endpoint}`, {
-    method: 'POST',
-    body: JSON.stringify(payload),
-    headers: { 'Content-Type': 'application/json', Cookie: cookie },
-    agent,
+  const body = JSON.stringify(payload);
+  const res = await httpsRequest('POST', `${slUrl()}/${endpoint}`, body, {
+    'Content-Type': 'application/json',
+    Cookie: cookie,
   });
-  const text = await res.text();
   let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    throw new Error(`SAP ${endpoint} failed (${res.status}): ${text.slice(0, 300)}`);
+  try { json = JSON.parse(res.body); } catch { json = { raw: res.body }; }
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    let sapMsg = '';
+    try { sapMsg = JSON.parse(res.body)?.error?.message?.value || ''; } catch {}
+    throw new Error(
+      `SAP ${endpoint} failed: HTTP ${res.statusCode}` +
+      (sapMsg ? ` "${sapMsg}"` : '') +
+      ` body=${res.body.slice(0, 300)}`
+    );
   }
   return json;
 }
