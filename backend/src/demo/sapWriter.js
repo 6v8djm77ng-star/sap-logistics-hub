@@ -143,8 +143,13 @@ async function login(companyCode) {
   // Hard gate: refuse to even attempt login if the resolved CompanyDB is not
   // in the explicit whitelist. This stops accidental connections to production
   // before a single packet hits SAP.
-  if (!isCompanyDbWhitelisted(companyDb)) {
-    const whitelist = getWriteWhitelist();
+  //
+  // DEV.9 (2026-05-22): previously called a non-existent local helper
+  // isCompanyDbWhitelisted() which crashed every LIVE write with
+  // "ReferenceError: isCompanyDbWhitelisted is not defined" — the
+  // whitelist module's canonical parseWhitelist is the right primitive.
+  const whitelist = parseWhitelist(process.env.SAP_LIVE_WRITE_DB_WHITELIST);
+  if (!whitelist.includes(companyDb)) {
     throw new Error(
       `SAP login refused: CompanyDB '${companyDb || '(empty)'}' is not in ` +
       `SAP_LIVE_WRITE_DB_WHITELIST (current=${whitelist.join(',') || '(empty)'})`
@@ -177,8 +182,10 @@ async function login(companyCode) {
 async function postSAP(companyCode, endpoint, payload) {
   // Defense-in-depth: re-check whitelist here even though login() already does.
   // Protects against any future code path that obtains a cookie by other means.
+  // DEV.9 (2026-05-22): same isCompanyDbWhitelisted-was-undefined fix as login().
   const companyDb = getCompanyDb(companyCode);
-  if (!isCompanyDbWhitelisted(companyDb)) {
+  const whitelist = parseWhitelist(process.env.SAP_LIVE_WRITE_DB_WHITELIST);
+  if (!whitelist.includes(companyDb)) {
     throw new Error(
       `SAP write refused: CompanyDB '${companyDb || '(empty)'}' is not in SAP_LIVE_WRITE_DB_WHITELIST`
     );
