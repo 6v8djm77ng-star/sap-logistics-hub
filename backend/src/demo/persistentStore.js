@@ -199,6 +199,10 @@ export function getPickerByCode(code) {
   return list.find((p) => p.Code === code);
 }
 
+export function getPickerById(id) {
+  return load().pickers?.find((p) => p.PickerId === Number(id));
+}
+
 // Set or rotate a picker's login PIN. Hashed with bcrypt; the picker can
 // always reset it from an admin / Picker management screen. We keep it
 // optional so existing pickers that pre-date this field can still log in
@@ -483,22 +487,33 @@ export function getUserById(id) {
   return load().users.find((u) => u.UserId === Number(id));
 }
 
-// Per-zone-picker-assignment (2026-05-21): the set of users that may be
-// chosen as the picker for a run in SendToPicking. Distinct from the
-// `pickers` table (those are warehouse handhelds, not user accounts) — see
-// the Discovery doc on this branch. MVP keeps the list broad so the
-// dropdown has options even before WAREHOUSE users are seeded.
-const PICKABLE_ROLES = new Set(['WAREHOUSE', 'ADMIN', 'PLANNER']);
-
+// Per-zone-picker-assignment — picker source correction (2026-05-22):
+// the first cut of this feature sourced the SendToPicking dropdown from
+// store.users with role in {ADMIN, PLANNER, WAREHOUSE}. That surfaced
+// admins/planners instead of the actual warehouse handhelds, because the
+// real picker identities live in the separate `pickers` table — the same
+// one PickersPage manages and that picker-login authenticates against.
+//
+// This pair now reads from store.pickers instead, so the dropdown shows
+// the 4 real pickers (הראל / לורנזו / יקיר / נהוראי …) and the
+// AssignedPickerId on the wave is a PickerId, not a UserId.
+//
+// Response shape on /api/pickable-users is INTENTIONALLY kept stable to
+// avoid touching the frontend in this commit:
+//   - userId field now carries the PickerId
+//   - role is hard-coded to 'WAREHOUSE' (every picker is, by definition,
+//     a warehouse role; the field is informational for the dropdown label)
+// A future commit can rename userId→pickerId end-to-end if we want a
+// cleaner contract, but it would require a coordinated frontend change.
 export function getPickableUsers() {
-  return load().users
-    .filter((u) => u.IsActive === true && PICKABLE_ROLES.has(u.Role))
-    .map((u) => ({ userId: u.UserId, fullName: u.FullName, role: u.Role }));
+  return (load().pickers || [])
+    .filter((p) => p.IsActive === true)
+    .map((p) => ({ userId: p.PickerId, fullName: p.FullName, role: 'WAREHOUSE' }));
 }
 
 export function isPickableUser(userId) {
-  const u = load().users.find((x) => x.UserId === Number(userId));
-  return !!(u && u.IsActive === true && PICKABLE_ROLES.has(u.Role));
+  const p = (load().pickers || []).find((x) => x.PickerId === Number(userId));
+  return !!(p && p.IsActive === true);
 }
 
 export async function verifyUserPassword(username, password) {

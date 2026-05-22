@@ -41,6 +41,10 @@ function snapshot() {
     waveLines:       structuredClone(s.waveLines || []),
     pickAllocations: structuredClone(s.pickAllocations || []),
     users:           structuredClone(s.users || []),
+    // Per-zone-picker-assignment source-correction (2026-05-22):
+    // pickable-users now reads from store.pickers, so the fixture
+    // has to live (and roll back) on this slice too.
+    pickers:         structuredClone(s.pickers || []),
     stops:           structuredClone(s.stops || []),
     runOrders:       structuredClone(s.runOrders || []),
     nextWaveId:      s.nextWaveId,
@@ -56,6 +60,7 @@ function restore(snap) {
   s.waveLines       = snap.waveLines;
   s.pickAllocations = snap.pickAllocations;
   s.users           = snap.users;
+  s.pickers         = snap.pickers;
   s.stops           = snap.stops;
   s.runOrders       = snap.runOrders;
   s.nextWaveId      = snap.nextWaveId;
@@ -233,34 +238,74 @@ test('createWaveFromLines: PENDING wave is silently cancelled (pre-feature behav
 
 // ── getPickableUsers / isPickableUser ────────────────────────────────────
 // Mirrors the runtime gate at /api/pickable-users + the body validator at
-// POST /api/runs/:id/wave. The user list is whatever's in store.json today
-// — these tests assert the FILTER logic, not the specific identities.
-
-test('getPickableUsers: includes ADMIN, PLANNER, WAREHOUSE; excludes DRIVER + inactive', () => {
+// POST /api/runs/:id/wave.
+//
+// Source-correction (2026-05-22): the data source is now store.pickers
+// (the warehouse-handheld entity, same one PickersPage uses), not
+// store.users. The response shape is intentionally preserved — userId
+// carries PickerId, and role is hard-coded 'WAREHOUSE' — so the frontend
+// dropdown didn't need to change.
+test('getPickableUsers: returns active pickers as { userId, fullName, role:WAREHOUSE }', () => {
   const snap = snapshot();
   try {
     const s = load();
-    s.users = [
-      { UserId: 101, Username: 'a', FullName: 'A admin',     Role: 'ADMIN',     IsActive: true },
-      { UserId: 102, Username: 'b', FullName: 'B planner',   Role: 'PLANNER',   IsActive: true },
-      { UserId: 103, Username: 'c', FullName: 'C warehouse', Role: 'WAREHOUSE', IsActive: true },
-      { UserId: 104, Username: 'd', FullName: 'D driver',    Role: 'DRIVER',    IsActive: true },
-      { UserId: 105, Username: 'e', FullName: 'E inactive',  Role: 'PLANNER',   IsActive: false },
+    // Seed only the slice the function reads — the fixture deliberately
+    // excludes inactive and proves users with a "pickable role" are NOT
+    // surfaced anymore (the bug the source-correction fixes).
+    s.pickers = [
+      { PickerId: 201, Code: 'P-A', FullName: 'הראל טסט',  Phone: '050-1', IsActive: true },
+      { PickerId: 202, Code: 'P-B', FullName: 'לורנזו טסט', Phone: '050-2', IsActive: true },
+      { PickerId: 203, Code: 'P-C', FullName: 'מלקט מושבת', Phone: '050-3', IsActive: false },
     ];
+    s.users = [
+      // These three would have been picked up under the OLD source
+      // (users.role ∈ {ADMIN,PLANNER,WAREHOUSE}); now they must NOT
+      // appear in getPickableUsers. The test fails if the source
+      // regresses back to users.
+      { UserId: 901, Username: 'a', FullName: 'איציק טסט', Role: 'ADMIN',     IsActive: true },
+      { UserId: 902, Username: 'b', FullName: 'מוטי טסט',  Role: 'PLANNER',   IsActive: true },
+      { UserId: 903, Username: 'c', FullName: 'מחסנאי טסט', Role: 'WAREHOUSE', IsActive: true },
+    ];
+
     const pickers = getPickableUsers();
     const ids = pickers.map((p) => p.userId).sort((a, b) => a - b);
-    assert.deepEqual(ids, [101, 102, 103], 'only active ADMIN/PLANNER/WAREHOUSE');
-    // Shape contract
+    assert.deepEqual(ids, [201, 202], 'only active pickers; inactive excluded');
+    // Shape contract — kept stable so frontend doesn't change
     for (const p of pickers) {
       assert.ok(typeof p.userId === 'number');
       assert.ok(typeof p.fullName === 'string');
-      assert.ok(['ADMIN', 'PLANNER', 'WAREHOUSE'].includes(p.role));
+      assert.equal(p.role, 'WAREHOUSE', 'role hard-coded for pickers');
     }
-    // isPickableUser mirrors the gate
-    assert.equal(isPickableUser(101), true);
-    assert.equal(isPickableUser(104), false, 'DRIVER excluded');
-    assert.equal(isPickableUser(105), false, 'inactive PLANNER excluded');
-    assert.equal(isPickableUser(999), false, 'missing user excluded');
+    // No user-table identities should leak in (regression guard)
+    assert.ok(!ids.includes(901));
+    assert.ok(!ids.includes(902));
+    assert.ok(!ids.includes(903));
+  } finally {
+    restore(snap);
+  }
+});
+
+test('isPickableUser: validates against store.pickers (active only)', () => {
+  const snap = snapshot();
+  try {
+    const s = load();
+    s.pickers = [
+      { PickerId: 301, Code: 'P-X', FullName: 'מלקט פעיל',  Phone: '050', IsActive: true },
+      { PickerId: 302, Code: 'P-Y', FullName: 'מלקט מושבת', Phone: '050', IsActive: false },
+    ];
+    // A user with a "pickable role" must NOT pass the validator — the
+    // source-correction means user-table membership is irrelevant.
+    s.users = [
+      { UserId: 901, Username: 'admin', FullName: 'אדמין', Role: 'ADMIN', IsActive: true },
+    ];
+
+    assert.equal(isPickableUser(301), true,  'active picker accepted');
+    assert.equal(isPickableUser(302), false, 'inactive picker rejected');
+    assert.equal(isPickableUser(999), false, 'missing picker rejected');
+    assert.equal(isPickableUser(901), false, 'user-table identity NOT accepted as picker');
+    assert.equal(isPickableUser('301'), true, 'string id is coerced');
+    assert.equal(isPickableUser(null), false);
+    assert.equal(isPickableUser(undefined), false);
   } finally {
     restore(snap);
   }

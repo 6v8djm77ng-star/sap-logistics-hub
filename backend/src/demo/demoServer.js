@@ -2777,6 +2777,12 @@ app.post('/api/runs/:id/wave', async (req, res) => {
 
   // Validate picker BEFORE touching SAP — otherwise a bad pickerId would
   // burn a SAP getBulkOrderLines call for nothing.
+  //
+  // Per-zone-picker-assignment correction (2026-05-22): the id is a
+  // PickerId from store.pickers, not a UserId. isPickableUser() and
+  // getPickerById() both read from that table now. Naming on the wire
+  // (assignedPickerId, AssignedPickerName) stays the same — only the FK
+  // target changed.
   const assignedPickerIdRaw = req.body?.assignedPickerId;
   let assignedPickerId = null;
   let assignedPickerName = null;
@@ -2784,13 +2790,13 @@ app.post('/api/runs/:id/wave', async (req, res) => {
     const id = Number(assignedPickerIdRaw);
     if (!Number.isInteger(id) || !store.isPickableUser(id)) {
       return res.status(400).json({
-        error: 'משתמש שנבחר כמלקט לא קיים, לא פעיל, או לא מתאים לליקוט',
+        error: 'המלקט שנבחר לא קיים או לא פעיל',
         code: 'INVALID_PICKER',
       });
     }
-    const user = store.getUserById(id);
+    const picker = store.getPickerById(id);
     assignedPickerId = id;
-    assignedPickerName = user.FullName;
+    assignedPickerName = picker.FullName;
   }
   // assignedBy is the planner who pressed "אשר ושלח" — pulled from the JWT
   // already verified by the global requireAuthBasic gate registered for
