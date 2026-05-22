@@ -583,8 +583,9 @@ const REAL_ORDERS_PATH = realFlagArg ? realFlagArg.split('=').slice(1).join('=')
     log(`RunId=${plan.run.RunId}  RunNumber=${plan.run.RunNumber}`);
     log(`RunOrderIds=${plan.runOrders.map((o) => o.RunOrderId).join(',')}`);
     log(`Next steps (manual, dry-run only):`);
-    log(`  curl -X POST http://localhost:4000/api/orders/${plan.runOrders[0].RunOrderId}/qc-approve`);
-    log(`  curl -X POST http://localhost:4000/api/orders/${plan.runOrders[1].RunOrderId}/qc-approve`);
+    for (const ro of plan.runOrders) {
+      log(`  curl -X POST http://localhost:4000/api/orders/${ro.RunOrderId}/qc-approve`);
+    }
     log(`  curl -X POST http://localhost:4000/api/runs/${plan.run.RunId}/flush-aggregate-docs`);
     log(`Cleanup when done: node scripts/seed-qc-ready-run.js --cleanup`);
   } else {

@@ -64,13 +64,25 @@ const DB_A    = process.env.SAP_SL_COMPANY_DB_A
              || '';
 const SSL_REJECT = process.env.SAP_SL_SSL_REJECT_UNAUTHORIZED !== 'false';
 
-function log(line) { if (!JSON_OUTPUT) console.log('[discover] ' + line); }
+// JSON-output contract: when --json is set, stdout MUST contain only the
+// JSON document (or be empty on error). All progress / error lines go to
+// stderr so callers can safely redirect stdout to a file.
+function log(line) {
+  if (JSON_OUTPUT) console.error('[discover] ' + line);
+  else             console.log('[discover] ' + line);
+}
 function err(line) { console.error('[discover] ERROR: ' + line); }
 
 // ---------------------------------------------------------------------------
 // Pre-flight checks
 // ---------------------------------------------------------------------------
+// abort() is used ONLY for pre-flight failures (before any SL session
+// exists). Once login() succeeds, in-flight failures throw DiscoverError
+// instead, so the main try/finally can always log the session out.
 function abort(code, message) { err(message); process.exit(code); }
+class DiscoverError extends Error {
+  constructor(exitCode, message) { super(message); this.exitCode = exitCode; }
+}
 
 if (!SL_URL)  abort(1, 'SAP_SL_URL is empty');
 if (!SL_USER) abort(1, 'SAP_SL_USERNAME is empty');
@@ -160,29 +172,67 @@ async function fetchCompanyInfo(cookie) {
   try { info = JSON.parse(res.body); } catch {}
   log(`  HTTP 200, CompanyDB=${info.CompanyDB || '(unknown)'}, CompanyName=${info.CompanyName || '(unknown)'}`);
   if (info.CompanyDB && info.CompanyDB !== DB_A) {
-    abort(2, `Connected DB '${info.CompanyDB}' does not match expected '${DB_A}' — refusing to proceed.`);
+    throw new DiscoverError(2, `Connected DB '${info.CompanyDB}' does not match expected '${DB_A}' — refusing to proceed.`);
   }
   return info;
 }
 
 async function fetchOpenOrders(cookie) {
   log(`STEP 3: GET /Orders (open, top ${TOP})`);
-  // Pull only the fields we need + a few lines per order so the seed can
-  // build BaseEntry/BaseLine references without a second round-trip.
   const select = 'DocEntry,DocNum,CardCode,CardName,DocDate,DocTotal,DocumentStatus';
-  const expand = 'DocumentLines($select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,UnitPrice)';
   const filter = `DocumentStatus eq 'bost_Open'`;
-  const url = `/Orders?$filter=${encodeURIComponent(filter)}&$top=${TOP}&$select=${select}&$expand=${encodeURIComponent(expand)}`;
-  const res = await request('GET', url, null, cookie);
+  // Tiered query strategy — SL versions differ in OData feature support.
+  // Tier 1: nested $expand($select=…) — preferred, fewest round-trips
+  // Tier 2: plain $expand=DocumentLines — works on older SL
+  // Tier 3: header-only (no $expand) + per-order Orders(N)?$expand=DocumentLines
+  //         — last resort if even plain $expand is broken
+  const expandNested = 'DocumentLines($select=LineNum,ItemCode,ItemDescription,Quantity,OpenQuantity,UnitPrice)';
+  const tier1Url = `/Orders?$filter=${encodeURIComponent(filter)}&$top=${TOP}&$select=${select}&$expand=${encodeURIComponent(expandNested)}`;
+  let res = await request('GET', tier1Url, null, cookie);
+  let tier = 1;
+
+  if (res.status === 400 && /invalid expand|nested|not supported/i.test(res.body)) {
+    log('  WARN: tier-1 nested $expand($select) rejected by SL. Retrying with plain $expand=DocumentLines (tier 2).');
+    const tier2Url = `/Orders?$filter=${encodeURIComponent(filter)}&$top=${TOP}&$select=${select}&$expand=DocumentLines`;
+    res = await request('GET', tier2Url, null, cookie);
+    tier = 2;
+  }
+
+  if (res.status === 400 && /invalid expand|not supported/i.test(res.body)) {
+    log('  WARN: tier-2 plain $expand also rejected. Falling back to header-only + per-order line fetch (tier 3).');
+    const tier3Url = `/Orders?$filter=${encodeURIComponent(filter)}&$top=${TOP}&$select=${select}`;
+    res = await request('GET', tier3Url, null, cookie);
+    tier = 3;
+  }
+
   if (res.status !== 200) {
-    abort(3, `GET /Orders failed: HTTP ${res.status}. Body: ${res.body.slice(0, 500)}`);
+    throw new DiscoverError(3, `GET /Orders failed (tier ${tier}): HTTP ${res.status}. Body: ${res.body.slice(0, 500)}`);
   }
   let data = {};
   try { data = JSON.parse(res.body); } catch (e) {
-    abort(3, `Failed to parse Orders response: ${e.message}. Body: ${res.body.slice(0, 200)}`);
+    throw new DiscoverError(3, `Failed to parse Orders response: ${e.message}. Body: ${res.body.slice(0, 200)}`);
   }
   const orders = Array.isArray(data.value) ? data.value : [];
-  log(`  HTTP 200, returned ${orders.length} orders (out of an unknown total)`);
+  log(`  HTTP 200 (tier ${tier}), returned ${orders.length} orders`);
+
+  // Tier-3 fallback: header-only response — fetch lines per order in series.
+  // This is slow but ensures the seed gets the structure it needs.
+  if (tier === 3 && orders.length > 0) {
+    log(`  tier 3: fetching DocumentLines for ${orders.length} orders (per-order)`);
+    for (const o of orders) {
+      const lineRes = await request('GET', `/Orders(${o.DocEntry})?$select=DocumentLines&$expand=DocumentLines`, null, cookie);
+      if (lineRes.status === 200) {
+        try {
+          const lineData = JSON.parse(lineRes.body);
+          o.DocumentLines = lineData.DocumentLines || [];
+        } catch { o.DocumentLines = []; }
+      } else {
+        log(`    WARN: lines for DocEntry=${o.DocEntry} returned HTTP ${lineRes.status} — leaving empty`);
+        o.DocumentLines = [];
+      }
+    }
+  }
+
   return orders;
 }
 
@@ -197,14 +247,16 @@ async function logout(cookie) {
 // Main
 // ---------------------------------------------------------------------------
 (async () => {
+  let cookie = null;
+  let exitCode = 0;
+  let jsonPayload = null;
   try {
-    const cookie = await login();
+    cookie = await login();
     const companyInfo = await fetchCompanyInfo(cookie);
     const orders = await fetchOpenOrders(cookie);
-    await logout(cookie);
 
     if (JSON_OUTPUT) {
-      console.log(JSON.stringify({
+      jsonPayload = {
         ok: true,
         connectedDb: companyInfo?.CompanyDB || DB_A,
         envDb: DB_A,
@@ -228,34 +280,46 @@ async function logout(cookie) {
             UnitPrice: ln.UnitPrice,
           })),
         })),
-      }, null, 2));
-      return;
+      };
+    } else {
+      log('==============================================================');
+      log(`SUMMARY — found ${orders.length} OPEN sales orders in ${DB_A}`);
+      log('==============================================================');
+      if (orders.length === 0) {
+        log('  (no open orders — test DB may be empty; ask SAP admin to create 1-2 test orders)');
+      } else {
+        const examples = orders.slice(0, 3);
+        log(`Examples (first ${examples.length}):`);
+        for (const o of examples) {
+          const lineSummary = (o.DocumentLines || [])
+            .slice(0, 3)
+            .map((ln) => `${ln.ItemCode}×${ln.OpenQuantity || ln.Quantity}`)
+            .join(', ');
+          log(`  DocEntry=${o.DocEntry} DocNum=${o.DocNum} CardCode=${o.CardCode} CardName='${(o.CardName || '').slice(0, 40)}' Total=${o.DocTotal} Lines=${(o.DocumentLines || []).length} [${lineSummary}${(o.DocumentLines || []).length > 3 ? ', ...' : ''}]`);
+        }
+        log('==============================================================');
+        log('Discovery complete. NO documents were created in SAP. NO local store changes.');
+        log('Next step (NOT executed by this script): seed-qc-ready-run.js --use-real-sap-orders');
+        log('to seed a QC-ready test run that references real SAP orders.');
+      }
     }
-
-    log('==============================================================');
-    log(`SUMMARY — found ${orders.length} OPEN sales orders in ${DB_A}`);
-    log('==============================================================');
-    if (orders.length === 0) {
-      log('  (no open orders — test DB may be empty; ask SAP admin to create 1-2 test orders)');
-      return;
-    }
-    const examples = orders.slice(0, 3);
-    log(`Examples (first ${examples.length}):`);
-    for (const o of examples) {
-      const lineSummary = (o.DocumentLines || [])
-        .slice(0, 3)
-        .map((ln) => `${ln.ItemCode}×${ln.OpenQuantity || ln.Quantity}`)
-        .join(', ');
-      log(`  DocEntry=${o.DocEntry} DocNum=${o.DocNum} CardCode=${o.CardCode} CardName='${(o.CardName || '').slice(0, 40)}' Total=${o.DocTotal} Lines=${(o.DocumentLines || []).length} [${lineSummary}${(o.DocumentLines || []).length > 3 ? ', ...' : ''}]`);
-    }
-    log('==============================================================');
-    log('Discovery complete. NO documents were created in SAP. NO local store changes.');
-    log('Next step (NOT executed by this script): A2c-3 will use these DocEntries');
-    log('to seed a QC-ready test run that references real SAP orders.');
   } catch (e) {
     // Print only the error message — no stack trace, in case the trace
     // happens to capture the request body (which contains the password).
     err(`Discovery failed: ${e.message}`);
-    process.exit(3);
+    exitCode = e instanceof DiscoverError ? e.exitCode : 1;
+  } finally {
+    // ALWAYS release the SL session if we got one — prevents leaked sessions
+    // when a downstream step throws.
+    if (cookie) {
+      try { await logout(cookie); }
+      catch (logoutErr) { err(`Logout-on-exit failed: ${logoutErr.message} (session will time out on its own)`); }
+    }
+    // Emit JSON LAST so the file is only written on success. On error path
+    // stdout stays empty, errors are on stderr.
+    if (JSON_OUTPUT && jsonPayload) {
+      console.log(JSON.stringify(jsonPayload, null, 2));
+    }
+    if (exitCode) process.exit(exitCode);
   }
 })();
