@@ -430,6 +430,26 @@ app.delete('/api/pickers/:id', adminOnly, (req, res) => {
   res.json({ ok: true });
 });
 
+// Picker Task Inbox (2026-05-22): the per-picker queue for the upcoming
+// /picker/tasks page. Returns only PENDING/IN_PROGRESS/PENDING_QC waves
+// assigned to this picker, with denormalised zone + line aggregates so
+// the page can render cards in one round-trip. Auth: requireAuthBasic
+// only — covered by the WAVE_A gate on /api/pickers below. MVP doesn't
+// scope it to the picker's own id; when PIN-login adoption grows, a
+// sibling /api/picker/me/waves can derive pickerId from the JWT instead.
+app.get('/api/pickers/:pickerId/assigned-waves', (req, res) => {
+  const raw = req.params.pickerId;
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) {
+    return res.status(400).json({ error: 'invalid pickerId', code: 'INVALID_PICKER' });
+  }
+  const waves = store.listAssignedWavesForPicker(id);
+  if (waves === null) {
+    return res.status(404).json({ error: 'מלקט לא נמצא או לא פעיל', code: 'PICKER_NOT_FOUND' });
+  }
+  res.json({ pickerId: id, waves });
+});
+
 // Per-zone-picker-assignment (2026-05-21): list of USER accounts that may
 // be chosen as the picker for a run in the SendToPicking modal. Distinct
 // from /api/pickers above (warehouse handhelds), and intentionally at a

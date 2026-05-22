@@ -2430,6 +2430,90 @@ export function listWaves({ status = null, runDate = null } = {}) {
   return waves.sort((a, b) => b.WaveId - a.WaveId);
 }
 
+// Picker Task Inbox (2026-05-22): the per-picker view of "what should I
+// pick now?". Backs GET /api/pickers/:pickerId/assigned-waves and the
+// upcoming /picker/tasks page. Returns null when the picker doesn't
+// exist or isn't active, so the HTTP layer can map that to a clean 404.
+//
+// Filters applied:
+//   - AssignedPickerId matches the requested picker
+//   - Wave Status is one of PENDING / IN_PROGRESS / PENDING_QC
+//     (CANCELLED / COMPLETED are deliberately excluded — those don't
+//     belong in an inbox)
+//   - The parent Run is not CANCELLED (an assigned wave with a cancelled
+//     run would create UI clutter that takes the picker nowhere)
+//
+// Each row is denormalised with Run zone fields + WaveLine aggregates so
+// the page can render a card without a second round-trip per wave.
+const ACTIVE_INBOX_STATUSES = new Set(['PENDING', 'IN_PROGRESS', 'PENDING_QC']);
+const SORT_PRIORITY = { IN_PROGRESS: 0, PENDING_QC: 1, PENDING: 2 };
+
+export function listAssignedWavesForPicker(pickerId) {
+  const id = Number(pickerId);
+  if (!Number.isInteger(id)) return null;
+  const s = ensureWavesStore();
+  const picker = (s.pickers || []).find((p) => p.PickerId === id);
+  if (!picker || picker.IsActive !== true) return null;
+
+  const runsById = new Map((s.runs || []).map((r) => [r.RunId, r]));
+  const stopsByRunId = new Map();
+  for (const stop of (s.stops || [])) {
+    if (!stopsByRunId.has(stop.RunId)) stopsByRunId.set(stop.RunId, []);
+    stopsByRunId.get(stop.RunId).push(stop);
+  }
+
+  const rows = [];
+  for (const w of (s.waves || [])) {
+    if (w.AssignedPickerId !== id) continue;
+    if (!ACTIVE_INBOX_STATUSES.has(w.Status)) continue;
+
+    const run = runsById.get(w.RunId);
+    // Drop waves whose run is gone or cancelled — see header comment.
+    if (!run || run.Status === 'CANCELLED') continue;
+
+    const stops = stopsByRunId.get(w.RunId) || [];
+    const stopIds = new Set(stops.map((st) => st.StopId));
+    const orderCount = (s.runOrders || []).filter(
+      (o) => stopIds.has(o.StopId) && o.Status !== 'CANCELLED'
+    ).length;
+
+    const lines = (s.waveLines || []).filter((wl) => wl.WaveId === w.WaveId);
+    const completedLineCount = lines.filter((wl) => wl.Status === 'COMPLETED').length;
+    const shortageCount      = lines.filter((wl) => wl.Status === 'SHORTAGE').length;
+
+    rows.push({
+      waveId:             w.WaveId,
+      waveNumber:         w.WaveNumber,
+      runId:              w.RunId,
+      runNumber:          w.RunNumber,
+      runDate:            w.RunDate,
+      zoneCode:           run.ZoneCode || null,
+      zoneName:           run.ZoneName || null,
+      zoneColor:          run.ZoneColor || null,
+      status:             w.Status,
+      assignedPickerId:   w.AssignedPickerId,
+      assignedPickerName: w.AssignedPickerName,
+      assignedAt:         w.AssignedAt,
+      orderCount,
+      lineCount:          lines.length,
+      completedLineCount,
+      shortageCount,
+      createdAt:          w.CreatedAt,
+      startedAt:          w.StartedAt,
+    });
+  }
+
+  // Sort: active waves first (IN_PROGRESS → PENDING_QC → PENDING),
+  // then newest-first within each status. Lets the picker see what's
+  // urgent at the top of the list.
+  return rows.sort((a, b) => {
+    const pa = SORT_PRIORITY[a.status] ?? 99;
+    const pb = SORT_PRIORITY[b.status] ?? 99;
+    if (pa !== pb) return pa - pb;
+    return b.waveId - a.waveId;
+  });
+}
+
 /**
  * Duplicate a run - creates a new run with the same stops + addresses
  * on a new date. Does NOT copy the SAP orders (those are one-time per order).
