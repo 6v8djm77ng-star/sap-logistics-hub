@@ -28,8 +28,21 @@ export default function PickerAutoLoginPage() {
           token: data.token,
         });
         setPicker(data.picker);
+        // Picker Task Inbox (2026-05-22): pre-seed the picker selector on
+        // /picker/tasks so the handheld lands on this picker's own queue
+        // without the operator picking themself from a dropdown. Uses the
+        // same key PickerTasksPage reads on mount; the page also prunes
+        // the value if the picker is no longer active, so this is safe.
+        if (data.picker?.id != null) {
+          try {
+            localStorage.setItem('picker.tasks.selectedPickerId.v1', String(data.picker.id));
+          } catch {}
+        }
         setStatus('ok');
-        setTimeout(() => navigate('/warehouse', { replace: true }), 1500);
+        // Redirect to the per-picker inbox instead of the manager-wide
+        // /warehouse dashboard. The inbox keeps the picker focused on
+        // exactly the waves assigned to them via SendToPickingModal.
+        setTimeout(() => navigate('/picker/tasks', { replace: true }), 1500);
       } catch (err) {
         setError(err.response?.data?.error || err.message || 'שגיאה לא ידועה');
         setStatus('error');
