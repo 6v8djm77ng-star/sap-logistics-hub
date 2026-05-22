@@ -2758,12 +2758,14 @@ app.post(
 // Create a new picking wave - pulls real SAP order lines + aggregates.
 //
 // Per-zone-picker-assignment (2026-05-21): accepts an optional body
-//   { assignedPickerId: <UserId> }
-// to record which user the planner picked for this zone/run in the
-// SendToPicking modal. The id must point to an active pickable user
-// (role ∈ WAREHOUSE/ADMIN/PLANNER) — invalid ids return 400 INVALID_PICKER
-// and no wave is created. Omitting the field keeps the legacy path
-// (unassigned wave, exactly as before this feature).
+//   { assignedPickerId: <PickerId> }
+// to record which picker the planner chose for this zone/run in the
+// SendToPicking modal. The id is a PickerId from store.pickers (the
+// warehouse-handheld entity surfaced via /api/pickers + PickersPage),
+// NOT a UserId — corrected in 2026-05-22, see commit bba4441. The id
+// must point to an active picker; invalid / inactive / missing ids
+// return 400 INVALID_PICKER and no wave is created. Omitting the field
+// keeps the legacy path (unassigned wave, exactly as before the feature).
 //
 // Reused-run case: if a wave already exists on this run in IN_PROGRESS or
 // PENDING_QC, createWaveFromLines throws WAVE_IN_PROGRESS — we surface that
