@@ -433,11 +433,19 @@ app.delete('/api/pickers/:id', adminOnly, (req, res) => {
 // Picker Task Inbox (2026-05-22): the per-picker queue for the upcoming
 // /picker/tasks page. Returns only PENDING/IN_PROGRESS/PENDING_QC waves
 // assigned to this picker, with denormalised zone + line aggregates so
-// the page can render cards in one round-trip. Auth: requireAuthBasic
-// only — covered by the WAVE_A gate on /api/pickers below. MVP doesn't
-// scope it to the picker's own id; when PIN-login adoption grows, a
-// sibling /api/picker/me/waves can derive pickerId from the JWT instead.
-app.get('/api/pickers/:pickerId/assigned-waves', (req, res) => {
+// the page can render cards in one round-trip. MVP doesn't scope it to
+// the picker's own id; when PIN-login adoption grows, a sibling
+// /api/picker/me/waves can derive pickerId from the JWT instead.
+//
+// Auth note (2026-05-23): inline requireAuthBasic is REQUIRED here.
+// The route is registered ~340 lines before the global
+// app.use('/api/pickers', requireAuthBasic) inside WAVE_A_SENSITIVE_
+// PREFIXES — Express middleware applies only to routes registered
+// AFTER it, so without the inline gate this endpoint leaked picker
+// waves to anyone with the URL. Caught by the external audit on
+// commit 36e13d4. Every other /api/pickers/* handler registered
+// before that gate already had an inline adminOnly or requireAuthBasic.
+app.get('/api/pickers/:pickerId/assigned-waves', requireAuthBasic, (req, res) => {
   const raw = req.params.pickerId;
   const id = Number(raw);
   if (!Number.isInteger(id) || id <= 0) {
