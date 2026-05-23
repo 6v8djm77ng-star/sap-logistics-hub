@@ -58,10 +58,14 @@ export default function MobileLinkDialog({ onClose }) {
       className="fixed inset-0 z-50 bg-black/50 overflow-y-auto p-4"
       onClick={onClose}
     >
-      {/* min-h-full + flex centering keeps the dialog vertically centered
+      {/* min-h-screen + flex centering keeps the dialog vertically centered
           when content fits, and lets it stack from top with margin when it
-          doesn't — no more clipped QR codes / headers. */}
-      <div className="min-h-full flex items-center justify-center">
+          doesn't — no more clipped QR codes / headers. min-h-screen (not
+          min-h-full) because the parent is `fixed inset-0` without an
+          explicit height; `min-h-full` then resolves to 0 on some browsers,
+          collapsing the centering and leaving the card pinned to the top
+          of the viewport (looks like the dashboard was "cut off"). */}
+      <div className="min-h-screen flex items-center justify-center">
         <div
           className="bg-white rounded-2xl max-w-md w-full max-h-[calc(100vh-2rem)] shadow-2xl flex flex-col my-auto"
           onClick={(e) => e.stopPropagation()}
