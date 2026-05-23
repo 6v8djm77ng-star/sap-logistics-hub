@@ -450,15 +450,22 @@ app.get('/api/pickers/:pickerId/assigned-waves', (req, res) => {
   res.json({ pickerId: id, waves });
 });
 
-// Per-zone-picker-assignment (2026-05-21): list of USER accounts that may
-// be chosen as the picker for a run in the SendToPicking modal. Distinct
-// from /api/pickers above (warehouse handhelds), and intentionally at a
-// different path so PickersPage keeps working untouched. Gated to
-// ADMIN+PLANNER since only they open the SendToPicking modal — pickers
-// themselves shouldn't be assigning runs.
+// Per-zone-picker-assignment (2026-05-21): list of pickers available for
+// assignment in the SendToPicking modal. Distinct from /api/pickers above
+// (warehouse handhelds), and intentionally at a different path so
+// PickersPage keeps working untouched. Source is now store.pickers (see
+// bba4441) — the response carries PickerId in the userId field.
+//
+// Role gate widened on 2026-05-22 to include WAREHOUSE: PickerTasksPage
+// (the /picker/tasks inbox a picker opens on their handheld) renders
+// the same dropdown so the picker can confirm who they are and switch
+// if needed. With a WAREHOUSE picker-login token, that page was 403'ing
+// and the dropdown stayed empty — see smoke run on f5fd22b. ADMIN and
+// PLANNER remain allowed for the SendToPicking modal use-case.
+const PICKABLE_USERS_ROLES = new Set(['ADMIN', 'PLANNER', 'WAREHOUSE']);
 app.get('/api/pickable-users', requireAuthBasic, (req, res) => {
-  if (req.user.role !== 'ADMIN' && req.user.role !== 'PLANNER') {
-    return res.status(403).json({ error: 'ADMIN or PLANNER role required' });
+  if (!PICKABLE_USERS_ROLES.has(req.user.role)) {
+    return res.status(403).json({ error: 'ADMIN, PLANNER or WAREHOUSE role required' });
   }
   res.json({ pickers: store.getPickableUsers() });
 });
