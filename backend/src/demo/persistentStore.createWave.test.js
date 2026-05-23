@@ -24,6 +24,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   load,
+  save,
   createWaveFromLines,
   getPickableUsers,
   isPickableUser,
@@ -33,7 +34,40 @@ import {
 // The cache mutations of this test must be local to the test. We capture
 // the arrays we touch before each test, seed test fixtures, and restore on
 // finish — even if the test throws.
+// Pre-purge fixtures that previous broken runs of this suite leaked into
+// store.json on disk. Without this, every test repeats the seed but the
+// snapshot/restore couldn't undo the pre-existing fixture rows (Run 90500,
+// Wave 99003, ...) — they accumulated, ~one duplicate per full suite run.
+// Test-pollution fix (2026-05-23): run once at first snapshot() call,
+// flush cleaned cache to disk via save() so this file (and the next test
+// file) inherit a clean baseline. The IDs we own here all live at
+// >=80000 (run/stop/runOrder) and >=99000 (wave) per seedFixture/
+// seedRunAndLines below.
+let _purgedOnce = false;
+function purgeTestFixtures() {
+  if (_purgedOnce) return;
+  _purgedOnce = true;
+  const s = load();
+  const before = {
+    runs: (s.runs||[]).length, waves: (s.waves||[]).length,
+    stops: (s.stops||[]).length, runOrders: (s.runOrders||[]).length,
+  };
+  s.runs      = (s.runs      || []).filter((r)  => r.RunId      < 80000);
+  s.waves     = (s.waves     || []).filter((w)  => w.WaveId     < 80000);
+  s.stops     = (s.stops     || []).filter((st) => st.StopId    < 80000);
+  s.runOrders = (s.runOrders || []).filter((o)  => o.RunOrderId < 80000);
+  const after = {
+    runs: s.runs.length, waves: s.waves.length,
+    stops: s.stops.length, runOrders: s.runOrders.length,
+  };
+  if (before.runs !== after.runs || before.waves !== after.waves ||
+      before.stops !== after.stops || before.runOrders !== after.runOrders) {
+    save();
+  }
+}
+
 function snapshot() {
+  purgeTestFixtures();
   const s = load();
   return {
     runs:            structuredClone(s.runs || []),
@@ -66,6 +100,13 @@ function restore(snap) {
   s.nextWaveId      = snap.nextWaveId;
   s.nextWaveLineId  = snap.nextWaveLineId;
   s.nextAllocId     = snap.nextAllocId;
+  // Test-pollution fix (2026-05-23): createWaveFromLines calls save()
+  // mid-test, so the on-disk store.json picks up the fixture inserts
+  // (Run 90100/90200/..., Wave 99001/..., etc). Reverting the in-memory
+  // cache alone leaves those rows orphaned on disk forever; rerunning
+  // the suite multiplies them. Calling save() here flushes the restored
+  // cache so disk and memory match.
+  save();
 }
 
 // Minimal "real" SAP-line shape required by the byItem aggregation loop.

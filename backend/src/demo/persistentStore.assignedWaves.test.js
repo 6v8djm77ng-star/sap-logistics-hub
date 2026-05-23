@@ -19,9 +19,45 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { load, listAssignedWavesForPicker } from './persistentStore.js';
+import { load, save, listAssignedWavesForPicker } from './persistentStore.js';
+
+// Test-pollution fix (2026-05-23): purge fixtures that leaked into
+// store.json from previous broken runs (Run/Stop/RunOrder >=80000,
+// Wave >=80000, Picker >=8000) before the first snapshot. Restore()
+// below already calls save() to prevent new leaks, but pre-existing
+// rows would otherwise persist forever.
+let _purgedOnce = false;
+function purgeTestFixtures() {
+  if (_purgedOnce) return;
+  _purgedOnce = true;
+  const s = load();
+  const before = {
+    runs: (s.runs||[]).length, waves: (s.waves||[]).length,
+    stops: (s.stops||[]).length, runOrders: (s.runOrders||[]).length,
+    pickers: (s.pickers||[]).length,
+  };
+  s.runs      = (s.runs      || []).filter((r)  => r.RunId      < 80000);
+  s.waves     = (s.waves     || []).filter((w)  => w.WaveId     < 80000);
+  s.stops     = (s.stops     || []).filter((st) => st.StopId    < 80000);
+  s.runOrders = (s.runOrders || []).filter((o)  => o.RunOrderId < 80000);
+  s.pickers   = (s.pickers   || []).filter((p)  => p.PickerId   < 8000);
+  s.waveLines = (s.waveLines || []).filter((wl) => wl.WaveLineId < 99000);
+  const after = {
+    runs: s.runs.length, waves: s.waves.length,
+    stops: s.stops.length, runOrders: s.runOrders.length,
+    pickers: s.pickers.length,
+  };
+  if (before.runs      !== after.runs   ||
+      before.waves     !== after.waves  ||
+      before.stops     !== after.stops  ||
+      before.runOrders !== after.runOrders ||
+      before.pickers   !== after.pickers) {
+    save();
+  }
+}
 
 function snapshot() {
+  purgeTestFixtures();
   const s = load();
   return {
     runs:        structuredClone(s.runs || []),
@@ -40,6 +76,12 @@ function restore(snap) {
   s.stops     = snap.stops;
   s.runOrders = snap.runOrders;
   s.pickers   = snap.pickers;
+  // Test-pollution fix (2026-05-23): mid-test save() calls inside
+  // persistentStore mutators leak fixtures (Pickers 800x, Runs 80100..,
+  // Waves 80501..) onto store.json on disk. Reverting the in-memory
+  // cache alone leaves those rows orphaned; flushing the restored
+  // cache here keeps disk and memory in sync.
+  save();
 }
 
 // Seed minimal fixture: 2 pickers, 1 inactive; 4 waves across 3 runs.
