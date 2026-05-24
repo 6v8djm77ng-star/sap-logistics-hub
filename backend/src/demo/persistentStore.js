@@ -3600,14 +3600,43 @@ export function markDocsExported(docIds, type = 'deliveryNote') {
   save();
 }
 
+// Minimum plausible SAP DocEntry. Real SAP TEST_OIG values seen in this
+// environment: DN starts ~42000, OINV ~77000-86000. Any "real" SAP install
+// also crosses 100 within hours of setup. Values < 100 are practically
+// guaranteed to be operator-typed placeholders (1, 2, 3 etc. — we already
+// have 3 such records in store: DN-40, DN-83, DN-84). Make the floor
+// CONFIRM_SAP_MIN_DOCENTRY so a fresh test fixture can override it.
+export const CONFIRM_SAP_MIN_DOCENTRY = 100;
+
 export function confirmSapDocument(docId, type, sapDocEntry, sapDocNum) {
+  // 2026-05-24 safeguard: reject placeholder/typo DocEntries that produced
+  // 3 fake SAP_CONFIRMED records in our store. Returns a structured error
+  // object (not an exception, not null) so the route can map to HTTP 400
+  // distinctly from "document not found" (null → 404).
+  const numEntry = Number(sapDocEntry);
+  if (!Number.isInteger(numEntry) || numEntry < CONFIRM_SAP_MIN_DOCENTRY) {
+    return {
+      error: 'INVALID_SAP_DOC_ENTRY',
+      message: `sapDocEntry must be an integer ≥ ${CONFIRM_SAP_MIN_DOCENTRY} (got ${JSON.stringify(sapDocEntry)}). Real SAP DocEntries are 4-5+ digits; values below the floor are placeholders.`,
+      provided: { sapDocEntry, sapDocNum },
+      floor: CONFIRM_SAP_MIN_DOCENTRY,
+    };
+  }
+  const numDocNum = Number(sapDocNum);
+  if (!Number.isInteger(numDocNum) || numDocNum <= 0) {
+    return {
+      error: 'INVALID_SAP_DOC_NUM',
+      message: `sapDocNum must be a positive integer (got ${JSON.stringify(sapDocNum)}).`,
+      provided: { sapDocEntry, sapDocNum },
+    };
+  }
   const s = ensureDocsStore();
   if (type === 'deliveryNote') {
     const dn = s.deliveryNotes.find((d) => d.DeliveryNoteId === Number(docId));
     if (!dn) return null;
     dn.Status = 'SAP_CONFIRMED';
-    dn.SapDeliveryDocEntry = sapDocEntry;
-    dn.SapDeliveryDocNum = sapDocNum;
+    dn.SapDeliveryDocEntry = numEntry;
+    dn.SapDeliveryDocNum = numDocNum;
     dn.ConfirmedAt = new Date().toISOString();
     save();
     return dn;
@@ -3615,8 +3644,8 @@ export function confirmSapDocument(docId, type, sapDocEntry, sapDocNum) {
     const inv = s.invoices.find((d) => d.InvoiceId === Number(docId));
     if (!inv) return null;
     inv.Status = 'SAP_CONFIRMED';
-    inv.SapInvoiceDocEntry = sapDocEntry;
-    inv.SapInvoiceDocNum = sapDocNum;
+    inv.SapInvoiceDocEntry = numEntry;
+    inv.SapInvoiceDocNum = numDocNum;
     inv.ConfirmedAt = new Date().toISOString();
     save();
     return inv;
