@@ -2401,7 +2401,21 @@ app.get('/api/orders/open-with-plan-eval', async (req, res) => {
         todayHebrew,
         filters,
       });
-      return { ...o, planEval };
+      // Open-orders zone toolbar (2026-05-24): mirror the city→zone
+      // enrichment from /api/orders/open so the frontend toolbar works
+      // identically whether plan-eval is on or off. CITY-derived; ignores
+      // any profile.Zone the customer happens to carry.
+      const addressParts = (o.ShipToAddress || '')
+        .split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
+      const city = addressParts[addressParts.length - 1] || o.CustCity || '';
+      const zone = city ? store.suggestZoneForCity(city) : null;
+      return {
+        ...o,
+        planEval,
+        Zone:      zone?.Code     || null,
+        ZoneName:  zone?.Name     || null,
+        ZoneColor: zone?.ColorHex || zone?.Color || null,
+      };
     });
 
     const passing = ordersWithEval.filter((x) => x.planEval.passes).length;
@@ -3056,17 +3070,31 @@ app.get('/api/orders/open', async (req, res) => {
       //   - profileIssue      → reason if the profile is incomplete in SAP
       // Filtering by zone/day is up to the caller (?zone=, ?day=) and applied
       // after enrichment so unmatched orders still surface.
+      //
+      // Open-orders zone toolbar (2026-05-24): also add Zone/ZoneName/
+      // ZoneColor derived from the city via store.suggestZoneForCity (the
+      // same cityToZone map auto-plan + send-to-picking use). This is the
+      // CITY-derived zone, distinct from `suggestedZone` (profile-derived)
+      // which the customer's admin set explicitly. Either may be null when
+      // the city has no mapping; the frontend toolbar uses Zone.
       const enriched = orders.map((o) => {
         const cardCode = String(o.CardCode || '').trim();
         const companyCode = (o.CompanyCode || o.Company || '').toString();
         const companyKey = companyCode === 'A' ? 'OIG' : companyCode === 'B' ? 'UNICO' : null;
         const profile = cardCode ? store.getCustomerProfile(cardCode, companyKey) : null;
+        const addressParts = (o.ShipToAddress || '')
+          .split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
+        const city = addressParts[addressParts.length - 1] || o.CustCity || '';
+        const zone = city ? store.suggestZoneForCity(city) : null;
         return {
           ...o,
           suggestedZone:    profile?.Zone || '',
           suggestedSubZone: profile?.SubZone || '',
           scheduledDays:    profile?.DeliveryDays || [],
           profileIssue:     profile?.Issue || (profile ? '' : 'no_profile'),
+          Zone:      zone?.Code     || null,
+          ZoneName:  zone?.Name     || null,
+          ZoneColor: zone?.ColorHex || zone?.Color || null,
         };
       });
       let out = enriched;
@@ -3691,6 +3719,11 @@ app.post('/api/documents/:type/:id/confirm-sap', (req, res) => {
   const { sapDocEntry, sapDocNum } = req.body;
   const result = store.confirmSapDocument(req.params.id, req.params.type, sapDocEntry, sapDocNum);
   if (!result) return res.status(404).json({ error: 'Document not found' });
+  // 2026-05-24: confirmSapDocument now returns { error, ... } on placeholder
+  // DocEntry/DocNum (sapDocEntry < CONFIRM_SAP_MIN_DOCENTRY etc.) — map to 400
+  // so the UI can show "this looks like a typo / placeholder" instead of
+  // silently storing yet another fake SAP_CONFIRMED row.
+  if (result.error) return res.status(400).json(result);
   res.json(result);
 });
 

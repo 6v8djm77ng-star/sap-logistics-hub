@@ -9,12 +9,12 @@
  * a Run. Toggle + filters persist to localStorage. The legacy
  * /api/orders/open path stays the default when the toggle is OFF.
  */
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
-import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, CalendarDays } from 'lucide-react';
+import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, CalendarDays, MapPin } from 'lucide-react';
 import SendToPickingModal from '../components/SendToPickingModal.jsx';
 
 // Hebrew weekday names indexed by Date.getDay() (0=Sunday). Matches the
@@ -64,6 +64,32 @@ function loadPlanEvalCfg() {
 }
 function savePlanEvalCfg(cfg) {
   try { localStorage.setItem(PLAN_EVAL_STORAGE_KEY, JSON.stringify(cfg)); } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Zone toolbar (2026-05-24): chip-multiselect that filters the open-orders
+// table by the city-derived `Zone` field added in 6a1dff7. Selection
+// persists across reloads so the operator's day-to-day focus (e.g. only
+// SHARON + CENTER_NEAR) doesn't reset on refetch.
+// ---------------------------------------------------------------------------
+const ZONE_FILTER_STORAGE_KEY = 'openOrders.selectedZones.v1';
+// Sentinel for orders whose city couldn't be mapped (Zone === null on the
+// row). Keeping it as a Set member alongside real zone codes is simpler
+// than carrying a separate boolean.
+const NO_ZONE_KEY = '__NO_ZONE__';
+function loadSelectedZones() {
+  try {
+    const raw = localStorage.getItem(ZONE_FILTER_STORAGE_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
+  } catch { return new Set(); }
+}
+function saveSelectedZones(set) {
+  try { localStorage.setItem(ZONE_FILTER_STORAGE_KEY, JSON.stringify([...set])); } catch {}
+}
+function zoneKeyOf(order) {
+  return order.Zone || NO_ZONE_KEY;
 }
 
 // Decompose planEval flags into a list of {label, detail} pairs — one entry
@@ -339,6 +365,26 @@ export default function OpenOrdersPage() {
   const [selectedDay, setSelectedDay] = useState(defaultDayKey);
   const todayLabel = HEBREW_WEEKDAYS[todayDayIdx];
 
+  // Zone filter — Set of zone codes (or NO_ZONE_KEY sentinel). Empty Set
+  // = no filter (show all). Persisted to localStorage so refresh keeps
+  // the operator's focus.
+  const [selectedZones, setSelectedZones] = useState(loadSelectedZones);
+  const toggleZone = (zoneKey) => {
+    setSelectedZones((prev) => {
+      const next = new Set(prev);
+      if (next.has(zoneKey)) next.delete(zoneKey); else next.add(zoneKey);
+      saveSelectedZones(next);
+      return next;
+    });
+  };
+  const clearZoneFilter = () => {
+    setSelectedZones(() => {
+      const empty = new Set();
+      saveSelectedZones(empty);
+      return empty;
+    });
+  };
+
   // Customer delivery profiles (1,500+ rows, ~1 MB). Used to join orders
   // to their customer's DeliveryDays array. Cached for 5 min so flipping
   // day tabs does not refetch.
@@ -447,9 +493,60 @@ export default function OpenOrdersPage() {
       })
     : dayFilteredRaw;
 
+  // Zone aggregation BEFORE the zone-filter step so the chip counts
+  // reflect "how many orders in each zone exist within the current
+  // day+company+search context" — not "after my own zone-filter is
+  // applied". Otherwise picking SHARON would make every other chip
+  // show 0, which is useless to the operator.
+  const zoneAggregates = useMemo(() => {
+    const m = new Map(); // key → { label, color, count }
+    for (const o of filteredRawOrders) {
+      const key = zoneKeyOf(o);
+      const cur = m.get(key);
+      if (cur) {
+        cur.count += 1;
+      } else {
+        m.set(key, {
+          label: key === NO_ZONE_KEY ? 'ללא אזור' : (o.ZoneName || o.Zone || key),
+          color: key === NO_ZONE_KEY ? null : (o.ZoneColor || null),
+          count: 1,
+        });
+      }
+    }
+    // Stable order: by count desc, then by label.
+    return [...m.entries()]
+      .map(([key, v]) => ({ key, ...v }))
+      .sort((a, b) => (b.count - a.count) || String(a.label).localeCompare(String(b.label), 'he'));
+  }, [filteredRawOrders]);
+
+  // Prune any stored zone keys that are no longer present in the current
+  // dataset (e.g. the operator saved CENTER_FAR yesterday but today no
+  // CENTER_FAR orders are open). One-shot, on each aggregates change.
+  useEffect(() => {
+    if (selectedZones.size === 0) return;
+    const present = new Set(zoneAggregates.map((z) => z.key));
+    let removed = false;
+    const next = new Set();
+    for (const z of selectedZones) {
+      if (present.has(z)) next.add(z); else removed = true;
+    }
+    if (removed) {
+      setSelectedZones(next);
+      saveSelectedZones(next);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zoneAggregates]);
+
+  // Zone-filtered set used downstream for sort + table. Empty selection
+  // means "show all". Selection of N zones means "show orders whose
+  // zoneKeyOf is in the set".
+  const zoneFilteredOrders = selectedZones.size === 0
+    ? filteredRawOrders
+    : filteredRawOrders.filter((o) => selectedZones.has(zoneKeyOf(o)));
+
   // Apply client-side sort.
   const orders = (() => {
-    const arr = [...filteredRawOrders];
+    const arr = [...zoneFilteredOrders];
     const cityOf = (o) => {
       const addr = (o.ShipToAddress || '').split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
       return addr[addr.length - 1] || o.CustCity || '';
@@ -613,6 +710,77 @@ export default function OpenOrdersPage() {
           כל הימים
         </button>
       </div>
+
+      {/* Zone filter toolbar — chip multi-select scoped to the current
+          day+company+search context. Empty selection = show all. Counts
+          on each chip reflect orders BEFORE the zone filter, so the
+          operator can see "what's available where" before drilling in.
+          Renders nothing when there are no zones to show (e.g. backend
+          not yet restarted with the Zone enrichment from 6a1dff7). */}
+      {zoneAggregates.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
+          <MapPin size={16} className="text-gray-500" />
+          <span className="text-gray-600">סינון לפי אזור חלוקה:</span>
+          {zoneAggregates.map((z) => {
+            const active = selectedZones.has(z.key);
+            const baseCls = 'inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors select-none';
+            const activeCls  = 'border-2 font-semibold';
+            const idleCls    = 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50';
+            // Inline style so Tailwind doesn't need to know about each
+            // dynamic ZoneColor at build time.
+            const activeStyle = active && z.color
+              ? { backgroundColor: z.color + '22', borderColor: z.color, color: z.color }
+              : (active ? { backgroundColor: '#1f2937', color: '#fff', borderColor: '#1f2937' } : {});
+            return (
+              <button
+                key={z.key}
+                type="button"
+                onClick={() => toggleZone(z.key)}
+                className={`${baseCls} ${active ? activeCls : idleCls}`}
+                style={activeStyle}
+                title={active ? 'הסר סינון לאזור זה' : 'סנן לאזור זה'}
+              >
+                {z.label} <span className="text-xs opacity-75">({z.count})</span>
+              </button>
+            );
+          })}
+          {selectedZones.size > 0 && (
+            <button
+              type="button"
+              onClick={clearZoneFilter}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-gray-600 hover:bg-gray-100 underline decoration-dotted"
+              title="נקה כל הסינון לפי אזור"
+            >
+              <X size={12} /> נקה סינון
+            </button>
+          )}
+          {/* UX hint (2026-05-24): the chip set above reflects the
+              currently-selected day filter — chips show only zones with
+              orders that match `selectedDay`. Without this hint a Sunday
+              with sparse DeliveryDays profiles looks like a broken
+              toolbar (only ירושלים). w-full forces this onto its own
+              flex row so the hint doesn't crowd the chips. NOT changing
+              zoneAggregates source — only surfacing existing behavior. */}
+          <div className="w-full text-xs text-gray-500 flex flex-wrap items-center gap-2 mt-1">
+            <span>
+              האזורים מוצגים לפי סינון היום הפעיל:{' '}
+              <span className="font-medium text-gray-700">
+                {selectedDay === 'all' ? 'כל הימים' : selectedDay}
+              </span>
+            </span>
+            {selectedDay !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setSelectedDay('all')}
+                className="text-blue-600 hover:underline decoration-dotted"
+                title="הצג אזורים לפי כל הימים, לא רק היום"
+              >
+                הצג כל הימים
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Plan-eval toggle + controls */}
       <div className="bg-white border rounded-xl p-3 mb-4">
