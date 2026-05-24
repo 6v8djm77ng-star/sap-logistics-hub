@@ -754,6 +754,31 @@ export default function OpenOrdersPage() {
               <X size={12} /> נקה סינון
             </button>
           )}
+          {/* UX hint (2026-05-24): the chip set above reflects the
+              currently-selected day filter — chips show only zones with
+              orders that match `selectedDay`. Without this hint a Sunday
+              with sparse DeliveryDays profiles looks like a broken
+              toolbar (only ירושלים). w-full forces this onto its own
+              flex row so the hint doesn't crowd the chips. NOT changing
+              zoneAggregates source — only surfacing existing behavior. */}
+          <div className="w-full text-xs text-gray-500 flex flex-wrap items-center gap-2 mt-1">
+            <span>
+              האזורים מוצגים לפי סינון היום הפעיל:{' '}
+              <span className="font-medium text-gray-700">
+                {selectedDay === 'all' ? 'כל הימים' : selectedDay}
+              </span>
+            </span>
+            {selectedDay !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setSelectedDay('all')}
+                className="text-blue-600 hover:underline decoration-dotted"
+                title="הצג אזורים לפי כל הימים, לא רק היום"
+              >
+                הצג כל הימים
+              </button>
+            )}
+          </div>
         </div>
       )}
 
