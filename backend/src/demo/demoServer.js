@@ -3691,6 +3691,11 @@ app.post('/api/documents/:type/:id/confirm-sap', (req, res) => {
   const { sapDocEntry, sapDocNum } = req.body;
   const result = store.confirmSapDocument(req.params.id, req.params.type, sapDocEntry, sapDocNum);
   if (!result) return res.status(404).json({ error: 'Document not found' });
+  // 2026-05-24: confirmSapDocument now returns { error, ... } on placeholder
+  // DocEntry/DocNum (sapDocEntry < CONFIRM_SAP_MIN_DOCENTRY etc.) — map to 400
+  // so the UI can show "this looks like a typo / placeholder" instead of
+  // silently storing yet another fake SAP_CONFIRMED row.
+  if (result.error) return res.status(400).json(result);
   res.json(result);
 });
 
