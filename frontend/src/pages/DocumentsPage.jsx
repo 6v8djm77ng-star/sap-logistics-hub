@@ -47,10 +47,22 @@ function StatusBadge({ status }) {
   );
 }
 
+// Matches backend `CONFIRM_SAP_MIN_DOCENTRY` in persistentStore.js (DEV.10).
+// Hardcoded — exporting the constant from a backend module into a frontend
+// bundle would couple the build pipeline to the server. If the backend floor
+// changes, update here too; a UI test below would catch the divergence.
+const CONFIRM_SAP_MIN_DOCENTRY = 100;
+
 function ConfirmSapDialog({ doc, type, onClose }) {
   const [docEntry, setDocEntry] = useState('');
   const [docNum, setDocNum] = useState('');
   const queryClient = useQueryClient();
+
+  // DEV.11: client-side check mirrors the backend safeguard so the operator
+  // sees an inline reason before submit (instead of a silent 400). The
+  // backend remains the source of truth — this is UX, not enforcement.
+  const numEntry = Number(docEntry);
+  const docEntryInvalid = docEntry === '' || !Number.isInteger(numEntry) || numEntry < CONFIRM_SAP_MIN_DOCENTRY;
 
   const mutation = useMutation({
     mutationFn: () => docsApi.confirmSap(type, type === 'invoice' ? doc.InvoiceId : doc.DeliveryNoteId, docEntry, docNum),
@@ -58,6 +70,17 @@ function ConfirmSapDialog({ doc, type, onClose }) {
       toast.success('עודכן בהצלחה');
       queryClient.invalidateQueries();
       onClose();
+    },
+    // DEV.11: surface backend rejections (DEV.10 INVALID_SAP_DOC_ENTRY /
+    // INVALID_SAP_DOC_NUM → 400) instead of leaving the dialog silently
+    // stuck. The backend `message` is operator-friendly Hebrew/explanation;
+    // fall back to a generic line if the shape differs.
+    onError: (err) => {
+      const msg = err?.response?.data?.message
+        || err?.response?.data?.error
+        || err?.message
+        || 'אישור SAP נכשל';
+      toast.error(msg);
     },
   });
 
@@ -84,11 +107,22 @@ function ConfirmSapDialog({ doc, type, onClose }) {
             <label className="block text-sm font-medium mb-1">SAP DocEntry</label>
             <input
               type="number"
+              min={CONFIRM_SAP_MIN_DOCENTRY}
               value={docEntry}
               onChange={(e) => setDocEntry(e.target.value)}
               placeholder="42203"
-              className="w-full px-3 py-2 border rounded-lg"
+              className={`w-full px-3 py-2 border rounded-lg ${
+                docEntry !== '' && docEntryInvalid ? 'border-red-400 bg-red-50' : ''
+              }`}
             />
+            {/* DEV.11 helper — explains the backend safeguard inline so the
+                operator doesn't waste a submit on a placeholder. */}
+            <p className={`text-xs mt-1 ${
+              docEntry !== '' && docEntryInvalid ? 'text-red-600' : 'text-gray-500'
+            }`}>
+              DocEntry אמיתי מ-SAP חייב להיות {CONFIRM_SAP_MIN_DOCENTRY} ומעלה.
+              ערכים כמו 1 הם placeholders ולא יאושרו.
+            </p>
           </div>
           <div>
             <label className="block text-sm font-medium mb-1">SAP DocNum</label>
@@ -106,8 +140,9 @@ function ConfirmSapDialog({ doc, type, onClose }) {
           <button onClick={onClose} className="flex-1 py-2 border rounded-lg">ביטול</button>
           <button
             onClick={() => mutation.mutate()}
-            disabled={!docEntry || mutation.isPending}
-            className="flex-1 py-2 bg-brand-600 text-white rounded-lg disabled:opacity-50"
+            disabled={docEntryInvalid || mutation.isPending}
+            className="flex-1 py-2 bg-brand-600 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
+            title={docEntryInvalid ? `יש להזין DocEntry ≥ ${CONFIRM_SAP_MIN_DOCENTRY}` : undefined}
           >
             אשר
           </button>
