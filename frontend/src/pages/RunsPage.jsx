@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate } from 'react-router-dom';
 import { runsApi, zonesApi, driversApi } from '../services/api.js';
-import api from '../services/api.js';
+import api, { downloadFile } from '../services/api.js';
 import StatusPill from '../components/StatusPill.jsx';
 import { toast } from 'sonner';
 import { format } from 'date-fns';
@@ -147,15 +147,19 @@ export default function RunsPage() {
             className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
           />
           {runs && runs.length > 0 && (
-            <a
-              href={`/api/reports/runs/bulk-manifest.pdf?runDate=${date}`}
-              target="_blank"
-              rel="noreferrer"
+            <button
+              type="button"
+              onClick={() => {
+                downloadFile(
+                  `/reports/runs/bulk-manifest.pdf?runDate=${date}`,
+                  `bulk-manifest-${date}.pdf`,
+                ).catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+              }}
               className="inline-flex items-center gap-2 px-4 py-2 border border-gray-300 rounded-lg text-sm font-medium hover:bg-gray-50"
               title="הדפס דף נהג מרוכז של כל המסלולים ליום זה"
             >
               <Printer size={16} /> הדפס את כל המסלולים
-            </a>
+            </button>
           )}
           <button
             onClick={() => setCreating(true)}

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import api from '../services/api.js';
+import api, { downloadFile } from '../services/api.js';
 import { runsApi, reportsApi } from '../services/api.js';
 import { toast } from 'sonner';
 import StatusPill from '../components/StatusPill.jsx';
@@ -215,32 +215,42 @@ export default function RunDetailsPage() {
               </button>
             </>
           )}
-          <a
-            href={reportsApi.manifestPdfUrl(id)}
-            target="_blank"
-            rel="noreferrer"
+          {/* All three PDFs now route through downloadFile so the Bearer
+              token attaches. Old <a target="_blank"> dropped the header on
+              new-tab nav and got 401. URLs unchanged — only the call
+              method differs. */}
+          <button
+            type="button"
+            onClick={() => {
+              downloadFile(`/reports/runs/${id}/manifest.pdf`, `manifest-${id}.pdf`)
+                .catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+            }}
             className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
           >
             <Printer size={16} /> דף נהג PDF
-          </a>
-          <a
-            href={`/api/reports/runs/${id}/loading-manifest.pdf`}
-            target="_blank"
-            rel="noreferrer"
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              downloadFile(`/reports/runs/${id}/loading-manifest.pdf`, `loading-manifest-${id}.pdf`)
+                .catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+            }}
             className="inline-flex items-center gap-2 px-3 py-2 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700"
             title="ריכוז העמסה - LIFO + פירוט פריטים"
           >
             <Box size={16} /> ריכוז העמסה
-          </a>
-          <a
-            href={`/api/reports/runs/${id}/distribution-summary.pdf`}
-            target="_blank"
-            rel="noreferrer"
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              downloadFile(`/reports/runs/${id}/distribution-summary.pdf`, `distribution-summary-${id}.pdf`)
+                .catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+            }}
             className="inline-flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
             title="ריכוז קו חלוקה - שורה לכל מסמך"
           >
             <FileText size={16} /> ריכוז חלוקה
-          </a>
+          </button>
           <button
             onClick={() => optimizeMutation.mutate()}
             className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"

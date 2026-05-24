@@ -8,7 +8,7 @@
  */
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import api from '../services/api.js';
+import api, { downloadFile } from '../services/api.js';
 import { format } from 'date-fns';
 import { toast } from 'sonner';
 import {
@@ -312,22 +312,34 @@ export default function DocumentsPage() {
 
           <div className="flex-1" />
 
-          <a
-            href={`/api/reports/${tab === 'deliveryNotes' ? 'delivery-notes' : 'invoices'}.xlsx?runDate=${date}&company=A`}
-            target="_blank"
-            rel="noreferrer"
+          {/* Per-company export. URL path identical to the old <a>; we now
+              route through downloadFile so the Bearer token attaches. */}
+          <button
+            type="button"
+            onClick={() => {
+              const resource = tab === 'deliveryNotes' ? 'delivery-notes' : 'invoices';
+              downloadFile(
+                `/reports/${resource}.xlsx?runDate=${date}&company=A`,
+                `${resource}-${date}-A.csv`,
+              ).catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+            }}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
           >
             <Download size={14} /> Excel - OIG
-          </a>
-          <a
-            href={`/api/reports/${tab === 'deliveryNotes' ? 'delivery-notes' : 'invoices'}.xlsx?runDate=${date}&company=B`}
-            target="_blank"
-            rel="noreferrer"
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const resource = tab === 'deliveryNotes' ? 'delivery-notes' : 'invoices';
+              downloadFile(
+                `/reports/${resource}.xlsx?runDate=${date}&company=B`,
+                `${resource}-${date}-B.csv`,
+              ).catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
+            }}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-green-600 text-white rounded text-sm hover:bg-green-700"
           >
             <Download size={14} /> Excel - Unico
-          </a>
+          </button>
         </div>
 
         {/* Table */}

@@ -34,6 +34,44 @@ api.interceptors.response.use(
 
 export default api;
 
+// ---------- Authenticated file download helper ----------
+//
+// Download buttons used to be `<a target="_blank" href="/api/reports/...">`
+// or window.open(...). The browser ignores localStorage on those, so the
+// Authorization: Bearer header never went out → 401 → empty new tab.
+//
+// downloadFile() routes through the same axios instance so the request
+// interceptor attaches the token, then materialises the response body as
+// a Blob and triggers a synthetic <a download> click. The filename comes
+// from the server's Content-Disposition when present; otherwise falls
+// back to the caller-supplied hint.
+//
+// `url` is the path AFTER /api (matches api.baseURL). Example:
+//   downloadFile('/reports/delivery-notes.xlsx?runDate=...', 'dn.csv')
+// hits the same endpoint as the old <a href="/api/reports/...">, but
+// with the Bearer header attached.
+export async function downloadFile(url, filenameHint) {
+  // responseType: 'blob' tells axios not to JSON-parse — keeps binary
+  // PDFs and CSV bytes intact.
+  const r = await api.get(url, { responseType: 'blob' });
+  const cd = r.headers?.['content-disposition'] || r.headers?.['Content-Disposition'] || '';
+  // RFC 5987 / common forms: filename="x.csv" or filename=x.csv
+  const m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/.exec(cd);
+  const filename = (m?.[1] ? decodeURIComponent(m[1]) : null) || filenameHint || 'download';
+  const blobUrl = URL.createObjectURL(r.data);
+  try {
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  } finally {
+    // Give the browser a moment to start the download before revoking.
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+  }
+}
+
 // ---------- Endpoint wrappers ----------
 
 export const authApi = {

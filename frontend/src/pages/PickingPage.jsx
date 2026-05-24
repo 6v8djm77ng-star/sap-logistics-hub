@@ -5,7 +5,7 @@
 import { useState, useEffect } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import api from '../services/api.js';
+import api, { downloadFile } from '../services/api.js';
 import { runsApi } from '../services/api.js';
 import BarcodeScanner from '../components/BarcodeScanner.jsx';
 import { toast } from 'sonner';
@@ -488,11 +488,17 @@ export default function PickingPage() {
           >
             <QrCode size={16} /> סרוק ברקוד
           </button>
+          {/* PDF + Excel route through downloadFile so the Bearer token
+              attaches. Old window.open/inline <a download> got 401 because
+              the browser drops the Authorization header on a new-tab nav. */}
           <button
             onClick={() => {
-              const url = `/api/reports/waves/${wave.WaveId}/picking.pdf`;
-              window.open(url, '_blank');
-              toast.info('PDF נפתח בלשונית חדשה');
+              downloadFile(
+                `/reports/waves/${wave.WaveId}/picking.pdf`,
+                `picking-${wave.WaveNumber}.pdf`,
+              )
+                .then(() => toast.success('PDF הורד - בדוק תיקיית Downloads'))
+                .catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
             }}
             className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
           >
@@ -500,15 +506,12 @@ export default function PickingPage() {
           </button>
           <button
             onClick={() => {
-              const url = `/api/reports/waves/${wave.WaveId}/picking.xlsx`;
-              const a = document.createElement('a');
-              a.href = url;
-              a.download = `picking-${wave.WaveNumber}.csv`;
-              a.target = '_blank';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              toast.success('Excel הורד - בדוק תיקיית Downloads');
+              downloadFile(
+                `/reports/waves/${wave.WaveId}/picking.xlsx`,
+                `picking-${wave.WaveNumber}.csv`,
+              )
+                .then(() => toast.success('Excel הורד - בדוק תיקיית Downloads'))
+                .catch((err) => toast.error(err.response?.data?.error || 'הורדה נכשלה'));
             }}
             className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
           >
