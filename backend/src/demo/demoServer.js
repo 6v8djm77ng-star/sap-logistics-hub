@@ -3728,57 +3728,6 @@ app.post('/api/documents/:type/:id/confirm-sap', (req, res) => {
 });
 
 /**
- * DEV.13: revert a suspicious manual SAP confirmation back to PENDING_EXPORT.
- *
- * Why this exists:
- *   The store still holds 3 SAP_CONFIRMED Delivery Notes with
- *   SapDeliveryDocEntry=1 (DN-40, DN-83, DN-84). DEV.10 prevents creating
- *   new ones; this endpoint lets an admin clean up the existing fakes
- *   without manual JSON surgery. The reset is LOCAL ONLY — it does not
- *   touch SAP. If the placeholder happens to correspond to a real SAP
- *   doc, the admin re-runs "confirm-sap" with the correct DocEntry.
- *
- * Guards (defense-in-depth, also checked by store.canRevertConfirmation):
- *   - ADMIN role required (adminOnly middleware)
- *   - Doc must exist                                   → 404
- *   - Doc.Status must be SAP_CONFIRMED                 → 400 NOT_SAP_CONFIRMED
- *   - Doc.Sap*DocEntry must be < CONFIRM_SAP_MIN_DOCENTRY (placeholder)
- *                                                       → 400 NOT_SUSPICIOUS
- *
- * Body (optional): { reason: string } — included in the audit log.
- */
-app.post('/api/documents/:type/:id/revert-confirm', adminOnly, (req, res) => {
-  const { type, id } = req.params;
-  if (type !== 'deliveryNote' && type !== 'invoice') {
-    return res.status(400).json({ error: 'INVALID_TYPE', provided: type });
-  }
-  const result = store.revertSapConfirmation(type, id);
-  if (result === null) return res.status(404).json({ error: 'Document not found' });
-  if (result.error) return res.status(400).json(result);
-
-  // Audit log — captures who reverted, what the previous values were, and
-  // the optional human reason. Lets us reconstruct intent later if we need
-  // to debug "why did this doc go back to PENDING_EXPORT".
-  store.recordAudit({
-    action: 'document.revert_confirm',
-    actorSub: req.user?.sub,
-    actorName: req.user?.name || req.user?.username,
-    ip: req.ip,
-    details: {
-      docType: type,
-      docId: Number(id),
-      docNumber: result.doc.DocNumber,
-      previousSapDocEntry: result.previous.SapDocEntry,
-      previousSapDocNum: result.previous.SapDocNum,
-      previousConfirmedAt: result.previous.ConfirmedAt,
-      reason: typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 500) : null,
-    },
-  });
-
-  res.json(result);
-});
-
-/**
  * Mark documents as exported (after user downloads them for manual SAP entry).
  */
 app.post('/api/documents/mark-exported', (req, res) => {
