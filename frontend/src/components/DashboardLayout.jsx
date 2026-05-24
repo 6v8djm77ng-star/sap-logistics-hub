@@ -48,14 +48,16 @@ import NextPageButton from './NextPageButton.jsx';
 const workflowSection = [
   { to: '/',           label: 'דשבורד',          icon: LayoutDashboard },
   { to: '/orders',     label: 'הזמנות SAP',      icon: Package, highlight: true },
-  { to: '/planner',    label: 'תכנון יומי',       icon: CalendarClock },
+  // Hidden 2026-05-24 by user request — pages still routable directly via URL.
+  // { to: '/planner',    label: 'תכנון יומי',       icon: CalendarClock },
   { to: '/runs',       label: 'מסלולי הפצה',     icon: Truck },
   { to: '/warehouse',  label: 'ליקוט מחסן',      icon: Warehouse },
   { to: '/documents',  label: 'תעודות וחשבוניות', icon: FileText, highlight: true },
   { to: '/live',       label: 'מעקב חי',         icon: Activity },
   { to: '/returns',    label: 'חזרות',           icon: RotateCcw },
   { to: '/exceptions', label: 'חריגים',          icon: AlertTriangle },
-  { to: '/anomalies',  label: 'זיהוי חריגים',    icon: Eye, highlight: true },
+  // Hidden 2026-05-24 by user request — page still routable directly via URL.
+  // { to: '/anomalies',  label: 'זיהוי חריגים',    icon: Eye, highlight: true },
   { to: '/closure',    label: 'סגירת יום',       icon: BarChart3 },
 ];
 
