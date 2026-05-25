@@ -25,6 +25,10 @@ const docsApi = {
   generateInvoicesForRun: (runId) => api.post(`/runs/${runId}/generate-invoices`).then((r) => r.data),
   confirmSap: (type, id, sapDocEntry, sapDocNum) =>
     api.post(`/documents/${type}/${id}/confirm-sap`, { sapDocEntry, sapDocNum }).then((r) => r.data),
+  // DEV.13: revert a suspicious SAP confirmation back to PENDING_EXPORT.
+  // Local-only; does not touch SAP. Backend rejects if not suspicious.
+  revertConfirm: (type, id, reason) =>
+    api.post(`/documents/${type}/${id}/revert-confirm`, { reason }).then((r) => r.data),
 };
 
 const STATUS_LABELS = {
@@ -152,6 +156,98 @@ function ConfirmSapDialog({ doc, type, onClose }) {
   );
 }
 
+// DEV.13: helper to detect a suspicious SAP confirmation in either DN or INV
+// shape. Centralizes the (Status + DocEntry < floor) check so the row-action
+// button and the dialog headline agree on what "suspicious" means.
+function isSuspiciousConfirm(doc, type) {
+  if (!doc || doc.Status !== 'SAP_CONFIRMED') return false;
+  const de = Number(type === 'invoice' ? doc.SapInvoiceDocEntry : doc.SapDeliveryDocEntry);
+  return Number.isInteger(de) && de >= 1 && de < CONFIRM_SAP_MIN_DOCENTRY;
+}
+
+function RevertConfirmDialog({ doc, type, onClose }) {
+  const [reason, setReason] = useState('');
+  const queryClient = useQueryClient();
+  const id = type === 'invoice' ? doc.InvoiceId : doc.DeliveryNoteId;
+  const currentDE = type === 'invoice' ? doc.SapInvoiceDocEntry : doc.SapDeliveryDocEntry;
+
+  const mutation = useMutation({
+    mutationFn: () => docsApi.revertConfirm(type, id, reason.trim() || undefined),
+    onSuccess: () => {
+      toast.success('האישור בוטל. הסטטוס חזר ל-PENDING_EXPORT');
+      queryClient.invalidateQueries();
+      onClose();
+    },
+    onError: (err) => {
+      const msg = err?.response?.data?.message
+        || err?.response?.data?.error
+        || err?.message
+        || 'ביטול האישור נכשל';
+      toast.error(msg);
+    },
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-md w-full p-5">
+        <h2 className="font-bold text-lg mb-1 text-red-700 flex items-center gap-2">
+          <AlertTriangle size={18} /> ביטול אישור SAP חשוד
+        </h2>
+        <p className="text-sm text-gray-500 mb-4">
+          {type === 'invoice' ? 'חשבונית' : 'תעודת משלוח'} {doc.DocNumber} - {doc.SapCardName}
+        </p>
+
+        <div className="bg-amber-50 border border-amber-200 rounded p-3 mb-3 text-xs space-y-1">
+          <div className="flex justify-between"><span>מצב כיום:</span><span className="font-semibold">SAP_CONFIRMED</span></div>
+          <div className="flex justify-between">
+            <span>SapDocEntry:</span>
+            <span className="font-mono text-red-700 font-semibold">{currentDE} (placeholder)</span>
+          </div>
+          <div className="flex justify-between">
+            <span>ConfirmedAt:</span>
+            <span className="font-mono text-gray-600">{doc.ConfirmedAt || '—'}</span>
+          </div>
+        </div>
+
+        <div className="bg-green-50 border border-green-200 rounded p-3 mb-3 text-xs space-y-1">
+          <div className="flex justify-between"><span>אחרי ביטול:</span><span className="font-semibold">PENDING_EXPORT</span></div>
+          <div className="flex justify-between"><span>SapDocEntry:</span><span className="text-gray-500">(יתאפס)</span></div>
+          <div className="flex justify-between"><span>ConfirmedAt:</span><span className="text-gray-500">(יתאפס)</span></div>
+        </div>
+
+        <div className="bg-blue-50 border border-blue-200 rounded p-3 mb-4 text-xs">
+          ⚠️ פעולה זו <strong>אינה משפיעה על SAP</strong>. היא רק מאפסת את הסימון המקומי
+          של "אושר ב-SAP". אם המסמך באמת קיים ב-SAP — עדכן את ה-DocEntry האמיתי
+          דרך "אשר ב-SAP".
+        </div>
+
+        <div className="mb-4">
+          <label className="block text-sm font-medium mb-1">סיבה (אופציונלי, לאודיט)</label>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="למשל: placeholder שהוקלד בטעות במאי"
+            maxLength={500}
+            rows={2}
+            className="w-full px-3 py-2 border rounded-lg text-sm"
+          />
+        </div>
+
+        <div className="flex gap-2">
+          <button onClick={onClose} className="flex-1 py-2 border rounded-lg">ביטול</button>
+          <button
+            onClick={() => mutation.mutate()}
+            disabled={mutation.isPending}
+            className="flex-1 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {mutation.isPending ? 'מבטל…' : 'אשר ביטול אישור'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function DocumentsPage() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState('deliveryNotes'); // 'deliveryNotes' | 'invoices'
@@ -159,6 +255,9 @@ export default function DocumentsPage() {
   const [companyFilter, setCompanyFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [confirmingDoc, setConfirmingDoc] = useState(null);
+  // DEV.13: separate state for the revert dialog so confirm and revert can't
+  // clash. revertingDoc = { doc, type } or null.
+  const [revertingDoc, setRevertingDoc] = useState(null);
 
   const params = {
     runDate: date,
@@ -504,6 +603,19 @@ export default function DocumentsPage() {
                           אשר ב-SAP
                         </button>
                       )}
+                      {/* DEV.13: revert appears ONLY when this row is a
+                          suspicious SAP_CONFIRMED (placeholder DocEntry).
+                          For real confirmations, the button is hidden — no
+                          undo path through the UI. */}
+                      {isSuspiciousConfirm(dn, 'deliveryNote') && (
+                        <button
+                          onClick={() => setRevertingDoc({ doc: dn, type: 'deliveryNote' })}
+                          className="text-xs text-red-600 hover:underline mr-2"
+                          title="בטל את האישור החשוד והחזר ל-PENDING_EXPORT (לא נוגע ב-SAP)"
+                        >
+                          ↩ בטל אישור חשוד
+                        </button>
+                      )}
                       <button
                         onClick={() => generateInvoiceMutation.mutate(dn.DeliveryNoteId)}
                         className="text-xs text-purple-600 hover:underline"
@@ -545,13 +657,25 @@ export default function DocumentsPage() {
                     <td className="p-3 text-center text-xs font-mono">
                       {inv.SapInvoiceDocEntry || '—'}
                     </td>
-                    <td className="p-3 text-left">
+                    <td className="p-3 text-left whitespace-nowrap">
                       {inv.Status !== 'SAP_CONFIRMED' && (
                         <button
                           onClick={() => setConfirmingDoc({ doc: inv, type: 'invoice' })}
-                          className="text-xs text-brand-600 hover:underline"
+                          className="text-xs text-brand-600 hover:underline mr-2"
                         >
                           אשר ב-SAP
+                        </button>
+                      )}
+                      {/* DEV.13: future-proof — currently no INV is
+                          suspicious, but the same guard applies if one
+                          ever is. */}
+                      {isSuspiciousConfirm(inv, 'invoice') && (
+                        <button
+                          onClick={() => setRevertingDoc({ doc: inv, type: 'invoice' })}
+                          className="text-xs text-red-600 hover:underline"
+                          title="בטל את האישור החשוד והחזר ל-PENDING_EXPORT (לא נוגע ב-SAP)"
+                        >
+                          ↩ בטל אישור חשוד
                         </button>
                       )}
                     </td>
@@ -750,6 +874,17 @@ export default function DocumentsPage() {
           doc={confirmingDoc.doc}
           type={confirmingDoc.type}
           onClose={() => setConfirmingDoc(null)}
+        />
+      )}
+
+      {/* DEV.13 revert dialog. Opens only when a suspicious-row button is
+          clicked. Backend rejects non-suspicious docs even if the button
+          somehow opens for them (defense-in-depth). */}
+      {revertingDoc && (
+        <RevertConfirmDialog
+          doc={revertingDoc.doc}
+          type={revertingDoc.type}
+          onClose={() => setRevertingDoc(null)}
         />
       )}
     </div>
