@@ -3608,6 +3608,74 @@ export function markDocsExported(docIds, type = 'deliveryNote') {
 // CONFIRM_SAP_MIN_DOCENTRY so a fresh test fixture can override it.
 export const CONFIRM_SAP_MIN_DOCENTRY = 100;
 
+// DEV.13: pure-function guard used by both `revertSapConfirmation` and the
+// tests. Takes the raw doc and the field name to read DocEntry from, so the
+// same logic serves both deliveryNote (SapDeliveryDocEntry) and invoice
+// (SapInvoiceDocEntry). Returns {ok:true} or a structured error so the
+// caller can map to HTTP / surface a UI message. Kept pure (no store
+// access) so unit tests can drive every branch with hand-built fixtures
+// without touching the real store.
+export function canRevertConfirmation(doc, sapDocEntryField) {
+  if (!doc || typeof doc !== 'object') {
+    return { error: 'DOC_NOT_FOUND' };
+  }
+  if (doc.Status !== 'SAP_CONFIRMED') {
+    return { error: 'NOT_SAP_CONFIRMED', current: doc.Status };
+  }
+  const currentDE = Number(doc[sapDocEntryField]);
+  if (!Number.isInteger(currentDE) || currentDE < 1 || currentDE >= CONFIRM_SAP_MIN_DOCENTRY) {
+    // Real SAP DocEntries are ≥ CONFIRM_SAP_MIN_DOCENTRY. Anything else is
+    // either a placeholder (1, 0) or already a real ID we MUST NOT touch
+    // through this endpoint — reverting a real confirmation needs a
+    // different, more deliberate flow with stronger guards.
+    return {
+      error: 'NOT_SUSPICIOUS',
+      currentDocEntry: doc[sapDocEntryField],
+      floor: CONFIRM_SAP_MIN_DOCENTRY,
+    };
+  }
+  return { ok: true };
+}
+
+// DEV.13: undo a placeholder/typo SAP confirmation by resetting the local
+// fields back to the pre-confirm state. Only allowed for SAP_CONFIRMED
+// rows whose SapDocEntry is a placeholder (< CONFIRM_SAP_MIN_DOCENTRY) —
+// i.e. exactly the rows the audit identifies as suspicious. Does NOT touch
+// SAP itself; this is a local-store-only correction. Returns:
+//   null                       — doc id not found
+//   { error, ... }             — guard rejected the operation
+//   { doc, previous }          — success, with previous values for audit
+export function revertSapConfirmation(type, docId) {
+  const s = ensureDocsStore();
+  const arr = type === 'invoice' ? s.invoices : s.deliveryNotes;
+  const idKey = type === 'invoice' ? 'InvoiceId' : 'DeliveryNoteId';
+  const deKey = type === 'invoice' ? 'SapInvoiceDocEntry' : 'SapDeliveryDocEntry';
+  const dnKey = type === 'invoice' ? 'SapInvoiceDocNum'  : 'SapDeliveryDocNum';
+
+  const doc = arr.find((d) => d[idKey] === Number(docId));
+  if (!doc) return null;
+
+  const guard = canRevertConfirmation(doc, deKey);
+  if (guard.error) return guard;
+
+  // Capture pre-mutation values for the audit log + response. Snapshotting
+  // here, AFTER the guard, ensures we never return previous values for a
+  // rejected revert.
+  const previous = {
+    SapDocEntry: doc[deKey],
+    SapDocNum: doc[dnKey],
+    ConfirmedAt: doc.ConfirmedAt,
+  };
+
+  doc.Status = 'PENDING_EXPORT';
+  doc[deKey] = null;
+  doc[dnKey] = null;
+  doc.ConfirmedAt = null;
+  save();
+
+  return { doc, previous };
+}
+
 export function confirmSapDocument(docId, type, sapDocEntry, sapDocNum) {
   // 2026-05-24 safeguard: reject placeholder/typo DocEntries that produced
   // 3 fake SAP_CONFIRMED records in our store. Returns a structured error
