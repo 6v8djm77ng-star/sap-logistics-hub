@@ -3970,10 +3970,12 @@ export function getCustomerProfileStats() {
  */
 export function listQcPendingOrders(filters = {}) {
   const s = load();
-  const waves     = s.waves || [];
-  const stops     = s.stops || [];
-  const runs      = s.runs || [];
-  const runOrders = s.runOrders || [];
+  const waves            = s.waves || [];
+  const waveLines        = s.waveLines || [];
+  const waveAllocations  = s.waveAllocations || [];
+  const stops            = s.stops || [];
+  const runs             = s.runs || [];
+  const runOrders        = s.runOrders || [];
 
   // Index for O(1) lookups.
   const wavesByRun = new Map();
@@ -3991,6 +3993,18 @@ export function listQcPendingOrders(filters = {}) {
     if (!ordersByStop.has(o.StopId)) ordersByStop.set(o.StopId, []);
     ordersByStop.get(o.StopId).push(o);
   }
+  // Picked items per order. v2 (P5+, 2026-05-26): the QC controller
+  // expands an order row and sees what was actually picked, with a
+  // visual check/X per item. Allocations link to the order via
+  // RunOrderId; the parent waveLine carries the SAP item identity.
+  const allocsByOrder = new Map();
+  for (const a of waveAllocations) {
+    if (a.RunOrderId == null) continue;
+    if (!allocsByOrder.has(a.RunOrderId)) allocsByOrder.set(a.RunOrderId, []);
+    allocsByOrder.get(a.RunOrderId).push(a);
+  }
+  const waveLineById = new Map();
+  for (const wl of waveLines) waveLineById.set(wl.WaveLineId, wl);
 
   const targetStatus = filters.status || 'PENDING_QC';
   const out = [];
@@ -4010,13 +4024,31 @@ export function listQcPendingOrders(filters = {}) {
     for (const stop of runStops) {
       const orders = ordersByStop.get(stop.StopId) || [];
       for (const order of orders) {
-        // Skip already-approved (has DN/INV) and already-rejected.
         if (order.DeliveryNoteId || order.InvoiceId) continue;
         if (order.QcRejected) continue;
-        // The QC controller needs every wave that holds this stop's orders;
-        // we surface only the first matching wave per (run,stop) — usually
-        // there's exactly one wave per run anyway.
         const wave = runWaves[0];
+
+        // Build pickedItems for the expandable row.
+        const allocs = allocsByOrder.get(order.RunOrderId) || [];
+        const pickedItems = allocs.map((a) => {
+          const wl = waveLineById.get(a.WaveLineId);
+          const ordered = Number(a.Quantity || 0);
+          const picked  = Number(a.PickedQuantity || 0);
+          return {
+            AllocationId: a.AllocationId,
+            WaveLineId:   a.WaveLineId,
+            ItemCode:     wl?.SapItemCode || null,
+            ItemName:     wl?.SapItemName || null,
+            Ordered:      ordered,
+            Picked:       picked,
+            Missing:      Math.max(0, ordered - picked),
+            IsPartial:    picked > 0 && picked < ordered,
+            IsEmpty:      picked === 0,
+          };
+        });
+        const totalOrdered = pickedItems.reduce((s, i) => s + i.Ordered, 0);
+        const totalPicked  = pickedItems.reduce((s, i) => s + i.Picked,  0);
+
         out.push({
           RunOrderId:        order.RunOrderId,
           SapCardCode:       order.SapCardCode,
@@ -4041,6 +4073,11 @@ export function listQcPendingOrders(filters = {}) {
           AssignedPickerName: wave.AssignedPickerName || null,
           PickedByName:      wave.PickedByName || null,
           QcSubmittedAt:     wave.CompletedAt || wave.UpdatedAt || null,
+          // P5 v2 — item-level detail for the expandable row
+          pickedItems,
+          totalOrdered,
+          totalPicked,
+          isPartial: totalPicked > 0 && totalPicked < totalOrdered,
         });
       }
     }

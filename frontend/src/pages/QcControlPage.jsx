@@ -1,18 +1,13 @@
 /**
- * QC Control Page — Post-Picking Quality Control (P4+P5, 2026-05-26).
+ * QC Control Page — Post-Picking Quality Control (v2, 2026-05-26).
  *
- * One row per RunOrder sitting in a PENDING_QC wave that hasn't been
- * approved or rejected. The QC controller / admin can:
- *   - Approve  → POST /api/qc/approve-order/:runOrderId  → DN/INV created
- *                 per customer DocPolicy (LOCAL, no SAP HTTP)
- *   - Reject   → POST /api/qc/reject-order/:runOrderId   → marks
- *                 QcRejected with a required reason
- *
- * Filters in URL/state (NOT yet persisted to localStorage — keep light):
- *   - runDate, pickerId, zoneCode
- *
- * Empty-list state shows guidance so the controller knows the screen is
- * working even when there's nothing to review.
+ * v2 layout matches OpenOrdersPage: one collapsed row per RunOrder, each
+ * expandable to show the picked items with per-item visual approve/reject
+ * marks. The final action stays at the order level — POST
+ * /api/qc/approve-order/:runOrderId creates DN/INV per the customer's
+ * DocPolicy with whatever was picked (isPartial path is already in the
+ * backend). Per-item marks are visual aids for the controller; backend
+ * still consumes the existing per-order semantics.
  */
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -21,6 +16,7 @@ import api from '../services/api.js';
 import { format } from 'date-fns';
 import {
   ShieldCheck, Check, X, AlertTriangle, Filter, RotateCcw, Package,
+  ChevronDown, ChevronUp, Circle, CheckCircle2, XCircle,
 } from 'lucide-react';
 
 const qcApi = {
@@ -31,7 +27,7 @@ const qcApi = {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// Reject dialog
+// Reject dialog (order-level)
 // ─────────────────────────────────────────────────────────────────────
 function RejectDialog({ row, onClose, onConfirm, isPending }) {
   const [reason, setReason] = useState('');
@@ -52,7 +48,7 @@ function RejectDialog({ row, onClose, onConfirm, isPending }) {
           rows={3}
           maxLength={500}
           className="w-full border rounded-lg px-3 py-2 text-sm resize-none focus:ring-2 focus:ring-red-300 focus:outline-none"
-          placeholder="לדוגמה: פגם באריזה / חוסר מלאי לא מתועד / כמות שגויה"
+          placeholder="לדוגמה: פגם באריזה / חוסר מלאי / כמות שגויה"
         />
         <div className="text-xs text-gray-400 mt-1">{reason.length}/500</div>
         <div className="flex gap-2 mt-4">
@@ -79,6 +75,189 @@ function RejectDialog({ row, onClose, onConfirm, isPending }) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Order row — collapsed header + expanded picked-items detail
+// ─────────────────────────────────────────────────────────────────────
+function OrderRow({ row, onApprove, onReject, isApprovePending }) {
+  const [expanded, setExpanded] = useState(false);
+  // itemMarks: { [allocationId]: 'ok' | 'bad' | undefined } — visual only.
+  const [itemMarks, setItemMarks] = useState({});
+
+  const items = row.pickedItems || [];
+  const okCount  = items.filter((i) => itemMarks[i.AllocationId] === 'ok').length;
+  const badCount = items.filter((i) => itemMarks[i.AllocationId] === 'bad').length;
+
+  const markItem = (allocId, value) => {
+    setItemMarks((prev) => ({
+      ...prev,
+      [allocId]: prev[allocId] === value ? undefined : value,
+    }));
+  };
+
+  const colSpanExpanded = 9;
+
+  return (
+    <>
+      <tr
+        className="hover:bg-gray-50 cursor-pointer border-t"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <td className="px-3 py-2 w-8">
+          <button className="p-1 hover:bg-gray-200 rounded">
+            {expanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+          </button>
+        </td>
+        <td className="px-3 py-2 font-mono text-xs">
+          #{row.SapDocNum}
+        </td>
+        <td className="px-3 py-2">
+          <div className="font-medium">{row.SapCardName}</div>
+          <div className="text-xs text-gray-500 font-mono">{row.SapCardCode}</div>
+        </td>
+        <td className="px-3 py-2">
+          <div className="text-xs font-mono">{row.RunNumber}</div>
+          <div className="text-xs text-gray-500">{row.RunDate}</div>
+        </td>
+        <td className="px-3 py-2 text-xs">
+          {row.ZoneName || row.ZoneCode || '—'}
+        </td>
+        <td className="px-3 py-2 text-xs">
+          {row.AssignedPickerName || row.PickedByName || '—'}
+        </td>
+        <td className="px-3 py-2 text-center">
+          <span className="font-semibold">{items.length}</span>
+          <span className="text-xs text-gray-500"> ({row.totalPicked}/{row.totalOrdered} יח׳)</span>
+          {row.isPartial && (
+            <div className="text-xs text-amber-600 mt-0.5">חלקי</div>
+          )}
+        </td>
+        <td className="px-3 py-2 text-left font-mono text-sm">
+          ₪{Number(row.OrderTotal || 0).toLocaleString()}
+        </td>
+        <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center justify-center gap-2">
+            <button
+              type="button"
+              onClick={() => onApprove(row.RunOrderId)}
+              disabled={isApprovePending}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-green-600 text-white text-xs font-semibold hover:bg-green-700 disabled:opacity-50"
+              title="אשר הזמנה — יצירת תעודות לפי מדיניות"
+            >
+              <Check size={14} /> אשר הזמנה
+            </button>
+            <button
+              type="button"
+              onClick={() => onReject(row)}
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white border border-red-300 text-red-700 text-xs font-semibold hover:bg-red-50"
+              title="דחה הזמנה — סיבה נדרשת"
+            >
+              <X size={14} /> דחה
+            </button>
+          </div>
+        </td>
+      </tr>
+      {expanded && (
+        <tr className="bg-gray-50/70 border-t border-dashed">
+          <td colSpan={colSpanExpanded} className="px-6 py-3">
+            <div className="flex items-center justify-between mb-2">
+              <h4 className="font-bold text-sm flex items-center gap-2">
+                <Package size={14} /> פריטים שלוקטו ({items.length})
+              </h4>
+              <div className="text-xs text-gray-600">
+                סומנו: <span className="text-green-700 font-bold">{okCount} תקינים</span>
+                {' · '}
+                <span className="text-red-700 font-bold">{badCount} בעייתיים</span>
+              </div>
+            </div>
+            {items.length === 0 ? (
+              <div className="text-sm text-gray-500 py-2">אין פריטים לתצוגה.</div>
+            ) : (
+              <table className="w-full text-sm bg-white border rounded-lg overflow-hidden">
+                <thead className="bg-gray-100 text-xs text-gray-600">
+                  <tr>
+                    <th className="px-3 py-2 text-right">פריט</th>
+                    <th className="px-3 py-2 text-right">קוד</th>
+                    <th className="px-3 py-2 text-center">הוזמן</th>
+                    <th className="px-3 py-2 text-center">נלקט</th>
+                    <th className="px-3 py-2 text-center">חוסר</th>
+                    <th className="px-3 py-2 text-center">סטטוס</th>
+                    <th className="px-3 py-2 text-center">סימון בקרה</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y">
+                  {items.map((item) => {
+                    const mark = itemMarks[item.AllocationId];
+                    return (
+                      <tr key={item.AllocationId} className={
+                        mark === 'ok' ? 'bg-green-50/50' :
+                        mark === 'bad' ? 'bg-red-50/50' : ''
+                      }>
+                        <td className="px-3 py-2">{item.ItemName || '—'}</td>
+                        <td className="px-3 py-2 font-mono text-xs">{item.ItemCode || '—'}</td>
+                        <td className="px-3 py-2 text-center font-mono">{item.Ordered}</td>
+                        <td className={`px-3 py-2 text-center font-mono font-semibold ${
+                          item.IsEmpty ? 'text-red-600' :
+                          item.IsPartial ? 'text-amber-600' : 'text-green-700'
+                        }`}>{item.Picked}</td>
+                        <td className="px-3 py-2 text-center font-mono">
+                          {item.Missing > 0 ? (
+                            <span className="text-red-600">{item.Missing}</span>
+                          ) : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-center">
+                          {item.IsEmpty ? (
+                            <span className="px-2 py-0.5 rounded text-xs bg-red-100 text-red-800">לא לוקט</span>
+                          ) : item.IsPartial ? (
+                            <span className="px-2 py-0.5 rounded text-xs bg-amber-100 text-amber-800">חלקי</span>
+                          ) : (
+                            <span className="px-2 py-0.5 rounded text-xs bg-green-100 text-green-800">מלא</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-center">
+                          <div className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => markItem(item.AllocationId, 'ok')}
+                              className={`p-1 rounded ${
+                                mark === 'ok'
+                                  ? 'bg-green-600 text-white'
+                                  : 'border border-gray-300 text-gray-500 hover:bg-green-50 hover:text-green-700'
+                              }`}
+                              title="סמן כתקין"
+                            >
+                              <CheckCircle2 size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => markItem(item.AllocationId, 'bad')}
+                              className={`p-1 rounded ${
+                                mark === 'bad'
+                                  ? 'bg-red-600 text-white'
+                                  : 'border border-gray-300 text-gray-500 hover:bg-red-50 hover:text-red-700'
+                              }`}
+                              title="סמן כבעייתי"
+                            >
+                              <XCircle size={14} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+            <div className="mt-2 text-xs text-gray-500">
+              סימני הבקרה הם ויזואליים בלבד לעזרה. אישור הזמנה מהכפתור הירוק יוצר תעודות לפי
+              כמויות הליקוט בפועל (חוסרים יסומנו ב-DN כ-Shortages).
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Page
 // ─────────────────────────────────────────────────────────────────────
 export default function QcControlPage() {
@@ -86,7 +265,7 @@ export default function QcControlPage() {
   const [runDate, setRunDate] = useState('');
   const [zoneCode, setZoneCode] = useState('');
   const [pickerId, setPickerId] = useState('');
-  const [rejecting, setRejecting] = useState(null); // row being rejected
+  const [rejecting, setRejecting] = useState(null);
 
   const { data, isLoading, refetch } = useQuery({
     queryKey: ['qc-pending', runDate, zoneCode, pickerId],
@@ -127,89 +306,63 @@ export default function QcControlPage() {
     },
   });
 
-  // Build dropdown options from the actual data — only days/zones/pickers
-  // that have something to review today. Saves the user from having to
-  // know the master list.
   const uniqueDates   = [...new Set(orders.map((o) => o.RunDate).filter(Boolean))].sort();
   const uniqueZones   = [...new Set(orders.map((o) => o.ZoneCode).filter(Boolean))].sort();
   const uniquePickers = [...new Map(
     orders.filter((o) => o.AssignedPickerId)
           .map((o) => [o.AssignedPickerId, o.AssignedPickerName || `Picker ${o.AssignedPickerId}`])
   )];
-
-  const clearFilters = () => {
-    setRunDate(''); setZoneCode(''); setPickerId('');
-  };
+  const clearFilters = () => { setRunDate(''); setZoneCode(''); setPickerId(''); };
   const hasFilter = !!(runDate || zoneCode || pickerId);
 
   return (
-    <div className="p-4 md:p-6 max-w-7xl">
+    <div className="p-4 md:p-6 max-w-screen-2xl">
       {/* Header */}
       <div className="flex items-center gap-3 mb-1">
         <ShieldCheck className="text-blue-600" size={28} />
         <h1 className="text-2xl font-bold">בקרה אחרי ליקוט</h1>
       </div>
       <p className="text-sm text-gray-600 mb-4">
-        אישור פר-הזמנה אחרי שהמלקט סיים. אישור → תעודות נוצרות לפי מדיניות הלקוח.
-        דחייה → ההזמנה מסומנת ולא מקבלת מסמך. שום פעולה לא נשלחת ל-SAP.
+        לחיצה על שורה פותחת את הפריטים שלוקטו עם סימוני בקרה (תקין / בעייתי).
+        כפתור "אשר הזמנה" → תעודות נוצרות לפי מדיניות הלקוח עם כמויות הליקוט בפועל.
+        שום פעולה לא נשלחת ל-SAP.
       </p>
 
       {/* Filters */}
       <div className="bg-white border rounded-xl p-3 mb-4 flex flex-wrap items-end gap-3">
         <div>
           <label className="block text-xs text-gray-500 mb-1">תאריך מסלול</label>
-          <select
-            value={runDate}
-            onChange={(e) => setRunDate(e.target.value)}
-            className="border rounded-lg px-3 py-1.5 text-sm bg-white"
-          >
+          <select value={runDate} onChange={(e) => setRunDate(e.target.value)}
+                  className="border rounded-lg px-3 py-1.5 text-sm bg-white">
             <option value="">כל התאריכים</option>
-            {uniqueDates.map((d) => (
-              <option key={d} value={d}>{d}</option>
-            ))}
+            {uniqueDates.map((d) => <option key={d} value={d}>{d}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-xs text-gray-500 mb-1">אזור</label>
-          <select
-            value={zoneCode}
-            onChange={(e) => setZoneCode(e.target.value)}
-            className="border rounded-lg px-3 py-1.5 text-sm bg-white"
-          >
+          <select value={zoneCode} onChange={(e) => setZoneCode(e.target.value)}
+                  className="border rounded-lg px-3 py-1.5 text-sm bg-white">
             <option value="">כל האזורים</option>
-            {uniqueZones.map((z) => (
-              <option key={z} value={z}>{z}</option>
-            ))}
+            {uniqueZones.map((z) => <option key={z} value={z}>{z}</option>)}
           </select>
         </div>
         <div>
           <label className="block text-xs text-gray-500 mb-1">מלקט</label>
-          <select
-            value={pickerId}
-            onChange={(e) => setPickerId(e.target.value)}
-            className="border rounded-lg px-3 py-1.5 text-sm bg-white"
-          >
+          <select value={pickerId} onChange={(e) => setPickerId(e.target.value)}
+                  className="border rounded-lg px-3 py-1.5 text-sm bg-white">
             <option value="">כל המלקטים</option>
-            {uniquePickers.map(([id, name]) => (
-              <option key={id} value={id}>{name}</option>
-            ))}
+            {uniquePickers.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
         </div>
         {hasFilter && (
-          <button
-            type="button"
-            onClick={clearFilters}
-            className="text-xs text-blue-600 hover:underline flex items-center gap-1 pb-2"
-          >
+          <button type="button" onClick={clearFilters}
+                  className="text-xs text-blue-600 hover:underline flex items-center gap-1 pb-2">
             <Filter size={12} /> נקה סינון
           </button>
         )}
-        <button
-          type="button"
-          onClick={() => refetch()}
-          className="ml-auto inline-flex items-center gap-1 text-xs text-gray-600 hover:bg-gray-100 px-2 py-1 rounded"
-          title="רענן"
-        >
+        <button type="button" onClick={() => refetch()}
+                className="ml-auto inline-flex items-center gap-1 text-xs text-gray-600 hover:bg-gray-100 px-2 py-1 rounded"
+                title="רענן">
           <RotateCcw size={12} /> רענן
         </button>
       </div>
@@ -223,7 +376,7 @@ export default function QcControlPage() {
         )}
       </div>
 
-      {/* Table or empty state */}
+      {/* Empty state */}
       {orders.length === 0 && !isLoading ? (
         <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-5 text-sm">
           <p className="font-semibold text-blue-900 mb-2 flex items-center gap-2">
@@ -238,67 +391,26 @@ export default function QcControlPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 text-xs text-gray-600">
               <tr>
+                <th className="px-3 py-2 w-8"></th>
                 <th className="px-3 py-2 text-right">הזמנה</th>
                 <th className="px-3 py-2 text-right">לקוח</th>
                 <th className="px-3 py-2 text-right">מסלול</th>
                 <th className="px-3 py-2 text-right">אזור</th>
                 <th className="px-3 py-2 text-right">מלקט</th>
-                <th className="px-3 py-2 text-right">תאריך הגשה</th>
+                <th className="px-3 py-2 text-center">פריטים</th>
                 <th className="px-3 py-2 text-left">סכום</th>
                 <th className="px-3 py-2 text-center">פעולות</th>
               </tr>
             </thead>
-            <tbody className="divide-y">
+            <tbody>
               {orders.map((row) => (
-                <tr key={row.RunOrderId} className="hover:bg-gray-50">
-                  <td className="px-3 py-2 font-mono text-xs">
-                    #{row.SapDocNum}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="font-medium">{row.SapCardName}</div>
-                    <div className="text-xs text-gray-500 font-mono">{row.SapCardCode}</div>
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="text-xs font-mono">{row.RunNumber}</div>
-                    <div className="text-xs text-gray-500">{row.RunDate}</div>
-                  </td>
-                  <td className="px-3 py-2 text-xs">
-                    {row.ZoneName || row.ZoneCode || '—'}
-                  </td>
-                  <td className="px-3 py-2 text-xs">
-                    {row.AssignedPickerName || row.PickedByName || '—'}
-                  </td>
-                  <td className="px-3 py-2 text-xs text-gray-600">
-                    {row.QcSubmittedAt
-                      ? format(new Date(row.QcSubmittedAt), 'dd/MM HH:mm')
-                      : '—'}
-                  </td>
-                  <td className="px-3 py-2 text-left font-mono">
-                    ₪{Number(row.OrderTotal || 0).toLocaleString()}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="flex items-center justify-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => approveMutation.mutate(row.RunOrderId)}
-                        disabled={approveMutation.isPending}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-green-600 text-white text-xs font-semibold hover:bg-green-700 disabled:opacity-50"
-                        title="אשר הזמנה — יצירת תעודות לפי מדיניות"
-                      >
-                        <Check size={14} /> אשר
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setRejecting(row)}
-                        disabled={rejectMutation.isPending}
-                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-white border border-red-300 text-red-700 text-xs font-semibold hover:bg-red-50 disabled:opacity-50"
-                        title="דחה הזמנה — סיבה נדרשת"
-                      >
-                        <X size={14} /> דחה
-                      </button>
-                    </div>
-                  </td>
-                </tr>
+                <OrderRow
+                  key={row.RunOrderId}
+                  row={row}
+                  onApprove={(id) => approveMutation.mutate(id)}
+                  onReject={(r) => setRejecting(r)}
+                  isApprovePending={approveMutation.isPending}
+                />
               ))}
             </tbody>
           </table>
