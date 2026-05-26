@@ -3953,6 +3953,99 @@ app.post('/api/orders/:runOrderId/qc-approve', (req, res) => {
   }
 });
 
+// =====================================================================
+// QC Control endpoints — P3 (2026-05-26)
+//
+// Three endpoints under qcControllerOnly for the "בקרה אחרי ליקוט" screen:
+//   - GET  /api/qc/pending                 → list orders waiting for QC
+//   - POST /api/qc/approve-order/:id       → approve (wraps the existing
+//                                            store.generateDocsForRunOrder
+//                                            with the QC gate)
+//   - POST /api/qc/reject-order/:id        → reject with reason
+//
+// The picker's per-order approve at /api/orders/:runOrderId/qc-approve
+// keeps working for backward compatibility (dual flow during P1-P5). The
+// QC controller route is a separate gate so a future change can disable
+// the picker's approve without touching the QC controller's path.
+// LOCAL ONLY — no SAP HTTP from any of these.
+// =====================================================================
+
+app.get('/api/qc/pending', qcControllerOnly, (req, res) => {
+  const filters = {
+    runDate:  req.query.runDate || undefined,
+    pickerId: req.query.pickerId != null && req.query.pickerId !== ''
+      ? Number(req.query.pickerId) : undefined,
+    zoneCode: req.query.zoneCode || undefined,
+    status:   req.query.status || undefined,
+  };
+  const orders = store.listQcPendingOrders(filters);
+  res.json({ orders, count: orders.length, filters });
+});
+
+app.post('/api/qc/approve-order/:runOrderId', qcControllerOnly, (req, res) => {
+  try {
+    const result = store.generateDocsForRunOrder(req.params.runOrderId, {
+      approvedBy: req.user?.name,
+      method: 'QC_CONTROL_PER_ORDER',
+    });
+    io.emit('order:qc-approved', { runOrderId: Number(req.params.runOrderId) });
+    res.json({
+      ok: true,
+      idempotent: !!result.idempotent,
+      isPartial: !!result.isPartial,
+      totalOrdered: result.totalOrdered,
+      totalPicked: result.totalPicked,
+      deliveryNote: result.deliveryNote
+        ? {
+            DeliveryNoteId: result.deliveryNote.DeliveryNoteId,
+            DocNumber: result.deliveryNote.DocNumber,
+            IsPartial: !!result.deliveryNote.IsPartial,
+            Shortages: result.deliveryNote.Shortages || [],
+          }
+        : null,
+      invoice: result.invoice
+        ? { InvoiceId: result.invoice.InvoiceId, DocNumber: result.invoice.DocNumber }
+        : null,
+    });
+  } catch (err) {
+    const payload = { error: err.message };
+    if (err.code) payload.code = err.code;
+    if (err.cardCode) payload.cardCode = err.cardCode;
+    if (err.cardName) payload.cardName = err.cardName;
+    res.status(err.status || 500).json(payload);
+  }
+});
+
+app.post('/api/qc/reject-order/:runOrderId', qcControllerOnly, (req, res) => {
+  const reason = (req.body?.reason || '').toString().trim();
+  if (!reason) {
+    return res.status(400).json({
+      error: 'REASON_REQUIRED',
+      message: 'חובה לפרט סיבת דחייה',
+    });
+  }
+  const result = store.rejectOrderQc(req.params.runOrderId, {
+    reason: reason.slice(0, 500),
+    rejectedBy: req.user?.name,
+  });
+  if (result.error) {
+    const statusCode = result.error === 'ORDER_NOT_FOUND' ? 404 : 400;
+    return res.status(statusCode).json(result);
+  }
+  store.recordAudit({
+    action: 'qc.reject-order',
+    actorSub: req.user?.sub,
+    actorName: req.user?.name,
+    ip: req.ip,
+    details: {
+      runOrderId: Number(req.params.runOrderId),
+      reason: reason.slice(0, 500),
+    },
+  });
+  io.emit('order:qc-rejected', { runOrderId: Number(req.params.runOrderId) });
+  res.json(result);
+});
+
 // Phase 3 — run-level aggregate flush. Walks all approved orders in the
 // run with AggregatePending=true, groups by AggregationKey, and emits one
 // consolidated DN per group. Admin-only because it mints documents en masse.

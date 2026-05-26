@@ -3941,3 +3941,149 @@ export function getCustomerProfileStats() {
   }
   return { total: rows.length, withIssues: issues, byZone, byDay, byCompany };
 }
+
+// =====================================================================
+// QC Control — P3 (2026-05-26)
+//
+// Per-order QC review for the post-picking control screen. Two new pure
+// functions:
+//   - listQcPendingOrders(filters): orders sitting in waves that the
+//     picker submitted to QC and that haven't been approved or rejected.
+//   - rejectOrderQc(runOrderId, opts): marks an order as QcRejected with
+//     a reason; the wave stays in PENDING_QC for other orders.
+//
+// Approval reuses the existing generateDocsForRunOrder() (creates DN/INV
+// per the customer's DocPolicy, idempotent). No SAP HTTP; LOCAL ONLY.
+// =====================================================================
+
+/**
+ * List orders pending QC approval. Returns one row per RunOrder whose
+ * wave is in PENDING_QC and which doesn't already have a DN/INV (= not
+ * yet approved) and isn't QC-rejected.
+ *
+ * Filters (all optional):
+ *   - runDate:  'YYYY-MM-DD' — match run.RunDate
+ *   - pickerId: number       — match wave.AssignedPickerId
+ *   - zoneCode: string       — match run.ZoneCode
+ *   - status:   string       — override the default wave status filter
+ *                              (default: only PENDING_QC waves)
+ */
+export function listQcPendingOrders(filters = {}) {
+  const s = load();
+  const waves     = s.waves || [];
+  const stops     = s.stops || [];
+  const runs      = s.runs || [];
+  const runOrders = s.runOrders || [];
+
+  // Index for O(1) lookups.
+  const wavesByRun = new Map();
+  for (const w of waves) {
+    if (!wavesByRun.has(w.RunId)) wavesByRun.set(w.RunId, []);
+    wavesByRun.get(w.RunId).push(w);
+  }
+  const stopsByRun = new Map();
+  for (const st of stops) {
+    if (!stopsByRun.has(st.RunId)) stopsByRun.set(st.RunId, []);
+    stopsByRun.get(st.RunId).push(st);
+  }
+  const ordersByStop = new Map();
+  for (const o of runOrders) {
+    if (!ordersByStop.has(o.StopId)) ordersByStop.set(o.StopId, []);
+    ordersByStop.get(o.StopId).push(o);
+  }
+
+  const targetStatus = filters.status || 'PENDING_QC';
+  const out = [];
+
+  for (const run of runs) {
+    if (filters.runDate && run.RunDate !== filters.runDate) continue;
+    if (filters.zoneCode && run.ZoneCode !== filters.zoneCode) continue;
+
+    const runWaves = (wavesByRun.get(run.RunId) || []).filter((w) => {
+      if (w.Status !== targetStatus) return false;
+      if (filters.pickerId != null && w.AssignedPickerId !== filters.pickerId) return false;
+      return true;
+    });
+    if (runWaves.length === 0) continue;
+
+    const runStops = stopsByRun.get(run.RunId) || [];
+    for (const stop of runStops) {
+      const orders = ordersByStop.get(stop.StopId) || [];
+      for (const order of orders) {
+        // Skip already-approved (has DN/INV) and already-rejected.
+        if (order.DeliveryNoteId || order.InvoiceId) continue;
+        if (order.QcRejected) continue;
+        // The QC controller needs every wave that holds this stop's orders;
+        // we surface only the first matching wave per (run,stop) — usually
+        // there's exactly one wave per run anyway.
+        const wave = runWaves[0];
+        out.push({
+          RunOrderId:        order.RunOrderId,
+          SapCardCode:       order.SapCardCode,
+          SapCardName:       order.SapCardName,
+          SapDocNum:         order.SapDocNum,
+          SapDocEntry:       order.SapDocEntry,
+          OrderTotal:        order.OrderTotal,
+          LinesCount:        order.LinesCount,
+          StopId:            stop.StopId,
+          StopSequence:      stop.Sequence || null,
+          StopAddress:       stop.Address || null,
+          RunId:             run.RunId,
+          RunNumber:         run.RunNumber,
+          RunDate:           run.RunDate,
+          ZoneCode:          run.ZoneCode,
+          ZoneName:          run.ZoneName,
+          DriverName:        run.DriverName || null,
+          WaveId:            wave.WaveId,
+          WaveNumber:        wave.WaveNumber,
+          WaveStatus:        wave.Status,
+          AssignedPickerId:  wave.AssignedPickerId || null,
+          AssignedPickerName: wave.AssignedPickerName || null,
+          PickedByName:      wave.PickedByName || null,
+          QcSubmittedAt:     wave.CompletedAt || wave.UpdatedAt || null,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Reject a per-order QC. Marks the order with QcRejected=true plus a
+ * reason and a timestamp. The wave stays in PENDING_QC so other orders
+ * in the same wave can still be approved. The rejected order keeps its
+ * picking allocations — operator can re-pick or escalate manually.
+ *
+ * Returns:
+ *   { ok: true, order }                                 — success
+ *   { error: 'ORDER_NOT_FOUND' }                        — bad id → 404 caller
+ *   { error: 'ALREADY_APPROVED', message }              — has DN → 400
+ *   { error: 'ALREADY_REJECTED', current: {...} }       — duplicate → 400
+ */
+export function rejectOrderQc(runOrderId, opts = {}) {
+  const s = load();
+  const order = (s.runOrders || []).find((o) => o.RunOrderId === Number(runOrderId));
+  if (!order) return { error: 'ORDER_NOT_FOUND' };
+  if (order.DeliveryNoteId || order.InvoiceId) {
+    return {
+      error: 'ALREADY_APPROVED',
+      message: 'ההזמנה כבר אושרה ויש לה תעודות; אי אפשר לדחות עכשיו',
+    };
+  }
+  if (order.QcRejected) {
+    return {
+      error: 'ALREADY_REJECTED',
+      current: {
+        reason: order.QcRejectionReason || null,
+        at: order.QcRejectedAt || null,
+        by: order.QcRejectedBy || null,
+      },
+    };
+  }
+  order.QcRejected        = true;
+  order.QcRejectionReason = opts.reason || null;
+  order.QcRejectedBy      = opts.rejectedBy || null;
+  order.QcRejectedAt      = new Date().toISOString();
+  save();
+  return { ok: true, order };
+}
