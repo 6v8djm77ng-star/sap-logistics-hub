@@ -211,6 +211,28 @@ function adminOnly(req, res, next) {
   }
 }
 
+// QC Control (P1, 2026-05-26): allow ADMIN + QC_CONTROLLER to reach the
+// post-picking quality-control screen and its endpoints. P3+ will mount
+// /api/qc/* routes behind this gate. PLANNER is intentionally excluded —
+// QC must be done by a separate role from the one who plans the runs.
+function qcControllerOnly(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  try {
+    const payload = verifyToken(auth.slice(7));
+    if (payload.role !== 'ADMIN' && payload.role !== 'QC_CONTROLLER') {
+      return res.status(403).json({ error: 'QC_CONTROLLER or ADMIN role required' });
+    }
+    req.user = payload;
+    return next();
+  } catch (err) {
+    const code = err.code === 'TOKEN_REVOKED' ? 'TOKEN_REVOKED' : undefined;
+    return res.status(401).json({ error: err.message || 'Invalid or expired token', code });
+  }
+}
+
 // Zod schemas for every auth endpoint. Reject unknown / malformed payloads
 // at the front door instead of trusting `req.body.x` to be a string.
 const LoginSchema = z.object({

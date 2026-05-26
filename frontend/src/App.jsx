@@ -23,6 +23,7 @@ import OpenOrdersPage from './pages/OpenOrdersPage.jsx';
 import WeeklyReportPage from './pages/WeeklyReportPage.jsx';
 import DailyClosurePage from './pages/DailyClosurePage.jsx';
 import DocumentsPage from './pages/DocumentsPage.jsx';
+import QcControlPage from './pages/QcControlPage.jsx';
 import CustomerPolicyPage from './pages/CustomerPolicyPage.jsx';
 import CustomerDocPolicyPage from './pages/CustomerDocPolicyPage.jsx';
 import DriverLoginPage from './pages/driver/DriverLoginPage.jsx';
@@ -181,6 +182,11 @@ export default function App() {
         <Route path="weekly" element={<WeeklyReportPage />} />
         <Route path="closure" element={<DailyClosurePage />} />
         <Route path="documents" element={<DocumentsPage />} />
+        {/* QC Control (P1, 2026-05-26) — placeholder page until P4 ships
+            the real waves+orders list. Sidebar visibility is filtered to
+            QC_CONTROLLER+ADMIN in DashboardLayout; backend gate is in the
+            qcControllerOnly middleware (demoServer.js). */}
+        <Route path="qc-control" element={<QcControlPage />} />
         <Route path="customer-policy" element={<CustomerPolicyPage />} />
         <Route path="customer-doc-policy" element={<CustomerDocPolicyPage />} />
         <Route path="pickers" element={<PickersPage />} />

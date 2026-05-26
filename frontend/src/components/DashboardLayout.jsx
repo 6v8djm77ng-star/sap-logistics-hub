@@ -28,6 +28,7 @@ import {
   Eye,
   ChevronDown,
   ChevronUp,
+  ShieldCheck,
 } from 'lucide-react';
 import clsx from 'clsx';
 import RefreshButton from './RefreshButton.jsx';
@@ -52,6 +53,10 @@ const workflowSection = [
   // { to: '/planner',    label: 'תכנון יומי',       icon: CalendarClock },
   { to: '/runs',       label: 'מסלולי הפצה',     icon: Truck },
   { to: '/warehouse',  label: 'ליקוט מחסן',      icon: Warehouse },
+  // QC Control (P1, 2026-05-26) — only QC_CONTROLLER + ADMIN see this item.
+  // Visibility is filtered below in the render via the `roles` field.
+  { to: '/qc-control', label: 'בקרה אחרי ליקוט', icon: ShieldCheck,
+    roles: ['QC_CONTROLLER', 'ADMIN'] },
   { to: '/documents',  label: 'תעודות וחשבוניות', icon: FileText, highlight: true },
   { to: '/live',       label: 'מעקב חי',         icon: Activity },
   { to: '/returns',    label: 'חזרות',           icon: RotateCcw },
@@ -199,10 +204,15 @@ export default function DashboardLayout() {
         </div>
 
         <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {/* Section 1 — daily workflow (always visible) */}
-          {workflowSection.map((item) => (
-            <NavItem key={item.to} item={item} />
-          ))}
+          {/* Section 1 — daily workflow.
+              Items without a `roles` field are visible to everyone; items
+              with `roles` are visible only when user.role is one of them.
+              (QC Control is the first item to use this — see workflowSection.) */}
+          {workflowSection
+            .filter((item) => !item.roles || item.roles.includes(user?.role))
+            .map((item) => (
+              <NavItem key={item.to} item={item} />
+            ))}
 
           {/* Section 2 — reports (collapsible) */}
           <CategoryHeader
