@@ -3995,16 +3995,19 @@ export function listQcPendingOrders(filters = {}) {
   }
   // Picked items per order. v2 (P5+, 2026-05-26): the QC controller
   // expands an order row and sees what was actually picked, with a
-  // visual check/X per item. Allocations link to the order via
-  // RunOrderId; the parent waveLine carries the SAP item identity.
-  const allocsByOrder = new Map();
-  for (const a of waveAllocations) {
-    if (a.RunOrderId == null) continue;
-    if (!allocsByOrder.has(a.RunOrderId)) allocsByOrder.set(a.RunOrderId, []);
-    allocsByOrder.get(a.RunOrderId).push(a);
-  }
+  // visual check/X per item. Allocations link to the order by
+  // SapDocEntry + CompanyCode (mirrors _computeOrderFulfillment's
+  // filter — there's no direct RunOrderId on allocations). The
+  // parent waveLine carries the SAP item identity (ItemCode/Name).
+  // We also bound the join by waveLines-of-the-target-wave so an
+  // allocation from a re-picked older wave doesn't leak in.
   const waveLineById = new Map();
   for (const wl of waveLines) waveLineById.set(wl.WaveLineId, wl);
+  const waveLineIdsByWave = new Map();
+  for (const wl of waveLines) {
+    if (!waveLineIdsByWave.has(wl.WaveId)) waveLineIdsByWave.set(wl.WaveId, new Set());
+    waveLineIdsByWave.get(wl.WaveId).add(wl.WaveLineId);
+  }
 
   const targetStatus = filters.status || 'PENDING_QC';
   const out = [];
@@ -4028,8 +4031,15 @@ export function listQcPendingOrders(filters = {}) {
         if (order.QcRejected) continue;
         const wave = runWaves[0];
 
-        // Build pickedItems for the expandable row.
-        const allocs = allocsByOrder.get(order.RunOrderId) || [];
+        // Build pickedItems for the expandable row. Match allocations by
+        // SapDocEntry + CompanyCode and require their WaveLine to belong
+        // to this run's active wave — mirrors _computeOrderFulfillment.
+        const allowedWaveLineIds = waveLineIdsByWave.get(wave.WaveId) || new Set();
+        const allocs = waveAllocations.filter((a) =>
+          Number(a.SapDocEntry) === Number(order.SapDocEntry) &&
+          a.CompanyCode === order.CompanyCode &&
+          allowedWaveLineIds.has(a.WaveLineId)
+        );
         const pickedItems = allocs.map((a) => {
           const wl = waveLineById.get(a.WaveLineId);
           const ordered = Number(a.Quantity || 0);
