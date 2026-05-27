@@ -93,7 +93,7 @@ function OrderRow({ row, onApprove, onReject, isApprovePending }) {
     }));
   };
 
-  const colSpanExpanded = 9;
+  const colSpanExpanded = 8;
 
   return (
     <>
@@ -108,10 +108,6 @@ function OrderRow({ row, onApprove, onReject, isApprovePending }) {
         </td>
         <td className="px-3 py-2 font-mono text-xs">
           #{row.SapDocNum}
-        </td>
-        <td className="px-3 py-2">
-          <div className="font-medium">{row.SapCardName}</div>
-          <div className="text-xs text-gray-500 font-mono">{row.SapCardCode}</div>
         </td>
         <td className="px-3 py-2">
           <div className="text-xs font-mono">{row.RunNumber}</div>
@@ -376,6 +372,14 @@ export default function QcControlPage() {
         )}
       </div>
 
+      {/* Customer-grouped rendering: same customer's orders share one
+          header instead of repeating the customer name on every row.
+          Group key = `${CompanyCode}:${SapCardCode}` so two different
+          companies with the same CardCode don't collide. Within a group
+          we keep the source order from the API (newest first). */}
+      {(() => null)()}
+      {/* (computed inline below) */}
+
       {/* Empty state */}
       {orders.length === 0 && !isLoading ? (
         <div className="bg-blue-50 border-2 border-blue-200 rounded-xl p-5 text-sm">
@@ -393,7 +397,6 @@ export default function QcControlPage() {
               <tr>
                 <th className="px-3 py-2 w-8"></th>
                 <th className="px-3 py-2 text-right">הזמנה</th>
-                <th className="px-3 py-2 text-right">לקוח</th>
                 <th className="px-3 py-2 text-right">מסלול</th>
                 <th className="px-3 py-2 text-right">אזור</th>
                 <th className="px-3 py-2 text-right">מלקט</th>
@@ -403,15 +406,51 @@ export default function QcControlPage() {
               </tr>
             </thead>
             <tbody>
-              {orders.map((row) => (
-                <OrderRow
-                  key={row.RunOrderId}
-                  row={row}
-                  onApprove={(id) => approveMutation.mutate(id)}
-                  onReject={(r) => setRejecting(r)}
-                  isApprovePending={approveMutation.isPending}
-                />
-              ))}
+              {(() => {
+                // Group orders by customer (CompanyCode:SapCardCode) and
+                // preserve the API order within each group.
+                const groups = new Map();
+                for (const o of orders) {
+                  const key = `${o.CompanyCode || ''}:${o.SapCardCode || ''}`;
+                  if (!groups.has(key)) groups.set(key, []);
+                  groups.get(key).push(o);
+                }
+                const rendered = [];
+                for (const [groupKey, groupOrders] of groups) {
+                  const first = groupOrders[0];
+                  const groupSum = groupOrders.reduce(
+                    (s, o) => s + Number(o.OrderTotal || 0), 0,
+                  );
+                  rendered.push(
+                    <tr key={`hdr-${groupKey}`} className="bg-purple-50 border-t-2 border-purple-200">
+                      <td colSpan={8} className="px-3 py-2">
+                        <div className="flex items-center justify-between">
+                          <div className="font-bold text-purple-900 flex items-center gap-2">
+                            <Package size={14} className="text-purple-700" />
+                            {first.SapCardName}
+                            <span className="text-xs text-purple-600 font-mono">{first.SapCardCode}</span>
+                          </div>
+                          <div className="text-xs text-purple-800">
+                            {groupOrders.length} הזמנות · סה״כ ₪{groupSum.toLocaleString()}
+                          </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                  for (const row of groupOrders) {
+                    rendered.push(
+                      <OrderRow
+                        key={row.RunOrderId}
+                        row={row}
+                        onApprove={(id) => approveMutation.mutate(id)}
+                        onReject={(r) => setRejecting(r)}
+                        isApprovePending={approveMutation.isPending}
+                      />
+                    );
+                  }
+                }
+                return rendered;
+              })()}
             </tbody>
           </table>
         </div>
