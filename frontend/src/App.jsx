@@ -24,6 +24,7 @@ import WeeklyReportPage from './pages/WeeklyReportPage.jsx';
 import DailyClosurePage from './pages/DailyClosurePage.jsx';
 import DocumentsPage from './pages/DocumentsPage.jsx';
 import QcControlPage from './pages/QcControlPage.jsx';
+import RolePermissionsPage from './pages/RolePermissionsPage.jsx';
 import CustomerPolicyPage from './pages/CustomerPolicyPage.jsx';
 import CustomerDocPolicyPage from './pages/CustomerDocPolicyPage.jsx';
 import DriverLoginPage from './pages/driver/DriverLoginPage.jsx';
@@ -75,6 +76,23 @@ function RequireAuth({ children, roles }) {
     return <Navigate to="/complete-profile" replace />;
   }
   if (roles && !roles.includes(user.role)) {
+    return <Navigate to="/" replace />;
+  }
+  // (2026-05-28) Role-permissions gate. If the user has an explicit
+  // allowedScreens list AND it doesn't include '*' AND doesn't include
+  // the current pathname, send them home. This makes URL navigation
+  // respect the same matrix as the sidebar. ADMIN bypasses because the
+  // backend always seeds ADMIN with ['*']. Dashboard root '/' and the
+  // mandatory onboarding routes are always reachable.
+  const ALWAYS_ALLOWED = new Set(['/', '/force-change-password', '/complete-profile']);
+  const allowedScreens = user.allowedScreens || [];
+  if (
+    !roles
+    && Array.isArray(allowedScreens) && allowedScreens.length > 0
+    && !allowedScreens.includes('*')
+    && !ALWAYS_ALLOWED.has(location.pathname)
+    && !allowedScreens.includes(location.pathname)
+  ) {
     return <Navigate to="/" replace />;
   }
   return children;
@@ -187,6 +205,14 @@ export default function App() {
             QC_CONTROLLER+ADMIN in DashboardLayout; backend gate is in the
             qcControllerOnly middleware (demoServer.js). */}
         <Route path="qc-control" element={<QcControlPage />} />
+        <Route
+          path="role-permissions"
+          element={
+            <RequireAuth roles={['ADMIN']}>
+              <RolePermissionsPage />
+            </RequireAuth>
+          }
+        />
         <Route path="customer-policy" element={<CustomerPolicyPage />} />
         <Route path="customer-doc-policy" element={<CustomerDocPolicyPage />} />
         <Route path="pickers" element={<PickersPage />} />

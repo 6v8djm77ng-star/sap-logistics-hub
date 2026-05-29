@@ -15,6 +15,7 @@ import bcrypt from 'bcryptjs';
 // the Invoice side of flushAggregateDocsForRun. Same dry-run-default and
 // whitelist gating apply — see sapWriter.js header.
 import { writeDeliveryNote, writeInvoice } from './sapWriter.js';
+import { ROLE_CODES, DEFAULT_ROLE_PERMISSIONS, isScreenAllowedForList } from './screenRegistry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STORE_PATH = path.resolve(__dirname, '../../data/store.json');
@@ -56,6 +57,11 @@ export function load() {
       const def = getDefault();
       if (!cache.users) { cache.users = def.users; cache.nextUserId = def.nextUserId; }
       if (!cache.zones) { cache.zones = def.zones; cache.nextZoneId = def.nextZoneId; }
+      // (2026-05-28) Role permissions migration. Older stores have no
+      // rolePermissions array — seed with DEFAULT_ROLE_PERMISSIONS so the
+      // matrix UI has something to show on day one. Also ensure every
+      // known role has an entry (in case a new role was added since).
+      _ensureRolePermissionsSeed(cache);
       console.log(`[store] Loaded ${cache.drivers?.length || 0} drivers, ${cache.users?.length || 0} users, ${cache.zones?.length || 0} zones`);
     } else {
       cache = getDefault();
@@ -485,6 +491,87 @@ export function getUserByUsername(username) {
 
 export function getUserById(id) {
   return load().users.find((u) => u.UserId === Number(id));
+}
+
+// ============================================================
+// Role Permissions (2026-05-28) — admin-editable role→screens map.
+// Persists in cache.rolePermissions as an array of:
+//   { RoleCode, AllowedScreens: string[], UpdatedAt, UpdatedBy }
+// The wildcard '*' in AllowedScreens means "all screens" (ADMIN).
+// Defaults are seeded from screenRegistry.DEFAULT_ROLE_PERMISSIONS on
+// first load. Missing roles get seeded too — adding a new ROLE_CODE
+// elsewhere will auto-populate its row next restart.
+// ============================================================
+function _ensureRolePermissionsSeed(cacheObj) {
+  if (!Array.isArray(cacheObj.rolePermissions)) cacheObj.rolePermissions = [];
+  const now = new Date().toISOString();
+  const byRole = new Map(cacheObj.rolePermissions.map((r) => [r.RoleCode, r]));
+  for (const code of ROLE_CODES) {
+    if (!byRole.has(code)) {
+      cacheObj.rolePermissions.push({
+        RoleCode: code,
+        AllowedScreens: (DEFAULT_ROLE_PERMISSIONS[code] || []).slice(),
+        UpdatedAt: now,
+        UpdatedBy: 'system',
+      });
+    }
+  }
+}
+
+export function listRolePermissions() {
+  const s = load();
+  // Return a stable order: ADMIN first, then by ROLE_CODES order, then
+  // anything unknown (custom roles a future admin might add manually).
+  const byCode = new Map((s.rolePermissions || []).map((r) => [r.RoleCode, r]));
+  const ordered = [];
+  for (const code of ROLE_CODES) {
+    if (byCode.has(code)) ordered.push(byCode.get(code));
+  }
+  for (const row of (s.rolePermissions || [])) {
+    if (!ROLE_CODES.includes(row.RoleCode)) ordered.push(row);
+  }
+  return ordered;
+}
+
+export function getAllowedScreensForRole(roleCode) {
+  const s = load();
+  const row = (s.rolePermissions || []).find((r) => r.RoleCode === roleCode);
+  if (!row) return (DEFAULT_ROLE_PERMISSIONS[roleCode] || []).slice();
+  return Array.isArray(row.AllowedScreens) ? row.AllowedScreens.slice() : [];
+}
+
+export function isScreenAllowedForRole(roleCode, screenCode) {
+  return isScreenAllowedForList(getAllowedScreensForRole(roleCode), screenCode);
+}
+
+export function setRolePermissions(roleCode, allowedScreens, { updatedBy } = {}) {
+  if (!ROLE_CODES.includes(roleCode)) {
+    return { ok: false, error: 'UNKNOWN_ROLE' };
+  }
+  if (!Array.isArray(allowedScreens)) {
+    return { ok: false, error: 'ALLOWED_SCREENS_NOT_ARRAY' };
+  }
+  // Sanity guard: never let an admin lock themselves out of /role-permissions
+  // by removing it from ADMIN. ADMIN always retains '*' or at least the
+  // route to this page itself.
+  if (roleCode === 'ADMIN') {
+    if (!allowedScreens.includes('*') && !allowedScreens.includes('/role-permissions')) {
+      return { ok: false, error: 'ADMIN_MUST_KEEP_PERMISSIONS_PAGE' };
+    }
+  }
+  const s = load();
+  if (!Array.isArray(s.rolePermissions)) s.rolePermissions = [];
+  const idx = s.rolePermissions.findIndex((r) => r.RoleCode === roleCode);
+  const next = {
+    RoleCode: roleCode,
+    // Dedupe + drop empties.
+    AllowedScreens: [...new Set(allowedScreens.filter((x) => typeof x === 'string' && x.length))],
+    UpdatedAt: new Date().toISOString(),
+    UpdatedBy: updatedBy || null,
+  };
+  if (idx >= 0) s.rolePermissions[idx] = next; else s.rolePermissions.push(next);
+  save();
+  return { ok: true, row: next };
 }
 
 // Per-zone-picker-assignment — picker source correction (2026-05-22):

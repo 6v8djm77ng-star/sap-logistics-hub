@@ -80,13 +80,17 @@ const reportsSection = [
 ];
 
 const settingsSection = [
-  { to: '/customer-policy',     label: 'מדיניות לקוחות', icon: Building2 },
-  { to: '/customer-doc-policy', label: 'מדיניות מסמכים', icon: FileText },
-  { to: '/zones',               label: 'אזורי הפצה',     icon: MapPin },
-  { to: '/drivers',             label: 'נהגים',          icon: Users },
-  { to: '/pickers',             label: 'מלקטים',         icon: Warehouse },
-  { to: '/users',               label: 'משתמשים',        icon: UserCog },
-  { to: '/settings',            label: 'הגדרות + SAP',   icon: Settings },
+  { to: '/customer-policy',     label: 'מדיניות לקוחות',  icon: Building2 },
+  { to: '/customer-doc-policy', label: 'מדיניות מסמכים',  icon: FileText },
+  { to: '/zones',               label: 'אזורי הפצה',      icon: MapPin },
+  { to: '/drivers',             label: 'נהגים',           icon: Users },
+  { to: '/pickers',             label: 'מלקטים',          icon: Warehouse },
+  { to: '/users',               label: 'משתמשים',         icon: UserCog },
+  // Role Permissions (2026-05-28) — ADMIN only. The matrix UI lives at
+  // /role-permissions and lets an admin define what each role can see.
+  { to: '/role-permissions',    label: 'הרשאות תפקידים',  icon: ShieldCheck,
+    roles: ['ADMIN'] },
+  { to: '/settings',            label: 'הגדרות + SAP',    icon: Settings },
 ];
 
 const wallboardItem = { to: '/wallboard', label: 'מסך גדול', icon: Tv };
@@ -204,40 +208,69 @@ export default function DashboardLayout() {
         </div>
 
         <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
-          {/* Section 1 — daily workflow.
-              Items without a `roles` field are visible to everyone; items
-              with `roles` are visible only when user.role is one of them.
-              (QC Control is the first item to use this — see workflowSection.) */}
-          {workflowSection
-            .filter((item) => !item.roles || item.roles.includes(user?.role))
-            .map((item) => (
-              <NavItem key={item.to} item={item} />
-            ))}
+          {/* (2026-05-28) Role-permissions filter — applies to ALL three
+              sections + standalone now. A sidebar item is visible when:
+                1. user.allowedScreens includes '*' (admin wildcard) OR
+                2. user.allowedScreens explicitly includes item.to OR
+                3. the user has no permissions list yet (legacy users,
+                   e.g. a freshly-issued JWT before the matrix was set
+                   up). In that case we fall back to the legacy
+                   item.roles[] hint and otherwise show the item.
+              The item.roles[] field is still honored as an additional
+              safety net so anything pre-tagged ADMIN-only doesn't leak. */}
+          {(() => {
+            const allowed = user?.allowedScreens || [];
+            const wildcard = allowed.includes('*');
+            const isVisible = (item) => {
+              if (item.roles && !item.roles.includes(user?.role)) return false;
+              if (wildcard) return true;
+              if (allowed.length === 0) return true; // legacy fallback
+              return allowed.includes(item.to);
+            };
+            const visibleWorkflow  = workflowSection.filter(isVisible);
+            const visibleReports   = reportsSection.filter(isVisible);
+            const visibleSettings  = settingsSection.filter(isVisible);
+            const wallboardVisible = isVisible(wallboardItem);
+            return (
+              <>
+                {visibleWorkflow.map((item) => (
+                  <NavItem key={item.to} item={item} />
+                ))}
 
-          {/* Section 2 — reports (collapsible) */}
-          <CategoryHeader
-            label="דוחות"
-            icon={BarChart3}
-            open={openCategories.reports}
-            onToggle={() => toggleCategory('reports')}
-          />
-          {openCategories.reports &&
-            reportsSection.map((item) => <NavItem key={item.to} item={item} />)}
+                {visibleReports.length > 0 && (
+                  <>
+                    <CategoryHeader
+                      label="דוחות"
+                      icon={BarChart3}
+                      open={openCategories.reports}
+                      onToggle={() => toggleCategory('reports')}
+                    />
+                    {openCategories.reports &&
+                      visibleReports.map((item) => <NavItem key={item.to} item={item} />)}
+                  </>
+                )}
 
-          {/* Section 3 — settings / master data (collapsible) */}
-          <CategoryHeader
-            label="הגדרות"
-            icon={Settings}
-            open={openCategories.settings}
-            onToggle={() => toggleCategory('settings')}
-          />
-          {openCategories.settings &&
-            settingsSection.map((item) => <NavItem key={item.to} item={item} />)}
+                {visibleSettings.length > 0 && (
+                  <>
+                    <CategoryHeader
+                      label="הגדרות"
+                      icon={Settings}
+                      open={openCategories.settings}
+                      onToggle={() => toggleCategory('settings')}
+                    />
+                    {openCategories.settings &&
+                      visibleSettings.map((item) => <NavItem key={item.to} item={item} />)}
+                  </>
+                )}
 
-          {/* Standalone — wallboard (operations display, not part of daily flow) */}
-          <div className="pt-3 mt-3 border-t border-gray-100">
-            <NavItem item={wallboardItem} />
-          </div>
+                {wallboardVisible && (
+                  <div className="pt-3 mt-3 border-t border-gray-100">
+                    <NavItem item={wallboardItem} />
+                  </div>
+                )}
+              </>
+            );
+          })()}
         </nav>
 
         <div className="p-3 border-t border-gray-200">

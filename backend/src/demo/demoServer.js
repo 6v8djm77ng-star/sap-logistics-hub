@@ -29,6 +29,7 @@ import * as data from './demoData.js';
 import { startSimulation } from './liveSimulation.js';
 import * as sapBridge from './sapBridge.js';
 import * as store from './persistentStore.js';
+import { SCREENS, ROLE_CODES } from './screenRegistry.js';
 import { evaluatePlanForOrder, hebrewDayFromDate } from './orderPlanEval.js';
 import { previewSelectedOrders, enrichConflict } from './previewSelectedOrders.js';
 import { createIdempotencyCache, idempotencyMiddleware } from './idempotency.js';
@@ -682,6 +683,11 @@ app.get('/api/auth/me', (req, res) => {
         mustChangePassword: !!user.MustChangePassword,
         passwordResetReason: user.PasswordResetReason || null,
         profileCompleted: user.ProfileCompleted !== false,
+        // (2026-05-28) Role permissions — the frontend uses this to
+        // filter sidebar items and to guard direct-URL navigation. '*'
+        // means "all screens". For unknown roles returns []; ADMIN
+        // always gets ['*'] from the default seed.
+        allowedScreens: store.getAllowedScreensForRole(payload.role) || [],
       } : payload;
       return res.json({ user: enriched });
     } catch {}
@@ -4107,6 +4113,59 @@ app.post('/api/qc/reject-order/:runOrderId', qcControllerOnly, (req, res) => {
     },
   });
   io.emit('order:qc-rejected', { runOrderId: Number(req.params.runOrderId) });
+  res.json(result);
+});
+
+// =====================================================================
+// Role Permissions endpoints (2026-05-28)
+//
+// Admin-only matrix of role→allowedScreens. The frontend's
+// /role-permissions page reads + writes here, and /api/auth/me serves
+// the *effective* allowedScreens for the current user (so the sidebar
+// doesn't need to refetch on every page).
+//
+//   GET  /api/admin/screens              — master screen registry
+//   GET  /api/admin/role-permissions     — all rows
+//   PUT  /api/admin/role-permissions/:roleCode  — update one role
+//
+// LOCAL ONLY — no SAP HTTP from any of these.
+// =====================================================================
+app.get('/api/admin/screens', adminOnly, (req, res) => {
+  res.json({ screens: SCREENS, roleCodes: ROLE_CODES });
+});
+
+app.get('/api/admin/role-permissions', adminOnly, (req, res) => {
+  res.json({ rolePermissions: store.listRolePermissions() });
+});
+
+app.put('/api/admin/role-permissions/:roleCode', adminOnly, (req, res) => {
+  const roleCode = String(req.params.roleCode || '').toUpperCase();
+  const allowedScreens = Array.isArray(req.body?.allowedScreens)
+    ? req.body.allowedScreens : null;
+  if (!allowedScreens) {
+    return res.status(400).json({ error: 'BAD_BODY', message: 'allowedScreens must be an array of strings' });
+  }
+  const result = store.setRolePermissions(roleCode, allowedScreens, {
+    updatedBy: req.user?.name || req.user?.username,
+  });
+  if (!result.ok) {
+    const statusByCode = {
+      UNKNOWN_ROLE: 404,
+      ALLOWED_SCREENS_NOT_ARRAY: 400,
+      ADMIN_MUST_KEEP_PERMISSIONS_PAGE: 422,
+    };
+    return res.status(statusByCode[result.error] || 400).json(result);
+  }
+  store.recordAudit({
+    action: 'role-permissions.update',
+    actorSub: req.user?.sub,
+    actorName: req.user?.name,
+    ip: req.ip,
+    details: { roleCode, allowedScreens: result.row.AllowedScreens },
+  });
+  // Tell every connected client that role permissions changed so the
+  // sidebar can refetch /api/auth/me to pick up the new mask.
+  io.emit('role-permissions:updated', { roleCode });
   res.json(result);
 });
 
