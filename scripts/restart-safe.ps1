@@ -152,8 +152,18 @@ if ($DryRun) {
     exit 0
 }
 
-Log "STEP 3: pm2 restart $PM2_NAME --update-env"
-& pm2 restart $PM2_NAME --update-env 2>&1 | Out-Null
+# (2026-05-28) Use `pm2 reload ecosystem.config.cjs` instead of plain
+# `pm2 restart` so the .env file is re-read on every restart. Plain
+# `pm2 restart --update-env` only refreshes env from the current PM2
+# session — it does NOT re-execute ecosystem.config.cjs, so backend/.env
+# edits silently never reach the child. Discovered when a CORS_ORIGINS
+# update appeared in .env but the running process kept blocking the new
+# origin. `pm2 reload` re-executes the ecosystem file → fs.readFileSync
+# of backend/.env runs → child gets the fresh env. Auto-recovery from
+# the wipe bug below still applies if the reload damages the store.
+$ECOSYSTEM = Join-Path $REPO_ROOT 'ecosystem.config.cjs'
+Log "STEP 3: pm2 reload $ECOSYSTEM --only $PM2_NAME --update-env"
+& pm2 reload $ECOSYSTEM --only $PM2_NAME --update-env 2>&1 | Out-Null
 Start-Sleep -Seconds 5
 
 # -----------------------------------------------------------------------------
