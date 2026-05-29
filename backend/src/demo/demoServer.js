@@ -537,12 +537,61 @@ app.post('/api/auth/mobile-link', async (req, res) => {
       user: payload.username,
     });
 
-    // Build the public URL the QR will encode. Priority order:
+    // Build the public URL the QR will encode. Priority order
+    // (rewritten 2026-05-27 — old log-scan was unreliable because every
+    // cloudflared respawn either wrote to a different log path or didn't
+    // log at all, leaving the file stale for days):
+    //
     //   1. PUBLIC_URL env var (set by admin if they have a stable domain)
-    //   2. Latest Cloudflare tunnel URL (auto-detected from cf-tunnel logs)
-    //   3. LAN IP (works only inside the office)
-    //   4. Whatever host the request came on (last resort)
+    //   2. Last trycloudflare URL in CORS_ORIGINS — admin MUST add the
+    //      tunnel URL there for the tunnel to work at all, so the trailing
+    //      entry is by construction the current production tunnel
+    //   3. Live probe of cloudflared metrics endpoints — scan ports
+    //      20241-20260 for /quicktunnel, then cross-check the returned
+    //      hostname against CORS_ORIGINS so a stale cloudflared process
+    //      can't win over the active one
+    //   4. cf-tunnel-error.log scan (legacy fallback)
+    //   5. LAN IP (works only inside the office)
+    //   6. Whatever host the request came on (last resort)
     let publicBase = process.env.PUBLIC_URL || null;
+
+    // Helper — extract trycloudflare URLs from the CORS allowlist.
+    const corsTunnels = (process.env.CORS_ORIGINS || '')
+      .split(',').map((s) => s.trim()).filter(Boolean)
+      .filter((o) => /^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(o));
+
+    // (2) Last entry in CORS_ORIGINS is the active tunnel by convention.
+    if (!publicBase && corsTunnels.length > 0) {
+      publicBase = corsTunnels[corsTunnels.length - 1];
+    }
+
+    // (3) Live probe — only useful if (2) found nothing (admin forgot to
+    // add the tunnel URL to CORS) OR multiple cloudflareds are running
+    // and the allowlist contains a stale URL whose process is dead.
+    if (!publicBase) {
+      try {
+        for (let port = 20241; port <= 20260; port++) {
+          // 250ms per port × 20 ports = 5s worst case. Acceptable for a
+          // one-shot mobile-link generation; not on a hot path.
+          const probe = await fetch(`http://127.0.0.1:${port}/quicktunnel`, {
+            signal: AbortSignal.timeout(250),
+          }).then((r) => r.ok ? r.json() : null).catch(() => null);
+          if (probe?.hostname) {
+            const candidate = `https://${probe.hostname}`;
+            // If CORS allowlist is non-empty, only accept probes that
+            // match it — prevents the QR from pointing at a tunnel the
+            // backend would block on CORS anyway.
+            if (corsTunnels.length === 0 || corsTunnels.includes(candidate)) {
+              publicBase = candidate;
+              break;
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // (4) Legacy log scan — kept as a last-ditch fallback for environments
+    // where neither CORS nor metrics-probe yields anything.
     if (!publicBase) {
       try {
         const fs = await import('fs');
