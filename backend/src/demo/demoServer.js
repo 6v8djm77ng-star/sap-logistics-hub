@@ -2462,12 +2462,27 @@ app.get('/api/orders/open-with-plan-eval', async (req, res) => {
 
     const filters = { ...base.filters, applyDeliveryDay };
 
+    // (2026-05-27) Build a per-customer total map so evaluatePlanForOrder
+    // can surface customerTotalCurrent on EVERY row (passing or failing).
+    // Uses the same customerKey rule as computePlanExclusions so the two
+    // datasets stay aligned even if the rule changes there. The user
+    // asked: "why does a ₪525 order say 'עובר' against a ₪3,000 threshold?"
+    // Answer: because the *customer's* aggregate ≥ ₪3,000. Surface it.
+    const customerKey = (o) =>
+      String(o.ParentCardCode || o.ChainCode || o.MasterCustomerKey || o.Father || o.CardCode || '').trim();
+    const customerTotalsByKey = new Map();
+    for (const o of base.allOrders) {
+      const k = customerKey(o);
+      customerTotalsByKey.set(k, (customerTotalsByKey.get(k) || 0) + Number(o.DocTotal || 0));
+    }
+
     const ordersWithEval = base.allOrders.map((o) => {
       const companyName = o.CompanyCode === 'A' ? 'OIG' : o.CompanyCode === 'B' ? 'UNICO' : o.CompanyCode;
       const profile = profileMap.get(`${companyName}:${o.CardCode}`) || null;
       const planEval = evaluatePlanForOrder({
         order: o,
         exclusionReasons: exclusionMap.get(`${o.CompanyCode}:${o.DocEntry}`) || [],
+        customerTotal: customerTotalsByKey.get(customerKey(o)) ?? 0,
         profile,
         todayHebrew,
         filters,

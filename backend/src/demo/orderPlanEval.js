@@ -24,6 +24,7 @@ export function hebrewDayFromDate(dateStr) {
 export function evaluatePlanForOrder({
   order,
   exclusionReasons = [],
+  customerTotal = null,
   profile = null,
   todayHebrew,
   filters = {},
@@ -37,6 +38,14 @@ export function evaluatePlanForOrder({
   const customerTotalOK = !failsCustomerTotal;
   const hasOpenLines    = !failsNoOpenLines;
   const stockOK         = !failsStock;
+
+  // (2026-05-27) Always surface the customer's aggregate total so the UI
+  // can tooltip "סך לקוח: ₪X,XXX" on every row — passing or failing.
+  // Previously the field was only populated on failure, which made
+  // passing rows look opaque (why is ₪525 "עובר" with sף ₪3,000? because
+  // the *customer's* total is ₪4,500). The wrapper computes it.
+  const effectiveCustomerTotal =
+    customerTotal != null ? customerTotal : (failsCustomerTotal?.total ?? null);
 
   let deliveryDayOK = true;
   let deliveryDayExpected = null;
@@ -57,7 +66,7 @@ export function evaluatePlanForOrder({
   return {
     passes,
     customerTotalOK,
-    customerTotalCurrent: failsCustomerTotal?.total ?? null,
+    customerTotalCurrent: effectiveCustomerTotal,
     customerTotalThreshold: filters.minCustomerTotal ?? null,
     hasOpenLines,
     noOpenLines: !!failsNoOpenLines,

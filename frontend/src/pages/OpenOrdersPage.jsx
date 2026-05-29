@@ -9,12 +9,12 @@
  * a Run. Toggle + filters persist to localStorage. The legacy
  * /api/orders/open path stays the default when the toggle is OFF.
  */
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import api from '../services/api.js';
 import { format } from 'date-fns';
-import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, CalendarDays, MapPin } from 'lucide-react';
+import { Package, Search, X, ChevronDown, ChevronUp, CheckCircle2, AlertTriangle, SlidersHorizontal, Send, MapPin } from 'lucide-react';
 import SendToPickingModal from '../components/SendToPickingModal.jsx';
 
 // Hebrew weekday names indexed by Date.getDay() (0=Sunday). Matches the
@@ -67,27 +67,14 @@ function savePlanEvalCfg(cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// Zone toolbar (2026-05-24): chip-multiselect that filters the open-orders
-// table by the city-derived `Zone` field added in 6a1dff7. Selection
-// persists across reloads so the operator's day-to-day focus (e.g. only
-// SHARON + CENTER_NEAR) doesn't reset on refetch.
+// Zone display (2026-05-27): per user request the zone chips are no longer
+// click-to-filter. They became a "לופ ובלגאן" because the day tabs already
+// hide rows by day, and stacking a zone filter on top created confusion.
+// Now they're read-only labels — for each day-active dataset we show which
+// zones are present + how many orders sit in each. No selection, no
+// localStorage, no filter cascade.
 // ---------------------------------------------------------------------------
-const ZONE_FILTER_STORAGE_KEY = 'openOrders.selectedZones.v1';
-// Sentinel for orders whose city couldn't be mapped (Zone === null on the
-// row). Keeping it as a Set member alongside real zone codes is simpler
-// than carrying a separate boolean.
 const NO_ZONE_KEY = '__NO_ZONE__';
-function loadSelectedZones() {
-  try {
-    const raw = localStorage.getItem(ZONE_FILTER_STORAGE_KEY);
-    if (!raw) return new Set();
-    const arr = JSON.parse(raw);
-    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
-  } catch { return new Set(); }
-}
-function saveSelectedZones(set) {
-  try { localStorage.setItem(ZONE_FILTER_STORAGE_KEY, JSON.stringify([...set])); } catch {}
-}
 function zoneKeyOf(order) {
   return order.Zone || NO_ZONE_KEY;
 }
@@ -244,6 +231,15 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
         </td>
         <td className="px-3 py-2 text-sm text-left font-mono">
           ₪{order.DocTotal ? Number(order.DocTotal).toLocaleString() : '—'}
+          {/* (2026-05-27) When plan-eval is ON, also show the customer's
+              aggregate total under the per-order amount. Makes it obvious
+              that a small order can "pass" the customer-total threshold
+              because the *customer's* sum across both companies clears it. */}
+          {showPlanEvalColumn && planEval?.customerTotalCurrent != null && (
+            <div className="text-xs text-gray-400 mt-0.5" title="סך כל הזמנות הלקוח בשתי החברות">
+              לקוח: ₪{Number(planEval.customerTotalCurrent).toLocaleString()}
+            </div>
+          )}
         </td>
         <td className="px-3 py-2 text-xs text-gray-500">
           {order.DocDueDate ? format(new Date(order.DocDueDate), 'dd/MM/yyyy') : '—'}
@@ -254,8 +250,24 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
               {planEval ? (
                 planEval.passes ? (
                   <span
-                    title="עומד בכל תנאי התכנון היומי"
-                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-emerald-100 text-emerald-700 font-medium"
+                    title={(() => {
+                      // Self-explanatory tooltip: show *why* a passing
+                      // order passes — most importantly the customer's
+                      // aggregate total vs the threshold, so a ₪525 row
+                      // doesn't look like a bug when its customer's sum
+                      // is ₪4,500 against a ₪3,000 sף.
+                      const lines = ['עומד בכל תנאי התכנון היומי'];
+                      if (planEval.customerTotalCurrent != null && planEval.customerTotalThreshold != null) {
+                        lines.push(
+                          `סך הזמנות הלקוח (שתי החברות): ₪${Number(planEval.customerTotalCurrent).toLocaleString()} (סף: ₪${Number(planEval.customerTotalThreshold).toLocaleString()})`
+                        );
+                      }
+                      if (planEval.deliveryDayApplied && Array.isArray(planEval.deliveryDayExpected) && planEval.deliveryDayExpected.length > 0) {
+                        lines.push(`ימי חלוקה: ${planEval.deliveryDayExpected.join(', ')} · היום ${planEval.deliveryDayToday}`);
+                      }
+                      return lines.join('\n');
+                    })()}
+                    className="inline-flex items-center gap-1 px-2 py-0.5 text-xs rounded bg-emerald-100 text-emerald-700 font-medium cursor-help"
                   >
                     <CheckCircle2 size={12} /> עובר
                   </span>
@@ -356,34 +368,13 @@ export default function OpenOrdersPage() {
   const [limit, setLimit] = useState(100);
   const [sortBy, setSortBy] = useState('docDate-desc'); // docDate / cardName / city / zone
 
-  // Day filter — matches the PlannerPage idiom. Defaults to today's
-  // Hebrew weekday (Sun-Thu). On Fri/Sat the default falls back to 'all'
-  // because the warehouse does not deliver on those days, so there's no
-  // sensible default day. Operator can flip via the day tabs.
+  // Today's Hebrew weekday — used as the "active day" when the operator
+  // turns ON "החל יום חלוקה". When the toggle is OFF the day check is
+  // bypassed entirely. There is no separate day-tab strip anymore (2026-05-27):
+  // the operator complained that having both a day-tab and a checkbox
+  // created "לופ ובלגאן" — only one place to control day behavior now.
   const todayDayIdx = new Date().getDay();
-  const defaultDayKey = todayDayIdx >= 0 && todayDayIdx <= 4 ? HEBREW_WEEKDAYS[todayDayIdx] : 'all';
-  const [selectedDay, setSelectedDay] = useState(defaultDayKey);
   const todayLabel = HEBREW_WEEKDAYS[todayDayIdx];
-
-  // Zone filter — Set of zone codes (or NO_ZONE_KEY sentinel). Empty Set
-  // = no filter (show all). Persisted to localStorage so refresh keeps
-  // the operator's focus.
-  const [selectedZones, setSelectedZones] = useState(loadSelectedZones);
-  const toggleZone = (zoneKey) => {
-    setSelectedZones((prev) => {
-      const next = new Set(prev);
-      if (next.has(zoneKey)) next.delete(zoneKey); else next.add(zoneKey);
-      saveSelectedZones(next);
-      return next;
-    });
-  };
-  const clearZoneFilter = () => {
-    setSelectedZones(() => {
-      const empty = new Set();
-      saveSelectedZones(empty);
-      return empty;
-    });
-  };
 
   // Customer delivery profiles (1,500+ rows, ~1 MB). Used to join orders
   // to their customer's DeliveryDays array. Cached for 5 min so flipping
@@ -473,11 +464,14 @@ export default function OpenOrdersPage() {
     return Array.isArray(p?.DeliveryDays) ? p.DeliveryDays : [];
   };
 
-  // Apply the day filter BEFORE search/company so the counts in the
-  // summary banner reflect the day-scoped set. 'all' = no day filter.
-  const dayFilteredRaw = selectedDay === 'all'
-    ? rawOrders
-    : rawOrders.filter((o) => deliveryDaysForOrder(o).includes(selectedDay));
+  // Day filtering is now driven SOLELY by the "החל יום חלוקה" checkbox.
+  //   - checkbox OFF → show all orders regardless of weekday (no filter)
+  //   - checkbox ON  → show only orders whose customer's DeliveryDays
+  //                    includes today's Hebrew weekday (todayLabel)
+  // This replaces the old day-tab strip the operator found confusing.
+  const dayFilteredRaw = planEvalCfg.applyDeliveryDay
+    ? rawOrders.filter((o) => deliveryDaysForOrder(o).includes(todayLabel))
+    : rawOrders;
 
   // The plan-eval source doesn't honor the search/company filters server-side,
   // so apply them client-side when the toggle is ON.
@@ -519,34 +513,12 @@ export default function OpenOrdersPage() {
       .sort((a, b) => (b.count - a.count) || String(a.label).localeCompare(String(b.label), 'he'));
   }, [filteredRawOrders]);
 
-  // Prune any stored zone keys that are no longer present in the current
-  // dataset (e.g. the operator saved CENTER_FAR yesterday but today no
-  // CENTER_FAR orders are open). One-shot, on each aggregates change.
-  useEffect(() => {
-    if (selectedZones.size === 0) return;
-    const present = new Set(zoneAggregates.map((z) => z.key));
-    let removed = false;
-    const next = new Set();
-    for (const z of selectedZones) {
-      if (present.has(z)) next.add(z); else removed = true;
-    }
-    if (removed) {
-      setSelectedZones(next);
-      saveSelectedZones(next);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zoneAggregates]);
-
-  // Zone-filtered set used downstream for sort + table. Empty selection
-  // means "show all". Selection of N zones means "show orders whose
-  // zoneKeyOf is in the set".
-  const zoneFilteredOrders = selectedZones.size === 0
-    ? filteredRawOrders
-    : filteredRawOrders.filter((o) => selectedZones.has(zoneKeyOf(o)));
+  // Zone toolbar is read-only now — no filter cascade, no cleanup pass.
+  // zoneAggregates still feeds the display below.
 
   // Apply client-side sort.
   const orders = (() => {
-    const arr = [...zoneFilteredOrders];
+    const arr = [...filteredRawOrders];
     const cityOf = (o) => {
       const addr = (o.ShipToAddress || '').split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
       return addr[addr.length - 1] || o.CustCity || '';
@@ -670,115 +642,35 @@ export default function OpenOrdersPage() {
         </div>
       </div>
 
-      {/* Day filter — Sunday → Thursday, plus 'all'. Default = today's
-          weekday (or 'all' on Fri/Sat). Same idiom as PlannerPage so the
-          two screens behave identically when the operator flips between
-          them. Filters orders by their customer's DeliveryDays. */}
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
-        <CalendarDays size={16} className="text-gray-500" />
-        <span className="text-gray-600">סינון לפי טבלת הפצה:</span>
-        {HEBREW_WEEKDAYS.slice(0, 5).map((day) => {
-          const active = selectedDay === day;
-          const isToday = day === todayLabel;
-          return (
-            <button
-              key={day}
-              type="button"
-              onClick={() => setSelectedDay(day)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
-                active
-                  ? (isToday
-                      ? 'bg-green-100 text-green-900 border-green-400 font-semibold'
-                      : 'bg-blue-100 text-blue-900 border-blue-400 font-semibold')
-                  : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-              }`}
-            >
-              {isToday && <span className="w-2 h-2 rounded-full bg-green-500" />}
-              {day}{isToday ? ' (היום)' : ''}
-            </button>
-          );
-        })}
-        <button
-          type="button"
-          onClick={() => setSelectedDay('all')}
-          className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors ${
-            selectedDay === 'all'
-              ? 'bg-gray-800 text-white border-gray-800 font-semibold'
-              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-          }`}
-        >
-          כל הימים
-        </button>
-      </div>
-
-      {/* Zone filter toolbar — chip multi-select scoped to the current
-          day+company+search context. Empty selection = show all. Counts
-          on each chip reflect orders BEFORE the zone filter, so the
-          operator can see "what's available where" before drilling in.
-          Renders nothing when there are no zones to show (e.g. backend
-          not yet restarted with the Zone enrichment from 6a1dff7). */}
+      {/* Zone display (read-only, 2026-05-27): shows which zones exist in
+          the current dataset and how many orders sit in each. No click,
+          no filter — just an at-a-glance breakdown so the operator knows
+          where today's load is concentrated. Visible only when there are
+          zones to show. */}
       {zoneAggregates.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
           <MapPin size={16} className="text-gray-500" />
-          <span className="text-gray-600">סינון לפי אזור חלוקה:</span>
+          <span className="text-gray-600">אזורי חלוקה במסך:</span>
           {zoneAggregates.map((z) => {
-            const active = selectedZones.has(z.key);
-            const baseCls = 'inline-flex items-center gap-1.5 px-3 py-1 rounded-md border transition-colors select-none';
-            const activeCls  = 'border-2 font-semibold';
-            const idleCls    = 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50';
-            // Inline style so Tailwind doesn't need to know about each
-            // dynamic ZoneColor at build time.
-            const activeStyle = active && z.color
+            const style = z.color
               ? { backgroundColor: z.color + '22', borderColor: z.color, color: z.color }
-              : (active ? { backgroundColor: '#1f2937', color: '#fff', borderColor: '#1f2937' } : {});
+              : { backgroundColor: '#f3f4f6', borderColor: '#d1d5db', color: '#374151' };
             return (
-              <button
+              <span
                 key={z.key}
-                type="button"
-                onClick={() => toggleZone(z.key)}
-                className={`${baseCls} ${active ? activeCls : idleCls}`}
-                style={activeStyle}
-                title={active ? 'הסר סינון לאזור זה' : 'סנן לאזור זה'}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md border select-none cursor-default"
+                style={style}
+                title={`${z.label}: ${z.count} הזמנות`}
               >
                 {z.label} <span className="text-xs opacity-75">({z.count})</span>
-              </button>
+              </span>
             );
           })}
-          {selectedZones.size > 0 && (
-            <button
-              type="button"
-              onClick={clearZoneFilter}
-              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-gray-600 hover:bg-gray-100 underline decoration-dotted"
-              title="נקה כל הסינון לפי אזור"
-            >
-              <X size={12} /> נקה סינון
-            </button>
-          )}
-          {/* UX hint (2026-05-24): the chip set above reflects the
-              currently-selected day filter — chips show only zones with
-              orders that match `selectedDay`. Without this hint a Sunday
-              with sparse DeliveryDays profiles looks like a broken
-              toolbar (only ירושלים). w-full forces this onto its own
-              flex row so the hint doesn't crowd the chips. NOT changing
-              zoneAggregates source — only surfacing existing behavior. */}
-          <div className="w-full text-xs text-gray-500 flex flex-wrap items-center gap-2 mt-1">
-            <span>
-              האזורים מוצגים לפי סינון היום הפעיל:{' '}
-              <span className="font-medium text-gray-700">
-                {selectedDay === 'all' ? 'כל הימים' : selectedDay}
-              </span>
+          {planEvalCfg.applyDeliveryDay && (
+            <span className="text-xs text-gray-500 mr-1">
+              · מסונן ליום: <span className="font-medium text-gray-700">{todayLabel} (היום)</span>
             </span>
-            {selectedDay !== 'all' && (
-              <button
-                type="button"
-                onClick={() => setSelectedDay('all')}
-                className="text-blue-600 hover:underline decoration-dotted"
-                title="הצג אזורים לפי כל הימים, לא רק היום"
-              >
-                הצג כל הימים
-              </button>
-            )}
-          </div>
+          )}
         </div>
       )}
 

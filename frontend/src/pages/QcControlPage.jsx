@@ -278,9 +278,30 @@ export default function QcControlPage() {
   const approveMutation = useMutation({
     mutationFn: (runOrderId) => qcApi.approve(runOrderId),
     onSuccess: (res) => {
-      const dn = res.deliveryNote ? `, DN ${res.deliveryNote.DocNumber}` : '';
-      const inv = res.invoice ? `, INV ${res.invoice.DocNumber}` : '';
-      toast.success(`הזמנה אושרה${dn}${inv}`);
+      // After approve: per DocPolicy, either a DN/INV got created locally
+      // (PENDING_EXPORT) or the order is queued for the run-level aggregate
+      // flush. Either way, nothing was sent to SAP — that happens later
+      // from /documents. Tell the controller exactly what happened so they
+      // know where the order went next.
+      const dnNum  = res.deliveryNote?.DocNumber;
+      const invNum = res.invoice?.DocNumber;
+      const idemSuffix = res.idempotent ? ' (כבר אושרה — לא נוצרו תעודות חדשות)' : '';
+      let msg;
+      if (dnNum || invNum) {
+        const parts = [];
+        if (dnNum)  parts.push(`תמ"ש ${dnNum}`);
+        if (invNum) parts.push(`חשבונית ${invNum}`);
+        msg = `אושרה ונוצרה ${parts.join(' + ')} מקומית · ממתינה לייצוא ל-SAP ב"מסמכים"${idemSuffix}`;
+      } else {
+        // No per-order doc was emitted → either aggregate-pending or
+        // policy is aggregate-only. Either way, the order sits in the
+        // run until the operator triggers the run-level flush.
+        msg = `אושרה · ממתינה ל-flush ברמת מסלול (תעודות מאוגדות)${idemSuffix}`;
+      }
+      toast.success(msg, {
+        duration: 6000,
+        action: { label: 'פתח מסמכים', onClick: () => { window.location.href = '/documents'; } },
+      });
       qc.invalidateQueries({ queryKey: ['qc-pending'] });
     },
     onError: (err) => {
@@ -320,8 +341,10 @@ export default function QcControlPage() {
       </div>
       <p className="text-sm text-gray-600 mb-4">
         לחיצה על שורה פותחת את הפריטים שלוקטו עם סימוני בקרה (תקין / בעייתי).
-        כפתור "אשר הזמנה" → תעודות נוצרות לפי מדיניות הלקוח עם כמויות הליקוט בפועל.
-        שום פעולה לא נשלחת ל-SAP.
+        כפתור "אשר הזמנה" → תעודות (תמ״ש/חשבונית) נוצרות לפי מדיניות הלקוח עם כמויות הליקוט בפועל,
+        ומועברות למסך <a href="/documents" className="text-blue-600 hover:underline font-medium">מסמכים</a> במצב{' '}
+        <span className="font-mono text-xs bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">PENDING_EXPORT</span>.
+        שליחת ה-SAP בפועל מבוצעת ידנית משם.
       </p>
 
       {/* Filters */}
