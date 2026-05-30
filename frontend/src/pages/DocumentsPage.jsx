@@ -29,6 +29,18 @@ const docsApi = {
   // Local-only; does not touch SAP. Backend rejects if not suspicious.
   revertConfirm: (type, id, reason) =>
     api.post(`/documents/${type}/${id}/revert-confirm`, { reason }).then((r) => r.data),
+  // DEV.15: preview the SAP payload that WOULD be sent for an invoice.
+  // Read-only — does not touch SAP, does not require SAP_WRITE_ENABLED.
+  previewInvoiceExport: (invoiceId) =>
+    api.post(`/admin/sap-write/invoices/${invoiceId}/preview`, {}).then((r) => r.data),
+  // DEV.15: LIVE export of a single PENDING_EXPORT invoice to SAP TEST.
+  // Requires SAP_WRITE_ENABLED=true on the backend AND admin role on the
+  // caller. The magic phrase is hard-coded here — the UI gate is the dialog
+  // the user clicks through, not a free-text field.
+  exportInvoiceToSap: (invoiceId) =>
+    api.post(`/admin/sap-write/invoices/${invoiceId}/export-test`, {
+      confirm: 'I-UNDERSTAND-THIS-WRITES-TO-SAP',
+    }).then((r) => r.data),
 };
 
 const STATUS_LABELS = {
@@ -248,6 +260,135 @@ function RevertConfirmDialog({ doc, type, onClose }) {
   );
 }
 
+// DEV.15: dialog for LIVE export of an invoice to SAP TEST. Wraps the new
+// DEV.14 endpoints: GET preview (auto-fetched on open) + POST export. The
+// dialog is the ONLY way to send the magic phrase from the UI — no free-text
+// input, so the operator can't typo their way into a corrupted call.
+//
+// Flow:
+//   1. Open dialog → useQuery fires preview endpoint immediately
+//   2. Show: target CompanyDB, guard verdict, payload that would be sent
+//   3. If canExport=false → block the "אשר ושלח" button, show the reason
+//   4. If canExport=true → enable button; click runs export mutation
+//   5. On success → toast with DocEntry/DocNum, invalidate queries, close
+//   6. On error → toast with backend message (e.g. negative inventory),
+//      keep dialog open so operator can re-check & decide
+function SapExportDialog({ invoice, onClose }) {
+  const queryClient = useQueryClient();
+  const invoiceId = invoice.InvoiceId;
+
+  const previewQuery = useQuery({
+    queryKey: ['sap-export-preview', invoiceId],
+    queryFn: () => docsApi.previewInvoiceExport(invoiceId),
+    staleTime: 0,
+  });
+
+  const exportMutation = useMutation({
+    mutationFn: () => docsApi.exportInvoiceToSap(invoiceId),
+    onSuccess: (data) => {
+      toast.success(`חשבונית נוצרה ב-SAP! DocEntry=${data.sapDocEntry}, DocNum=${data.sapDocNum}`);
+      queryClient.invalidateQueries();
+      onClose();
+    },
+    onError: (err) => {
+      const data = err?.response?.data;
+      const msg = data?.error || data?.message || err?.message || 'שליחה ל-SAP נכשלה';
+      // Surface useful structured fields when present so the operator sees
+      // exactly what blocked them (e.g. LIVE_WRITE_DISABLED → arm needed).
+      const extra = data?.code ? ` [${data.code}]` : '';
+      toast.error(`${msg}${extra}`);
+    },
+  });
+
+  const preview = previewQuery.data;
+  const canExport = preview?.canExport === true;
+  const isProductionDb = preview?.productionDbBlocked === true;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl max-w-lg w-full p-5">
+        <h2 className="font-bold text-lg mb-1 text-brand-700 flex items-center gap-2">
+          <Send size={18} /> שליחת חשבונית ל-SAP TEST
+        </h2>
+        <p className="text-sm text-gray-500 mb-3">
+          חשבונית {invoice.DocNumber} - {invoice.SapCardName}
+        </p>
+
+        {previewQuery.isLoading ? (
+          <div className="py-6 text-center text-gray-500">טוען תצוגה מקדימה...</div>
+        ) : previewQuery.isError ? (
+          <div className="bg-red-50 border border-red-200 rounded p-3 text-sm text-red-700">
+            כשל בטעינת תצוגה: {previewQuery.error?.response?.data?.error || previewQuery.error?.message}
+          </div>
+        ) : preview ? (
+          <>
+            {/* Target — most-important info, red if accidentally production */}
+            <div className={`rounded p-3 mb-3 text-sm border ${
+              isProductionDb ? 'bg-red-50 border-red-300' : 'bg-blue-50 border-blue-200'
+            }`}>
+              <div className="flex justify-between">
+                <span>חברה ב-SAP:</span>
+                <span className="font-mono font-semibold">{preview.targetCompanyDb || '(לא הוגדר)'}</span>
+              </div>
+              {isProductionDb && (
+                <div className="text-red-700 font-semibold mt-1">⛔ זוהי חברת production — חסום</div>
+              )}
+            </div>
+
+            {/* Guard verdict */}
+            {!canExport && (
+              <div className="bg-amber-50 border border-amber-300 rounded p-3 mb-3 text-sm">
+                <strong>לא ניתן לייצא:</strong>{' '}
+                {preview.guard?.error || (isProductionDb ? 'production DB blocked' : 'unknown')}
+                {preview.guard?.current && <span> (נוכחי: {preview.guard.current})</span>}
+              </div>
+            )}
+
+            {/* Payload preview — exactly what SAP would receive */}
+            <div className="bg-gray-50 border border-gray-200 rounded p-3 mb-3 text-xs">
+              <div className="font-semibold mb-1">Payload שייצא:</div>
+              <pre className="overflow-x-auto whitespace-pre-wrap text-gray-700">
+{JSON.stringify(preview.payloadThatWouldBeSent, null, 2)}
+              </pre>
+              <div className="text-xs text-gray-500 mt-1">
+                Shape: {preview.payloadShape || 'unknown'}
+              </div>
+            </div>
+
+            {/* DEV.15 inline warning so the operator knows the costs */}
+            <div className="bg-yellow-50 border border-yellow-200 rounded p-3 mb-3 text-xs">
+              ⚠️ פעולה זו תיצור חשבונית <strong>אמיתית ב-SAP</strong> ({preview.targetCompanyDb}).
+              ביטול דורש Credit Memo ידני ב-SAP B1 Client. דורש <code>SAP_WRITE_ENABLED=true</code> בשרת.
+            </div>
+          </>
+        ) : null}
+
+        <div className="flex gap-2">
+          <button
+            onClick={onClose}
+            className="flex-1 py-2 border rounded-lg"
+            disabled={exportMutation.isPending}
+          >
+            ביטול
+          </button>
+          <button
+            onClick={() => exportMutation.mutate()}
+            disabled={!canExport || exportMutation.isPending || previewQuery.isLoading}
+            className="flex-1 py-2 bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            title={
+              !canExport
+                ? 'תצוגה מקדימה חוסמת — ראה למעלה'
+                : 'שלח את החשבונית ל-SAP TEST (פעולה אמיתית)'
+            }
+          >
+            {exportMutation.isPending ? 'שולח…' : '↗ אשר ושלח ל-SAP'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function DocumentsPage() {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState('deliveryNotes'); // 'deliveryNotes' | 'invoices'
@@ -258,6 +399,8 @@ export default function DocumentsPage() {
   // DEV.13: separate state for the revert dialog so confirm and revert can't
   // clash. revertingDoc = { doc, type } or null.
   const [revertingDoc, setRevertingDoc] = useState(null);
+  // DEV.15: state for the SAP export dialog. exportingInvoice = invoice obj or null.
+  const [exportingInvoice, setExportingInvoice] = useState(null);
 
   const params = {
     runDate: date,
@@ -658,6 +801,19 @@ export default function DocumentsPage() {
                       {inv.SapInvoiceDocEntry || '—'}
                     </td>
                     <td className="p-3 text-left whitespace-nowrap">
+                      {/* DEV.15: send-to-SAP button. Only on PENDING_EXPORT
+                          (canExport precondition); the dialog enforces the
+                          rest. The 6 retries we did in the LIVE.5/6 sessions
+                          collapse into one click here. */}
+                      {inv.Status === 'PENDING_EXPORT' && (
+                        <button
+                          onClick={() => setExportingInvoice(inv)}
+                          className="text-xs text-brand-600 hover:underline mr-2 font-medium"
+                          title="שלח את החשבונית ל-SAP TEST (פותח תצוגה מקדימה תחילה)"
+                        >
+                          ↗ שלח ל-SAP
+                        </button>
+                      )}
                       {inv.Status !== 'SAP_CONFIRMED' && (
                         <button
                           onClick={() => setConfirmingDoc({ doc: inv, type: 'invoice' })}
@@ -885,6 +1041,17 @@ export default function DocumentsPage() {
           doc={revertingDoc.doc}
           type={revertingDoc.type}
           onClose={() => setRevertingDoc(null)}
+        />
+      )}
+
+      {/* DEV.15 SAP export dialog. Opens with auto-loaded preview from the
+          DEV.14 preview endpoint. The dialog handles both the inspection +
+          the actual send-to-SAP click. Magic phrase is never visible to the
+          user — sent automatically by the apiClient method. */}
+      {exportingInvoice && (
+        <SapExportDialog
+          invoice={exportingInvoice}
+          onClose={() => setExportingInvoice(null)}
         />
       )}
     </div>
