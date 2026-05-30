@@ -35,18 +35,16 @@ if (fs.existsSync(envPath)) {
 
 module.exports = {
   apps: [
-    {
-      name: 'cloudflare-tunnel',
-      script: 'C:\\Program Files (x86)\\cloudflared\\cloudflared.exe',
-      args: 'tunnel --url http://localhost:4000',
-      autorestart: true,
-      watch: false,
-      max_restarts: 100,
-      min_uptime: '30s',
-      error_file: __dirname + '/backend/logs/cf-tunnel-error.log',
-      out_file: __dirname + '/backend/logs/cf-tunnel-out.log',
-      merge_logs: true,
-    },
+    // (2026-05-30) cloudflare-tunnel removed — public access now via
+    // Tailscale Funnel (https://izik-win10.tailbe99fc.ts.net). Funnel
+    // starts automatically with the Tailscale client (no PM2 entry
+    // required). The cloudflare quick-tunnel here was unstable (URL
+    // rotated on every respawn → mobile links broke). Keeping the
+    // ecosystem block invited `pm2 resurrect` to bring it back into
+    // a stale config. To restore for a brief test, copy the original
+    // block from commit history before this commit on wave-a-mitigation.
+    // See cowork/INCIDENTS.md "2026-05-30 — sap-logistics: cloudflare
+    // quick-tunnels הוחלפו ב-Tailscale Funnel".
     {
       name: 'sap-logistics',
       // A2g-HOTFIX (2026-05-20): reverted to demoServer.js because the
