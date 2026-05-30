@@ -5739,6 +5739,20 @@ if (process.env.DISABLE_LIVE_SIMULATION !== 'true') {
   console.log('[demo] Live simulation DISABLED via DISABLE_LIVE_SIMULATION env');
 }
 
+// DEV.18: start the auto-DISARM watcher. If SAP_WRITE_ENABLED is left on
+// for >5 minutes (e.g. an arm cycle never reached its finally{} disarm),
+// the watcher clears it from process.env. Belt-and-suspenders alongside
+// the explicit DISARM in restart-safe-driven runbooks.
+(async () => {
+  try {
+    const { startAutoDisarmWatcher } = await import('./sapWriteAutoDisarm.js');
+    startAutoDisarmWatcher({ maxMinutes: 5, intervalMs: 60_000 });
+    console.log('[sap-write-auto-disarm] watcher started (max 5 min, poll 60s)');
+  } catch (err) {
+    console.warn('[sap-write-auto-disarm] failed to start:', err.message);
+  }
+})();
+
 server.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════╗
