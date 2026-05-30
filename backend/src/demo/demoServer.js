@@ -4281,6 +4281,104 @@ app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, async (req, res) => {
   }
 });
 
+// (2026-05-30) Reset stuck aggregate invoices — one-time admin tool to
+// recover invoices that got stuck in PENDING_EXPORT because of a bug in
+// flushAggregateDocsForRun (see commit a2ec4e5 fix). For each invoice
+// ID in the body, marks it (and its linked DN, if any) as CANCELLED
+// and resets the source orders' AggregatePending=true so the next
+// flush-aggregate-docs call can recreate them cleanly with valid
+// DocNumber and audit fields. Does NOT touch QcApproved/QcApprovedAt
+// (the orders stay approved — we're just undoing the doc-creation step).
+//
+// Body: { invoiceIds: number[] }
+// Returns: { cancelled: { invoiceIds, deliveryNoteIds }, resetRunOrders: number[] }
+//
+// Idempotent: an already-CANCELLED invoice is skipped. An invoice with
+// SapInvoiceDocEntry set (= already in SAP) is refused (422) — we don't
+// silently cancel something the customer actually received.
+app.post('/api/admin/reset-stuck-aggregate-docs', adminOnly, (req, res) => {
+  const invoiceIds = Array.isArray(req.body?.invoiceIds) ? req.body.invoiceIds.map(Number) : null;
+  if (!invoiceIds?.length) {
+    return res.status(400).json({ error: 'BAD_BODY', message: 'invoiceIds: number[] required' });
+  }
+  const s = store.load();
+  const cancelledInvoiceIds = [];
+  const cancelledDnIds = new Set();
+  const resetRunOrderIds = new Set();
+  const skipped = [];
+  const refused = [];
+
+  for (const invId of invoiceIds) {
+    const inv = (s.invoices || []).find((i) => i.InvoiceId === invId);
+    if (!inv) { skipped.push({ invoiceId: invId, reason: 'NOT_FOUND' }); continue; }
+    if (inv.Status === 'CANCELLED') { skipped.push({ invoiceId: invId, reason: 'ALREADY_CANCELLED' }); continue; }
+    if (inv.SapInvoiceDocEntry) {
+      refused.push({ invoiceId: invId, reason: 'ALREADY_IN_SAP', sapDocEntry: inv.SapInvoiceDocEntry });
+      continue;
+    }
+    inv.Status = 'CANCELLED';
+    inv.CancelledAt = new Date().toISOString();
+    inv.CancelledBy = req.user?.name || 'admin';
+    inv.CancelReason = req.body?.reason || 'reset-stuck-aggregate-docs';
+    cancelledInvoiceIds.push(invId);
+
+    // Cancel the linked DN if it exists, isn't already in SAP, and isn't
+    // shared by another non-cancelled invoice.
+    if (inv.DeliveryNoteId) {
+      const dn = (s.deliveryNotes || []).find((d) => d.DeliveryNoteId === inv.DeliveryNoteId);
+      if (dn && dn.Status !== 'CANCELLED' && !dn.SapDeliveryDocEntry) {
+        const othersUsingDn = (s.invoices || []).some((i) =>
+          i.InvoiceId !== invId &&
+          i.DeliveryNoteId === dn.DeliveryNoteId &&
+          i.Status !== 'CANCELLED'
+        );
+        if (!othersUsingDn) {
+          dn.Status = 'CANCELLED';
+          dn.CancelledAt = new Date().toISOString();
+          dn.CancelReason = 'reset-stuck-aggregate-docs';
+          cancelledDnIds.add(dn.DeliveryNoteId);
+        }
+      }
+    }
+
+    // Reset the source runOrders so the next flush sees them as pending.
+    for (const src of (inv.SourceOrders || [])) {
+      const ord = (s.runOrders || []).find((o) => o.RunOrderId === src.RunOrderId);
+      if (!ord) continue;
+      ord.DeliveryNoteId = null;
+      ord.InvoiceId = null;
+      ord.AggregatePending = true; // re-mark for the next flush
+      resetRunOrderIds.add(ord.RunOrderId);
+    }
+  }
+
+  store.save();
+  store.recordAudit?.({
+    action: 'admin.reset-stuck-aggregate-docs',
+    actorSub: req.user?.sub,
+    actorName: req.user?.name,
+    ip: req.ip,
+    details: {
+      invoiceIdsRequested: invoiceIds,
+      cancelledInvoiceIds,
+      cancelledDeliveryNoteIds: [...cancelledDnIds],
+      resetRunOrderIds: [...resetRunOrderIds],
+      skipped,
+      refused,
+    },
+  });
+  res.json({
+    ok: true,
+    cancelled: {
+      invoiceIds: cancelledInvoiceIds,
+      deliveryNoteIds: [...cancelledDnIds],
+    },
+    resetRunOrderIds: [...resetRunOrderIds],
+    skipped,
+    refused,
+  });
+});
+
 // A2c-4b — admin-only endpoint to invoke flushAggregateDocsForRun with
 // liveWrite=true OUTSIDE the picking -> QC-approve UI flow. Strictly for
 // validating the live SAP write path on TEST runs only.
