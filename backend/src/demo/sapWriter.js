@@ -211,6 +211,57 @@ async function postSAP(companyCode, endpoint, payload) {
 }
 
 /**
+ * DEV.16: read-only GET to SAP Service Layer. Mirrors postSAP but for safe
+ * read paths (item lookup, stock check, etc.). Skips the whitelist gate
+ * because reads cannot mutate SAP — they are bounded by which CompanyDB
+ * `getCompanyDb(companyCode)` resolves to via env. The login() call still
+ * uses the whitelisted DB by construction.
+ */
+async function getSAP(companyCode, endpoint) {
+  const cookie = await login(companyCode);
+  const res = await httpsRequest('GET', `${slUrl()}/${endpoint}`, null, {
+    Cookie: cookie,
+  });
+  let json;
+  try { json = JSON.parse(res.body); } catch { json = { raw: res.body }; }
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    let sapMsg = '';
+    try { sapMsg = JSON.parse(res.body)?.error?.message?.value || ''; } catch {}
+    throw new Error(
+      `SAP GET ${endpoint} failed: HTTP ${res.statusCode}` +
+      (sapMsg ? ` "${sapMsg}"` : '') +
+      ` body=${res.body.slice(0, 300)}`
+    );
+  }
+  return json;
+}
+
+/**
+ * DEV.16: fetch a single item's stock from SAP, including per-warehouse
+ * breakdown. Returns { itemCode, itemName, totalStock, perWarehouse: [...] }
+ * Throws if SAP can't reach the item (typically 404 from SAP).
+ */
+export async function getItemStock(itemCode, companyCode = 'A') {
+  // $expand=ItemWarehouseInfoCollection gives us per-warehouse stock.
+  // $select narrows the response payload — keeps cost predictable even on
+  // big item masters.
+  const path = `Items('${encodeURIComponent(itemCode)}')`
+    + `?$select=ItemCode,ItemName,QuantityOnStock`
+    + `&$expand=ItemWarehouseInfoCollection($select=WarehouseCode,InStock)`;
+  const sap = await getSAP(companyCode, path);
+  const warehouses = (sap.ItemWarehouseInfoCollection || []).map((w) => ({
+    warehouse: w.WarehouseCode,
+    stock: Number(w.InStock || 0),
+  }));
+  return {
+    itemCode: sap.ItemCode,
+    itemName: sap.ItemName,
+    totalStock: Number(sap.QuantityOnStock || 0),
+    perWarehouse: warehouses,
+  };
+}
+
+/**
  * Build a SAP Delivery Note payload from one of our local DN docs.
  * The local doc has SourceOrders[*].SapDocEntry referencing the original sales orders.
  */

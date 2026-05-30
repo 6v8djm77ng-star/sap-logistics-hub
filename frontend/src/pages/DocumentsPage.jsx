@@ -7,7 +7,7 @@
  *   - Generate invoices from delivery notes
  */
 import { useState } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import api, { downloadFile } from '../services/api.js';
 import { format } from 'date-fns';
 import { toast } from 'sonner';
@@ -40,6 +40,13 @@ const docsApi = {
   exportInvoiceToSap: (invoiceId) =>
     api.post(`/admin/sap-write/invoices/${invoiceId}/export-test`, {
       confirm: 'I-UNDERSTAND-THIS-WRITES-TO-SAP',
+    }).then((r) => r.data),
+  // DEV.16: read-only stock lookup for a SAP item. Used by the export
+  // dialog to preflight inventory before LIVE write. Returns
+  // { itemCode, itemName, totalStock, perWarehouse: [{warehouse, stock}] }
+  getItemStock: (itemCode, companyCode = 'A') =>
+    api.get(`/admin/sap-write/items/${encodeURIComponent(itemCode)}/stock`, {
+      params: { companyCode },
     }).then((r) => r.data),
 };
 
@@ -304,6 +311,41 @@ function SapExportDialog({ invoice, onClose }) {
   const canExport = preview?.canExport === true;
   const isProductionDb = preview?.productionDbBlocked === true;
 
+  // DEV.16: extract item codes from the preview payload so we can
+  // preflight stock for each one. Skips when the payload is live-mode
+  // (BaseType=15 ref) because in that case SAP just copies the DN — no
+  // direct inventory hit from this invoice.
+  const itemCodesInPayload = (preview?.payloadThatWouldBeSent?.DocumentLines || [])
+    .map((l) => l.ItemCode)
+    .filter(Boolean);
+  const stockQueries = useQueries({
+    queries: itemCodesInPayload.map((itemCode) => ({
+      queryKey: ['sap-item-stock', invoice.CompanyCode || 'A', itemCode],
+      queryFn: () => docsApi.getItemStock(itemCode, invoice.CompanyCode || 'A'),
+      enabled: !!preview && !!itemCode,
+      staleTime: 30_000, // brief cache so re-renders don't re-fetch
+      retry: false,
+    })),
+  });
+  // Align each line's requested quantity with the SAP stock fetch result.
+  const stockByItem = itemCodesInPayload.map((itemCode, idx) => {
+    const line = preview?.payloadThatWouldBeSent?.DocumentLines?.[idx] || {};
+    const q = stockQueries[idx];
+    return {
+      itemCode,
+      requestedQty: Number(line.Quantity || 0),
+      loading: q?.isLoading,
+      error: q?.error?.response?.data?.error || q?.error?.message,
+      itemName: q?.data?.itemName,
+      totalStock: q?.data?.totalStock,
+      perWarehouse: q?.data?.perWarehouse || [],
+    };
+  });
+  const stockShort = stockByItem.some((s) =>
+    s.totalStock != null && s.totalStock < s.requestedQty
+  );
+  const stockLoading = stockQueries.some((q) => q.isLoading);
+
   return (
     <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl max-w-lg w-full p-5">
@@ -355,6 +397,46 @@ function SapExportDialog({ invoice, onClose }) {
               </div>
             </div>
 
+            {/* DEV.16: per-item stock preflight. Catches the LIVE.5 attempt #5
+                fail mode ("Quantity falls into negative inventory") BEFORE the
+                operator hits the LIVE write button. */}
+            {itemCodesInPayload.length > 0 && (
+              <div className={`rounded p-3 mb-3 text-xs border ${
+                stockShort ? 'bg-red-50 border-red-300' : 'bg-green-50 border-green-200'
+              }`}>
+                <div className="font-semibold mb-1">
+                  {stockLoading ? '⏳ בודק מלאי ב-SAP...' : (stockShort ? '⛔ מלאי לא מספיק' : '✓ מלאי מספיק')}
+                </div>
+                <table className="w-full">
+                  <thead className="text-gray-500">
+                    <tr>
+                      <th className="text-right">פריט</th>
+                      <th className="text-center">מבוקש</th>
+                      <th className="text-center">במלאי</th>
+                      <th className="text-right">סטטוס</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stockByItem.map((s) => {
+                      const short = s.totalStock != null && s.totalStock < s.requestedQty;
+                      return (
+                        <tr key={s.itemCode} className={short ? 'text-red-700 font-semibold' : ''}>
+                          <td className="font-mono">{s.itemCode}</td>
+                          <td className="text-center">{s.requestedQty}</td>
+                          <td className="text-center">
+                            {s.loading ? '...' : s.error ? '⚠️' : (s.totalStock ?? '?')}
+                          </td>
+                          <td className="text-xs">
+                            {s.loading ? 'טוען' : s.error ? `שגיאה: ${s.error.slice(0, 40)}` : (short ? '❌ חסר' : '✓')}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
             {/* DEV.15 inline warning so the operator knows the costs */}
             <div className="bg-yellow-50 border border-yellow-200 rounded p-3 mb-3 text-xs">
               ⚠️ פעולה זו תיצור חשבונית <strong>אמיתית ב-SAP</strong> ({preview.targetCompanyDb}).
@@ -373,11 +455,12 @@ function SapExportDialog({ invoice, onClose }) {
           </button>
           <button
             onClick={() => exportMutation.mutate()}
-            disabled={!canExport || exportMutation.isPending || previewQuery.isLoading}
+            disabled={!canExport || stockShort || stockLoading || exportMutation.isPending || previewQuery.isLoading}
             className="flex-1 py-2 bg-brand-600 text-white rounded-lg hover:bg-brand-700 disabled:opacity-50 disabled:cursor-not-allowed"
             title={
-              !canExport
-                ? 'תצוגה מקדימה חוסמת — ראה למעלה'
+              !canExport ? 'תצוגה מקדימה חוסמת — ראה למעלה'
+                : stockShort ? 'מלאי לא מספיק לאחד מהפריטים — ראה טבלה'
+                : stockLoading ? 'בודק מלאי...'
                 : 'שלח את החשבונית ל-SAP TEST (פעולה אמיתית)'
             }
           >

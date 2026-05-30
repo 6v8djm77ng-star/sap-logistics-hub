@@ -4487,6 +4487,35 @@ function _resolveCompanyDb(companyCode) {
 }
 
 /**
+ * DEV.16: read-only stock lookup for a SAP item. Used by the UI export
+ * dialog to warn the operator before they hit "send" on an invoice whose
+ * items don't have enough stock in TEST_OIG (LIVE.5 attempt #5 fail mode).
+ * Admin-only because the underlying SAP login uses the writer credentials.
+ * Does NOT require SAP_WRITE_ENABLED — it's a GET, not a write.
+ */
+app.get('/api/admin/sap-write/items/:itemCode/stock', adminOnly, async (req, res) => {
+  const itemCode = String(req.params.itemCode || '').trim();
+  if (!itemCode) {
+    return res.status(400).json({ error: 'itemCode required', code: 'INVALID_ITEM_CODE' });
+  }
+  // companyCode picks which TEST CompanyDB to query — default A=TEST_OIG.
+  // We don't expose production company codes here; the env-mapping is the
+  // bound.
+  const companyCode = String(req.query.companyCode || 'A').trim().toUpperCase();
+  if (companyCode !== 'A' && companyCode !== 'B') {
+    return res.status(400).json({ error: 'companyCode must be A or B', code: 'INVALID_COMPANY' });
+  }
+  try {
+    const { getItemStock } = await import('./sapWriter.js');
+    const stock = await getItemStock(itemCode, companyCode);
+    return res.json({ ok: true, ...stock, companyCode });
+  } catch (err) {
+    // Surface SAP-side errors verbatim (already contains the SAP error text)
+    return res.status(502).json({ error: err.message, code: 'SAP_GET_FAILED' });
+  }
+});
+
+/**
  * DEV.14 preview — dry-run inspection of the SAP payload that WOULD be
  * sent for this invoice, plus the guard verdict. Read-only: never writes
  * to SAP, never mutates the store. Does NOT require SAP_WRITE_ENABLED —
