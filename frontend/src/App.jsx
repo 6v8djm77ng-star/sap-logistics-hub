@@ -23,6 +23,7 @@ import OpenOrdersPage from './pages/OpenOrdersPage.jsx';
 import WeeklyReportPage from './pages/WeeklyReportPage.jsx';
 import DailyClosurePage from './pages/DailyClosurePage.jsx';
 import DocumentsPage from './pages/DocumentsPage.jsx';
+import AuditLogPage from './pages/AuditLogPage.jsx';
 import QcControlPage from './pages/QcControlPage.jsx';
 import RolePermissionsPage from './pages/RolePermissionsPage.jsx';
 import CustomerPolicyPage from './pages/CustomerPolicyPage.jsx';
@@ -200,6 +201,11 @@ export default function App() {
         <Route path="weekly" element={<WeeklyReportPage />} />
         <Route path="closure" element={<DailyClosurePage />} />
         <Route path="documents" element={<DocumentsPage />} />
+        {/* DEV.19: Audit log viewer — admin-only via the backend gate
+            (/api/audit uses adminOnly middleware). No sidebar entry yet;
+            access via direct URL /audit-log to keep noise out of the nav
+            for non-admin operators. */}
+        <Route path="audit-log" element={<AuditLogPage />} />
         {/* QC Control (P1, 2026-05-26) — placeholder page until P4 ships
             the real waves+orders list. Sidebar visibility is filtered to
             QC_CONTROLLER+ADMIN in DashboardLayout; backend gate is in the
