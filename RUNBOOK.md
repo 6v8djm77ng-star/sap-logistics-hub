@@ -3,7 +3,7 @@
 Operational guide for maintaining sap-logistics-hub on **Izik-win10**
 without Claude Code. Print a copy and tape it next to the server.
 
-Last updated: 2026-05-18.
+Last updated: 2026-05-30.
 
 ---
 
@@ -12,13 +12,40 @@ Last updated: 2026-05-18.
 | Need to... | Command |
 |---|---|
 | See what's running | `pm2 list` |
-| Restart sap-logistics | `pm2 reload sap-logistics` |
+| Restart sap-logistics (safely, with store backup) | `powershell -File scripts\restart-safe.ps1` |
+| Restart sap-logistics + pick up new `.env` | `pm2 reload ecosystem.config.cjs --only sap-logistics --update-env` |
 | Tail backend logs | `pm2 logs sap-logistics --lines 50` |
-| Find current public URL | `pm2 logs cloudflare-tunnel --lines 200 --nostream \| grep trycloudflare` |
+| Public URL (stable, Tailscale Funnel) | `https://izik-win10.tailbe99fc.ts.net` |
 | Run a backup now | `powershell -ExecutionPolicy Bypass -File scripts\daily-backup-store.ps1` |
 | Restore from backup | `powershell -ExecutionPolicy Bypass -File scripts\restore-store-from-backup.ps1 store-YYYYMMDD-HHmmss.json` |
 | Reset a user's password | See section **5** |
 | Free a stuck port 4000 | `netstat -ano \| findstr :4000` → `taskkill /F /PID <pid>` |
+
+### ⚠️ `pm2 restart --update-env` does NOT re-read `.env`
+
+If you change `backend/.env` (CORS_ORIGINS, PUBLIC_URL, JWT_*, ANTHROPIC_*, ...)
+and want the running PM2 child to pick it up, use either:
+
+```
+powershell -File scripts\restart-safe.ps1
+# or, if you know what you're doing and want zero downtime:
+pm2 reload ecosystem.config.cjs --only sap-logistics --update-env
+```
+
+Why: `pm2 restart sap-logistics --update-env` only refreshes env from
+the CURRENT shell session, not from `ecosystem.config.cjs`. Our
+`ecosystem.config.cjs` parses `backend/.env` manually at evaluation
+time — so re-evaluating it (= `reload <file>`) is the only way to pull
+fresh env values into the child. A plain `restart --update-env`
+silently leaves the child on the OLD env.
+
+This bug was silently live for months before being noticed — see
+`cowork/INCIDENTS.md` "2026-05-28 — sap-logistics: `pm2 restart
+--update-env` לא קורא מחדש את `.env`".
+
+`scripts/restart-safe.ps1` already uses `pm2 reload ecosystem.config.cjs`
+internally (since commit `e68411a`), so the safest answer is **always
+use restart-safe.ps1** unless you're doing a deliberate one-off.
 
 ---
 
