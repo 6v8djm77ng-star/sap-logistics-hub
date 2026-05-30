@@ -52,6 +52,26 @@ export default defineConfig({
               expiration: { maxEntries: 50, maxAgeSeconds: 60 * 60 * 24 },
             },
           },
+          {
+            // (2026-05-30) Navigation requests use NetworkFirst — without
+            // this, the SW serves the precached index.html (with its old
+            // hashed asset references) and a plain Ctrl+R still loads the
+            // OLD bundle. Operators had to Ctrl+Shift+R after every deploy
+            // to see the new code. With NetworkFirst here:
+            //   - Soft refresh fetches a fresh index.html → points at new
+            //     hashes → new bundle loads naturally.
+            //   - Offline / slow → 3s timeout, then cache fallback (same
+            //     behaviour as before, just with a bounded wait).
+            // Pairs with skipWaiting+clientsClaim above — the new SW
+            // installs immediately, then this rule makes sure the very
+            // first navigation after install sees fresh HTML.
+            urlPattern: ({ request }) => request.mode === 'navigate',
+            handler: 'NetworkFirst',
+            options: {
+              cacheName: 'navigation-cache',
+              networkTimeoutSeconds: 3,
+            },
+          },
         ],
       },
     }),
