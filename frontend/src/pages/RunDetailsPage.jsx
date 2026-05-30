@@ -97,8 +97,15 @@ export default function RunDetailsPage() {
   // Phase 3 — aggregate flush. Walks every QcApproved+AggregatePending order
   // in this run, groups by AggregationKey, and emits one consolidated DN
   // (and optionally INV) per group. Refuses if any order is unapproved.
+  // (2026-05-30) liveWriteToSap toggle — when true, the request body
+  // carries { liveWrite: true } so the backend POSTs the DN+INV straight
+  // to SAP B1 Service Layer (still gated by SAP_WRITE_ENABLED + DB
+  // whitelist server-side). Default OFF — accidental clicks stay dry-run.
+  const [liveWriteToSap, setLiveWriteToSap] = useState(false);
   const flushAggregateMutation = useMutation({
-    mutationFn: () => api.post(`/runs/${id}/flush-aggregate-docs`).then((r) => r.data),
+    mutationFn: () => api
+      .post(`/runs/${id}/flush-aggregate-docs`, { liveWrite: liveWriteToSap })
+      .then((r) => r.data),
     onSuccess: (result) => {
       const dnCount = result.deliveryNotes?.length || 0;
       const invCount = result.invoices?.length || 0;
@@ -106,7 +113,8 @@ export default function RunDetailsPage() {
       if (dnCount) parts.push(`${dnCount} תעודות משלוח`);
       if (invCount) parts.push(`${invCount} חשבוניות`);
       const summary = parts.join(' + ') || 'אין מסמכים חדשים';
-      toast.success(`הופקו ${summary} (${result.ordersTouched} הזמנות אוחדו)`, { duration: 6000 });
+      const mode = liveWriteToSap ? ' · 🔴 נשלח חי ל-SAP' : ' · ⚙️ dry-run (לא נשלח ל-SAP)';
+      toast.success(`הופקו ${summary} (${result.ordersTouched} הזמנות אוחדו)${mode}`, { duration: 8000 });
       queryClient.invalidateQueries({ queryKey: ['run', id] });
       queryClient.invalidateQueries({ queryKey: ['wave-for-run', id] });
     },
@@ -299,15 +307,50 @@ export default function RunDetailsPage() {
               .filter((o) => o.QcApproved && o.AggregatePending && !o.DeliveryNoteId && !o.InvoiceId);
             if (!pending.length) return null;
             return (
-              <button
-                onClick={() => flushAggregateMutation.mutate()}
-                disabled={flushAggregateMutation.isPending}
-                className="inline-flex items-center gap-2 px-3 py-2 bg-sky-600 text-white rounded-lg text-sm hover:bg-sky-700 disabled:opacity-50"
-                title={`${pending.length} הזמנות ממתינות לאיחוד`}
-              >
-                <FileText size={16} />
-                {flushAggregateMutation.isPending ? 'מפיק...' : `הפק מסמכים מאוחדים (${pending.length})`}
-              </button>
+              <div className="inline-flex items-center gap-3">
+                {/* (2026-05-30) Live-SAP-write opt-in. OFF by default so the
+                    button stays a safe dry-run; flip it on only when you
+                    actually want the DN+INV to land in SAP B1 immediately.
+                    Server still gates on SAP_WRITE_ENABLED + whitelist. */}
+                <label
+                  className="inline-flex items-center gap-1.5 text-xs cursor-pointer select-none"
+                  title="כשמסומן: לחיצה על 'הפק מסמכים מאוחדים' תיצור DN+INV גם ב-SAP B1 (לא רק מקומית). כבוי = dry-run, רק תצוגה מקדימה של ה-payload."
+                >
+                  <input
+                    type="checkbox"
+                    checked={liveWriteToSap}
+                    onChange={(e) => setLiveWriteToSap(e.target.checked)}
+                    className="w-4 h-4 accent-red-600"
+                  />
+                  <span className={liveWriteToSap ? 'text-red-700 font-semibold' : 'text-gray-600'}>
+                    {liveWriteToSap ? '🔴 שלח חי ל-SAP' : 'שלח חי ל-SAP'}
+                  </span>
+                </label>
+                <button
+                  onClick={() => {
+                    if (liveWriteToSap) {
+                      const ok = window.confirm(
+                        `אתה עומד לשלוח ${pending.length} הזמנות כ-DN+INV חיים ל-SAP B1.\n\n` +
+                        `כתיבה זו אינה הפיכה ב-SAP. להמשיך?`
+                      );
+                      if (!ok) return;
+                    }
+                    flushAggregateMutation.mutate();
+                  }}
+                  disabled={flushAggregateMutation.isPending}
+                  className={`inline-flex items-center gap-2 px-3 py-2 text-white rounded-lg text-sm disabled:opacity-50 ${
+                    liveWriteToSap
+                      ? 'bg-red-600 hover:bg-red-700'
+                      : 'bg-sky-600 hover:bg-sky-700'
+                  }`}
+                  title={`${pending.length} הזמנות ממתינות לאיחוד · ${liveWriteToSap ? 'מצב חי — ישלח ל-SAP' : 'מצב dry-run — לא ישלח ל-SAP'}`}
+                >
+                  <FileText size={16} />
+                  {flushAggregateMutation.isPending
+                    ? 'מפיק...'
+                    : `הפק מסמכים מאוחדים (${pending.length})`}
+                </button>
+              </div>
             );
           })()}
         </div>

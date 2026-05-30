@@ -4214,10 +4214,27 @@ app.post('/api/runs/:id/flush-aggregate-docs', adminOnly, async (req, res) => {
   try {
     // Phase A2-2: flushAggregateDocsForRun is now async — it performs a
     // dry-run SAP payload check on every DN it creates.
+    // (2026-05-30) Phase 2 — liveWrite is opt-in per click via the new
+    // "שלח חי ל-SAP" checkbox in RunDetailsPage. Default stays false →
+    // dry-run only, so an accidental button press never posts to SAP.
+    // The actual write is still gated by SAP_WRITE_ENABLED +
+    // SAP_LIVE_WRITE_DB_WHITELIST inside writeDeliveryNote/writeInvoice,
+    // so this flag at most ENABLES the attempt — env still has the
+    // final say.
+    const liveWrite = req.body?.liveWrite === true;
     const result = await store.flushAggregateDocsForRun(req.params.id, {
       approvedBy,
-      method: 'AUTO_AGGREGATE_FLUSH',
+      method: liveWrite ? 'AUTO_AGGREGATE_FLUSH_LIVE' : 'AUTO_AGGREGATE_FLUSH',
+      liveWrite,
     });
+    if (liveWrite) {
+      store.recordAudit?.({
+        action: 'flush-aggregate-docs.live-attempted',
+        actorName: approvedBy,
+        ip: req.ip,
+        details: { runId: Number(req.params.id) },
+      });
+    }
     io.emit('run:aggregate-flushed', { runId: Number(req.params.id) });
     res.json({
       ok: true,
