@@ -2749,7 +2749,14 @@ export function generateInvoiceFromDeliveryNote(deliveryNoteId, options = {}) {
 
   const invoice = {
     InvoiceId: s.nextInvoiceId++,
-    DocNumber: `INV-${dn.StopId}-${dn.CompanyCode}-${String(s.nextInvoiceId).padStart(4, '0')}`,
+    // (2026-05-30) Aggregate DNs span multiple stops, so dn.StopId is
+    // intentionally null on them — feeding that straight into the
+    // template literal produced ugly DocNumbers like "INV-null-A-0008".
+    // Use the same INV-AGG-<runId> shape that the aggregate DN itself
+    // uses (see flushAggregateDocsForRun) so the two stay aligned.
+    DocNumber: dn.StopId == null
+      ? `INV-AGG-${dn.RunId}-${dn.CompanyCode}-${String(s.nextInvoiceId).padStart(4, '0')}`
+      : `INV-${dn.StopId}-${dn.CompanyCode}-${String(s.nextInvoiceId).padStart(4, '0')}`,
     DeliveryNoteId: dn.DeliveryNoteId,
     RunId: dn.RunId,
     StopId: dn.StopId,
@@ -3445,6 +3452,16 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
     const firstOrder = orders[0];
     const firstStop = _findStopOfOrder(firstOrder);
 
+    // (2026-05-30) liveWrite was declared inside the `if (emitDN)` block,
+    // which is a different block scope from the two later branches
+    // (`if (emitINV && dn)` and `else if (emitINV && !dn)`) that also
+    // reference it. The result was a ReferenceError "liveWrite is not
+    // defined" every time flushAggregateDocs hit the invoice-write path,
+    // which left INV rows stuck with SapWriteLastError and never reached
+    // either dry-run audit fields or live POST. Lifting it to the loop
+    // body scope makes all three branches see the same value.
+    const liveWrite = options.liveWrite === true;
+
     let dn = null;
     if (emitDN) {
       dn = {
@@ -3510,7 +3527,9 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
       // Audit fields are populated regardless of mode.
       dn.SapWriteAttempts = (dn.SapWriteAttempts || 0) + 1;
       dn.SapWriteAttemptedAt = new Date().toISOString();
-      const liveWrite = options.liveWrite === true;
+      // (2026-05-30) liveWrite is now declared above, before the three
+      // emitDN/emitINV branches, so all of them see the same flag. See
+      // the comment near `const liveWrite = options.liveWrite === true;`.
       try {
         const wr = await writeDeliveryNote(dn, { dryRun: !liveWrite });
         // Phase A2-3: validate critical payload fields BEFORE applying the
