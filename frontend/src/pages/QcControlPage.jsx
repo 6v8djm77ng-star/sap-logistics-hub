@@ -20,9 +20,10 @@ import {
 } from 'lucide-react';
 
 const qcApi = {
-  pending: (params) => api.get('/qc/pending', { params }).then((r) => r.data),
-  approve: (runOrderId) => api.post(`/qc/approve-order/${runOrderId}`).then((r) => r.data),
-  reject:  (runOrderId, reason) =>
+  pending:      (params) => api.get('/qc/pending', { params }).then((r) => r.data),
+  todaySummary: () => api.get('/qc/today-summary').then((r) => r.data),
+  approve:      (runOrderId) => api.post(`/qc/approve-order/${runOrderId}`).then((r) => r.data),
+  reject:       (runOrderId, reason) =>
     api.post(`/qc/reject-order/${runOrderId}`, { reason }).then((r) => r.data),
 };
 
@@ -273,6 +274,16 @@ export default function QcControlPage() {
     refetchInterval: 30_000,
   });
 
+  // (2026-05-30) Counter strip: how many orders the controller approved
+  // and rejected today, plus where the approved ones went next. Polls
+  // alongside the pending list. After every approve/reject we invalidate
+  // this key so the badges advance instantly.
+  const { data: summary } = useQuery({
+    queryKey: ['qc-today-summary'],
+    queryFn:  qcApi.todaySummary,
+    refetchInterval: 60_000,
+  });
+
   const orders = data?.orders || [];
 
   const approveMutation = useMutation({
@@ -303,6 +314,7 @@ export default function QcControlPage() {
         action: { label: 'פתח מסמכים', onClick: () => { window.location.href = '/documents'; } },
       });
       qc.invalidateQueries({ queryKey: ['qc-pending'] });
+      qc.invalidateQueries({ queryKey: ['qc-today-summary'] });
     },
     onError: (err) => {
       const msg = err.response?.data?.message || err.response?.data?.error || 'אישור נכשל';
@@ -316,6 +328,7 @@ export default function QcControlPage() {
       toast.success('הזמנה נדחתה');
       setRejecting(null);
       qc.invalidateQueries({ queryKey: ['qc-pending'] });
+      qc.invalidateQueries({ queryKey: ['qc-today-summary'] });
     },
     onError: (err) => {
       const msg = err.response?.data?.message || err.response?.data?.error || 'דחייה נכשלה';
@@ -339,13 +352,43 @@ export default function QcControlPage() {
         <ShieldCheck className="text-blue-600" size={28} />
         <h1 className="text-2xl font-bold">בקרה אחרי ליקוט</h1>
       </div>
-      <p className="text-sm text-gray-600 mb-4">
+      <p className="text-sm text-gray-600 mb-3">
         לחיצה על שורה פותחת את הפריטים שלוקטו עם סימוני בקרה (תקין / בעייתי).
         כפתור "אשר הזמנה" → תעודות (תמ״ש/חשבונית) נוצרות לפי מדיניות הלקוח עם כמויות הליקוט בפועל,
         ומועברות למסך <a href="/documents" className="text-blue-600 hover:underline font-medium">מסמכים</a> במצב{' '}
         <span className="font-mono text-xs bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded">PENDING_EXPORT</span>.
         שליחת ה-SAP בפועל מבוצעת ידנית משם.
       </p>
+
+      {/* (2026-05-30) Today's-activity strip — shows the controller where
+          they stand for the day. The "אישרת היום" chip links to /documents
+          so they can flip to the next step (export to SAP) in one click. */}
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
+        <a
+          href="/documents"
+          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-green-200 bg-green-50 text-green-800 hover:bg-green-100 transition-colors"
+          title="עבור למסך מסמכים — תעודות שאושרו היום ממתינות שם לייצוא ל-SAP"
+        >
+          <CheckCircle2 size={14} className="text-green-600" />
+          אישרת היום: <span className="font-bold">{summary?.approvedToday ?? '—'}</span>
+        </a>
+        {summary?.rejectedToday > 0 && (
+          <span
+            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-red-200 bg-red-50 text-red-800"
+            title="הזמנות שדחית היום (לא נשלחו ל-SAP)"
+          >
+            <XCircle size={14} className="text-red-600" />
+            דחית היום: <span className="font-bold">{summary.rejectedToday}</span>
+          </span>
+        )}
+        <span
+          className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-blue-200 bg-blue-50 text-blue-800"
+          title="הזמנות שעדיין מחכות לבקרה"
+        >
+          <ShieldCheck size={14} className="text-blue-600" />
+          ממתינות עכשיו: <span className="font-bold">{summary?.pendingCount ?? orders.length}</span>
+        </span>
+      </div>
 
       {/* Filters */}
       <div className="bg-white border rounded-xl p-3 mb-4 flex flex-wrap items-end gap-3">

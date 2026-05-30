@@ -4062,6 +4062,29 @@ app.get('/api/qc/pending', qcControllerOnly, (req, res) => {
   res.json({ orders, count: orders.length, filters });
 });
 
+// (2026-05-30) "אישרת היום" + "דחית היום" counters. Drives the small
+// badge on QcControlPage's header so the controller knows where today's
+// approved orders went (→ /documents, PENDING_EXPORT). Lives alongside
+// /api/qc/pending because the matrix UI polls it on the same interval.
+app.get('/api/qc/today-summary', qcControllerOnly, (req, res) => {
+  const s = store.load();
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+  const isToday = (iso) => typeof iso === 'string' && iso.slice(0, 10) === today;
+
+  let approvedToday = 0;
+  let rejectedToday = 0;
+  for (const o of (s.runOrders || [])) {
+    if (o.QcApproved && isToday(o.QcApprovedAt)) approvedToday++;
+    if (o.QcRejected && isToday(o.QcRejectedAt)) rejectedToday++;
+  }
+  res.json({
+    today,
+    approvedToday,
+    rejectedToday,
+    pendingCount: store.listQcPendingOrders({}).length,
+  });
+});
+
 app.post('/api/qc/approve-order/:runOrderId', qcControllerOnly, (req, res) => {
   try {
     const result = store.generateDocsForRunOrder(req.params.runOrderId, {
