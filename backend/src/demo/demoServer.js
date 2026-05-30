@@ -79,6 +79,16 @@ if (!JWT_SECRET || JWT_SECRET.length < 32) {
 const app = express();
 const server = http.createServer(app);
 
+// (2026-05-30) Trust the first proxy hop so req.ip / X-Forwarded-For
+// reflects the real client IP behind Tailscale Funnel (or any single
+// reverse proxy). Without this:
+//   - express-rate-limit warns ERR_ERL_UNEXPECTED_X_FORWARDED_FOR and
+//     measures by the proxy IP (so all mobile clients share one bucket)
+//   - audit log writes show the proxy IP instead of the real user
+// `1` = trust ONE proxy in front. Tailscale Funnel is one hop. Bump if
+// we later add Cloudflare/nginx in front.
+app.set('trust proxy', 1);
+
 // Wave A security follow-up — explicit CORS allow-list from CORS_ORIGINS env.
 // Without this, any origin on the public internet could call our API once it
 // found a valid token. Same-origin requests (no Origin header — curl, mobile
