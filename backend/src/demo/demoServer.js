@@ -4336,6 +4336,197 @@ app.post('/api/admin/sap-write/test-flush/:runId', adminOnly, async (req, res) =
   }
 });
 
+// DEV.14: per-invoice export to SAP TEST.
+//
+// Why a NEW endpoint instead of reusing /api/sap/write/invoice/:id:
+//   The legacy /api/sap/write/invoice/:id has no admin gate, no confirm
+//   phrase, no PENDING_EXPORT check, and no production-DB blocker. It
+//   pre-dates the strict gating pattern. Building a new endpoint lets us
+//   layer all 6 defense-in-depth checks without breaking anything else.
+//
+// Defense-in-depth gates (all must pass, in this order):
+//   1. adminOnly middleware       -> JWT + role==='ADMIN' (401 / 403)
+//   2. invoiceId positive integer -> 400 INVALID_INVOICE_ID
+//   3. body.confirm magic phrase  -> 400 BAD_INPUT
+//   4. SAP_WRITE_ENABLED='true'   -> 403 LIVE_WRITE_DISABLED
+//   5. CompanyDB not in production block-list -> 403 PRODUCTION_DB_BLOCKED
+//   6. Invoice exists             -> 404 INVOICE_NOT_FOUND
+//   7. canExportInvoiceToSap(...) -> 400 NOT_PENDING_EXPORT / ALREADY_EXPORTED / ...
+//   8. (inside writeInvoice) whitelist case-sensitive check -> 503 if drift
+//
+// Blast radius: exactly 1 invoice per call. No bulk path.
+
+const ExportInvoiceBodySchema = z.object({
+  confirm: z.literal('I-UNDERSTAND-THIS-WRITES-TO-SAP'),
+}).strict();
+
+// Block-list of production company DBs. Belt-and-suspenders alongside
+// SAP_LIVE_WRITE_DB_WHITELIST: even if the whitelist drifts, this hard
+// reject prevents an accidental production write through this endpoint.
+const SAP_PRODUCTION_DB_BLOCKLIST = ['SAP_OIG', 'SAP_Unico', 'SAP_Unico_Eilat'];
+
+function _resolveCompanyDb(companyCode) {
+  if (companyCode === 'A') return process.env.SAP_SL_COMPANY_DB_A || null;
+  if (companyCode === 'B') return process.env.SAP_SL_COMPANY_DB_B || null;
+  return null;
+}
+
+/**
+ * DEV.14 preview — dry-run inspection of the SAP payload that WOULD be
+ * sent for this invoice, plus the guard verdict. Read-only: never writes
+ * to SAP, never mutates the store. Does NOT require SAP_WRITE_ENABLED —
+ * operators should be able to inspect the payload even on a quiet system.
+ */
+app.post('/api/admin/sap-write/invoices/:invoiceId/preview', adminOnly, async (req, res) => {
+  const invoiceId = Number(req.params.invoiceId);
+  if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+    return res.status(400).json({ error: 'invalid invoiceId', code: 'INVALID_INVOICE_ID' });
+  }
+  const invoice = (store.load().invoices || []).find((i) => i.InvoiceId === invoiceId);
+  if (!invoice) return res.status(404).json({ error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' });
+
+  const dn = invoice.DeliveryNoteId
+    ? (store.load().deliveryNotes || []).find((d) => d.DeliveryNoteId === invoice.DeliveryNoteId)
+    : null;
+
+  const guard = store.canExportInvoiceToSap(invoice);
+  const targetCompanyDb = _resolveCompanyDb(invoice.CompanyCode);
+  const isProductionDb = SAP_PRODUCTION_DB_BLOCKLIST.includes(targetCompanyDb);
+
+  // Force dryRun=true so writeInvoice builds the payload and returns it
+  // without touching the network (also short-circuits the per-request
+  // whitelist gate — we want to see the payload regardless).
+  const { writeInvoice } = await import('./sapWriter.js');
+  const result = await writeInvoice(invoice, dn, { dryRun: true });
+
+  return res.json({
+    ok: true,
+    mode: 'preview',
+    canExport: guard.ok === true && !isProductionDb,
+    guard,
+    productionDbBlocked: isProductionDb,
+    targetCompanyDb,
+    invoice: {
+      InvoiceId: invoice.InvoiceId,
+      DocNumber: invoice.DocNumber,
+      Status: invoice.Status,
+      CompanyCode: invoice.CompanyCode,
+      SapCardCode: invoice.SapCardCode,
+      SapCardName: invoice.SapCardName,
+      TotalAmount: invoice.TotalAmount,
+      DeliveryNoteId: invoice.DeliveryNoteId,
+      hasLines: Array.isArray(invoice.Lines) && invoice.Lines.length > 0,
+    },
+    linkedDn: dn ? {
+      DeliveryNoteId: dn.DeliveryNoteId,
+      DocNumber: dn.DocNumber,
+      Status: dn.Status,
+      SapDeliveryDocEntry: dn.SapDeliveryDocEntry,
+    } : null,
+    payloadThatWouldBeSent: result.payload,
+    payloadShape: dn?.SapDeliveryDocEntry ? 'live-mode (BaseType=15 ref to DN)' : 'standalone (ItemCode+Quantity)',
+  });
+});
+
+/**
+ * DEV.14 export-test — LIVE write of a single PENDING_EXPORT invoice to
+ * the configured TEST CompanyDB. Multiple defense-in-depth gates run
+ * before any network call; see comment block above. On success the
+ * invoice is updated to SAP_CONFIRMED with the real DocEntry/DocNum.
+ */
+app.post('/api/admin/sap-write/invoices/:invoiceId/export-test', adminOnly, async (req, res) => {
+  // Gate 2: invoiceId positive integer
+  const invoiceId = Number(req.params.invoiceId);
+  if (!Number.isInteger(invoiceId) || invoiceId <= 0) {
+    return res.status(400).json({ error: 'invalid invoiceId', code: 'INVALID_INVOICE_ID' });
+  }
+  // Gate 3: body confirm phrase (matches the test-flush pattern)
+  const body = parseBody(ExportInvoiceBodySchema, req.body, res);
+  if (!body) return;
+  // Gate 4: SAP_WRITE_ENABLED env. Early reject — no point continuing if
+  // writeInvoice would dry-run anyway.
+  if (process.env.SAP_WRITE_ENABLED !== 'true') {
+    return res.status(403).json({
+      error: 'SAP_WRITE_ENABLED is not true; refusing live write',
+      code: 'LIVE_WRITE_DISABLED',
+    });
+  }
+  // Gate 6: invoice exists
+  const invoice = (store.load().invoices || []).find((i) => i.InvoiceId === invoiceId);
+  if (!invoice) return res.status(404).json({ error: 'Invoice not found', code: 'INVOICE_NOT_FOUND' });
+  // Gate 5: production DB block-list (after we know the invoice's company)
+  const targetCompanyDb = _resolveCompanyDb(invoice.CompanyCode);
+  if (SAP_PRODUCTION_DB_BLOCKLIST.includes(targetCompanyDb)) {
+    return res.status(403).json({
+      error: `production CompanyDB '${targetCompanyDb}' is forbidden via this endpoint`,
+      code: 'PRODUCTION_DB_BLOCKED',
+      companyDb: targetCompanyDb,
+    });
+  }
+  // Gate 7: invoice state checks (status, no existing DocEntry, lines present)
+  const guard = store.canExportInvoiceToSap(invoice);
+  if (guard.error) return res.status(400).json(guard);
+
+  // Look up linked DN if any — used by the payload builder to decide
+  // live-mode (BaseType=15) vs standalone (ItemCode+Quantity).
+  const dn = invoice.DeliveryNoteId
+    ? (store.load().deliveryNotes || []).find((d) => d.DeliveryNoteId === invoice.DeliveryNoteId)
+    : null;
+
+  // Execute. writeInvoice() runs gate 8 (per-request whitelist) internally
+  // and returns { ok, sapDocEntry, sapDocNum, payload, ... } or throws.
+  const { writeInvoice } = await import('./sapWriter.js');
+  let result;
+  try {
+    result = await writeInvoice(invoice, dn, { dryRun: false });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, code: 'SAP_WRITE_EXCEPTION' });
+  }
+  if (!result.ok) {
+    return res.status(502).json({
+      error: result.error || 'SAP write failed',
+      code: result.code || 'SAP_WRITE_FAILED',
+      payload: result.payload,
+    });
+  }
+
+  // Success: persist the real DocEntry/DocNum and flip status.
+  if (result.sapDocEntry) {
+    invoice.SapInvoiceDocEntry = result.sapDocEntry;
+    invoice.SapInvoiceDocNum = result.sapDocNum;
+    invoice.Status = 'SAP_CONFIRMED';
+    invoice.SentToSapAt = new Date().toISOString();
+    invoice.ConfirmedAt = new Date().toISOString();
+    store.save?.();
+  }
+
+  store.recordAudit({
+    action: 'invoice.export_test',
+    actorSub: req.user?.sub,
+    actorName: req.user?.name || req.user?.username,
+    ip: req.ip,
+    details: {
+      invoiceId: invoice.InvoiceId,
+      docNumber: invoice.DocNumber,
+      companyCode: invoice.CompanyCode,
+      companyDb: targetCompanyDb,
+      sapCardCode: invoice.SapCardCode,
+      sapDocEntry: result.sapDocEntry,
+      sapDocNum: result.sapDocNum,
+    },
+  });
+
+  return res.json({
+    ok: true,
+    mode: 'live',
+    invoiceId: invoice.InvoiceId,
+    docNumber: invoice.DocNumber,
+    sapDocEntry: result.sapDocEntry,
+    sapDocNum: result.sapDocNum,
+    payload: result.payload,
+  });
+});
+
 app.post('/api/picking/:waveId/qc-approve', (req, res) => {
   const auth = req.headers.authorization;
   let approvedBy = null;

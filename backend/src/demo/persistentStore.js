@@ -3674,6 +3674,51 @@ export async function flushAggregateDocsForRun(runId, options = {}) {
   };
 }
 
+// DEV.14: pure guard that decides if a single invoice can be exported to
+// SAP TEST via the new `/api/admin/sap-write/invoices/:invoiceId/export-test`
+// endpoint. All checks here are state-of-record only — no env, no SAP
+// connectivity. The endpoint layers env/whitelist/admin gates on top.
+// Returns { ok: true } or { error, ... }.
+//
+// Why centralize here:
+//   - Lets unit tests drive every branch with hand-built fixtures (zero
+//     store access, zero PM2, zero SAP)
+//   - The same guard is reused by the preview endpoint to surface
+//     "this invoice can/can't be exported" without doing the write
+//   - Keeps the endpoint code readable: route handler stays thin, all
+//     domain logic lives in the store module
+export function canExportInvoiceToSap(invoice) {
+  if (!invoice || typeof invoice !== 'object') {
+    return { error: 'INVOICE_NOT_FOUND' };
+  }
+  if (invoice.Status !== 'PENDING_EXPORT') {
+    return { error: 'NOT_PENDING_EXPORT', current: invoice.Status };
+  }
+  // Truthy SapInvoiceDocEntry means SOMETHING already lives in the field —
+  // could be a real SAP DocEntry from a previous successful export, or a
+  // placeholder string like "1" from a legacy manual-confirm. Either way:
+  // refuse, to avoid silently overwriting state. Reverting bad placeholders
+  // is a separate flow (DEV.13 revertSapConfirmation).
+  if (invoice.SapInvoiceDocEntry) {
+    return { error: 'ALREADY_EXPORTED', existingDocEntry: invoice.SapInvoiceDocEntry };
+  }
+  if (!invoice.SapCardCode) {
+    return { error: 'MISSING_CARD_CODE' };
+  }
+  if (!invoice.CompanyCode) {
+    return { error: 'MISSING_COMPANY_CODE' };
+  }
+  // The payload builder (sapWriter._buildInvoicePayload) needs at least one
+  // line — either dn.Lines (preferred) or invoice.Lines. Block here so the
+  // operator gets a clean 400 instead of a cryptic SAP error on an empty
+  // DocumentLines array.
+  const hasInvoiceLines = Array.isArray(invoice.Lines) && invoice.Lines.length > 0;
+  if (!hasInvoiceLines) {
+    return { error: 'NO_LINES' };
+  }
+  return { ok: true };
+}
+
 export function markDocsExported(docIds, type = 'deliveryNote') {
   const s = ensureDocsStore();
   const collection = type === 'invoice' ? s.invoices : s.deliveryNotes;
