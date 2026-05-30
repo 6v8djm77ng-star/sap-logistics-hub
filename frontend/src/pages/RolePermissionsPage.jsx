@@ -215,8 +215,18 @@ export default function RolePermissionsPage() {
               {roles.map((roleCode) => {
                 const hasWildcard = (draft[roleCode] || []).includes('*');
                 const isPending = pendingRoles.has(roleCode);
+                // (2026-05-30) DRIVER uses a separate mobile-first UI
+                // under /driver/* that doesn't render the sidebar at all,
+                // so toggling AllowedScreens has no visible effect for
+                // them. Keep the row visible (admin should know the role
+                // exists) but disable the checkboxes + add an explainer
+                // so nobody wastes time configuring an inert row.
+                const isInformational = roleCode === 'DRIVER';
                 return (
-                  <tr key={roleCode} className="border-t hover:bg-gray-50">
+                  <tr
+                    key={roleCode}
+                    className={`border-t hover:bg-gray-50 ${isInformational ? 'bg-gray-50' : ''}`}
+                  >
                     <td className="px-3 py-2 sticky right-0 bg-white z-10 border-l font-semibold">
                       <div className="flex items-center gap-2">
                         {ROLE_LABELS[roleCode] || roleCode}
@@ -225,14 +235,22 @@ export default function RolePermissionsPage() {
                         )}
                       </div>
                       <div className="text-xs text-gray-400 font-mono">{roleCode}</div>
+                      {isInformational && (
+                        <div className="text-[10px] text-gray-500 mt-1 leading-tight italic">
+                          לא רלוונטי — נהגים משתמשים בממשק נפרד <span className="font-mono">/driver/*</span>
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2 text-center border-l">
                       <input
                         type="checkbox"
                         checked={hasWildcard}
                         onChange={() => toggleWildcard(roleCode)}
-                        className="w-4 h-4 cursor-pointer"
-                        title="להעניק גישה לכל המסכים, כולל מסכים שיתווספו בעתיד"
+                        disabled={isInformational}
+                        className="w-4 h-4 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={isInformational
+                          ? 'נהגים אינם רואים את הסיידבר — ההגדרה הזו לא תשפיע עליהם'
+                          : 'להעניק גישה לכל המסכים, כולל מסכים שיתווספו בעתיד'}
                       />
                     </td>
                     {SECTION_ORDER.flatMap((section) =>
@@ -244,11 +262,13 @@ export default function RolePermissionsPage() {
                               type="checkbox"
                               checked={allowed}
                               onChange={() => toggleScreen(roleCode, s.code)}
-                              disabled={hasWildcard}
-                              className="w-4 h-4 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                              title={hasWildcard
-                                ? '★ "כל המסכים" פעיל — לפעולה פר-מסך כבה אותו קודם'
-                                : `${ROLE_LABELS[roleCode] || roleCode}: ${s.label}`}
+                              disabled={hasWildcard || isInformational}
+                              className="w-4 h-4 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                              title={isInformational
+                                ? 'נהגים אינם רואים את הסיידבר — ההגדרה הזו לא תשפיע עליהם'
+                                : hasWildcard
+                                  ? '★ "כל המסכים" פעיל — לפעולה פר-מסך כבה אותו קודם'
+                                  : `${ROLE_LABELS[roleCode] || roleCode}: ${s.label}`}
                             />
                           </td>
                         );
