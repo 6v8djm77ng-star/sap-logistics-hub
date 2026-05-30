@@ -9,7 +9,7 @@
  * a Run. Toggle + filters persist to localStorage. The legacy
  * /api/orders/open path stays the default when the toggle is OFF.
  */
-import { useState, useMemo } from 'react';
+import { useState, useMemo, Fragment } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import api from '../services/api.js';
@@ -362,11 +362,57 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
   );
 }
 
+// DEV.20: keys for localStorage persistence of the new view controls so the
+// operator's choice survives reload. Bumped to .v1 to leave room for future
+// migrations.
+const VIEW_MODE_KEY     = 'openOrders.viewMode.v1';     // 'customers' | 'orders'
+const MIN_ORDER_KEY     = 'openOrders.minOrderTotal.v1'; // number ≥ 0
+const EXPANDED_KEY      = 'openOrders.expanded.v1';      // Set serialized as array
+
+function loadViewMode() {
+  try { return localStorage.getItem(VIEW_MODE_KEY) || 'customers'; } catch { return 'customers'; }
+}
+function loadMinOrderTotal() {
+  try { return Number(localStorage.getItem(MIN_ORDER_KEY)) || 0; } catch { return 0; }
+}
+function loadExpanded() {
+  try {
+    const raw = localStorage.getItem(EXPANDED_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
+  } catch { return new Set(); }
+}
+
 export default function OpenOrdersPage() {
   const [search, setSearch] = useState('');
   const [company, setCompany] = useState('');
   const [limit, setLimit] = useState(100);
   const [sortBy, setSortBy] = useState('docDate-desc'); // docDate / cardName / city / zone
+  // DEV.20: view mode + filter. 'customers' (default) aggregates by
+  // CardCode — way less noise when an operator just wants to know who
+  // to ship to today. 'orders' falls back to the legacy row-per-order
+  // view for cases where the operator does need to drill in.
+  const [viewMode, setViewMode] = useState(loadViewMode); // 'customers' | 'orders'
+  const [minOrderTotal, setMinOrderTotal] = useState(loadMinOrderTotal);
+  const [expandedCustomers, setExpandedCustomers] = useState(loadExpanded);
+  const updateViewMode = (v) => {
+    setViewMode(v);
+    try { localStorage.setItem(VIEW_MODE_KEY, v); } catch {}
+  };
+  const updateMinOrderTotal = (n) => {
+    const v = Math.max(0, Number(n) || 0);
+    setMinOrderTotal(v);
+    try { localStorage.setItem(MIN_ORDER_KEY, String(v)); } catch {}
+  };
+  const toggleExpandCustomer = (key) => {
+    setExpandedCustomers((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      try { localStorage.setItem(EXPANDED_KEY, JSON.stringify([...next])); } catch {}
+      return next;
+    });
+  };
 
   // Today's Hebrew weekday — used as the "active day" when the operator
   // turns ON "החל יום חלוקה". When the toggle is OFF the day check is
@@ -543,6 +589,61 @@ export default function OpenOrdersPage() {
         }
       : baseSort;
     arr.sort(finalSort);
+    return arr;
+  })();
+
+  // DEV.20A: per-order minimum filter. Applied AFTER plan-eval so an
+  // order that "passes" plan-eval (because its customer aggregate is
+  // above threshold) can still be hidden if THIS specific order is
+  // below the operator's per-order floor. minOrderTotal=0 = disabled.
+  const minOrderFilteredOrders = minOrderTotal > 0
+    ? orders.filter((o) => Number(o.DocTotal || 0) >= minOrderTotal)
+    : orders;
+
+  // DEV.20B: aggregate by customer (CardCode + CompanyCode). One row per
+  // customer with sum/count, expandable to see individual orders.
+  // Key format avoids collisions between CompanyCode A and B.
+  const customerKeyOf = (o) => `${o.CompanyCode || '?'}:${o.CardCode || '?'}`;
+  const aggregatedByCustomer = (() => {
+    const groups = new Map();
+    for (const o of minOrderFilteredOrders) {
+      const key = customerKeyOf(o);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          CardCode:    o.CardCode,
+          CardName:    o.CardName,
+          CompanyCode: o.CompanyCode,
+          CompanyName: o.CompanyName,
+          Zone:        o.Zone,
+          ZoneName:    o.ZoneName,
+          ZoneColor:   o.ZoneColor,
+          orders:      [],
+          totalAmount: 0,
+          totalLines:  0,
+          // For plan-eval-aware sort: customer "passes" if ANY of their
+          // orders passes (since they'd be picked up in the same Stop).
+          anyPasses:   false,
+        });
+      }
+      const g = groups.get(key);
+      g.orders.push(o);
+      g.totalAmount += Number(o.DocTotal || 0);
+      g.totalLines  += Number(o.LinesCount || 0);
+      if (o.planEval?.passes) g.anyPasses = true;
+    }
+    // Stable order: by amount desc, then card name.
+    const arr = [...groups.values()];
+    arr.sort((a, b) => {
+      // Pin passing customers to top when plan-eval is on
+      if (planEvalCfg.enabled) {
+        const passDiff = Number(b.anyPasses) - Number(a.anyPasses);
+        if (passDiff !== 0) return passDiff;
+      }
+      const amountDiff = b.totalAmount - a.totalAmount;
+      if (amountDiff !== 0) return amountDiff;
+      return String(a.CardName || '').localeCompare(String(b.CardName || ''), 'he');
+    });
     return arr;
   })();
 
@@ -852,6 +953,59 @@ export default function OpenOrdersPage() {
         )}
       </div>
 
+      {/* DEV.20: view-mode toggle + per-order minimum filter. Persisted
+          to localStorage. Default = 'customers' because operators plan
+          per-customer Stops, not per-order. */}
+      <div className="bg-white border rounded-xl p-3 mb-3 flex items-center gap-3 flex-wrap text-sm">
+        <span className="text-gray-600">תצוגה:</span>
+        <div className="inline-flex rounded-md border overflow-hidden">
+          <button
+            type="button"
+            onClick={() => updateViewMode('customers')}
+            className={`px-3 py-1.5 ${viewMode === 'customers' ? 'bg-brand-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'}`}
+            title="שורה לכל לקוח (מומלץ — מתאים לתכנון Stops)"
+          >
+            👥 לקוחות ({aggregatedByCustomer.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => updateViewMode('orders')}
+            className={`px-3 py-1.5 ${viewMode === 'orders' ? 'bg-brand-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-50'}`}
+            title="שורה לכל הזמנה (תצוגה מפורטת)"
+          >
+            📋 הזמנות ({minOrderFilteredOrders.length})
+          </button>
+        </div>
+        <span className="text-gray-300">|</span>
+        <label className="flex items-center gap-2">
+          <span className="text-gray-600">מינימום הזמנה ₪:</span>
+          <input
+            type="number"
+            min={0}
+            step={50}
+            value={minOrderTotal}
+            onChange={(e) => updateMinOrderTotal(e.target.value)}
+            className="w-24 px-2 py-1 border rounded text-sm"
+            title="הזמנות מתחת לסף הזה לא יוצגו. 0 = ללא סינון."
+          />
+          {minOrderTotal > 0 && (
+            <button
+              type="button"
+              onClick={() => updateMinOrderTotal(0)}
+              className="text-xs text-gray-500 hover:underline"
+              title="נקה מסנן מינימום"
+            >
+              <X size={12} className="inline" /> נקה
+            </button>
+          )}
+        </label>
+        {minOrderTotal > 0 && orders.length !== minOrderFilteredOrders.length && (
+          <span className="text-xs text-amber-700 bg-amber-50 px-2 py-0.5 rounded">
+            סוננו {orders.length - minOrderFilteredOrders.length} הזמנות מתחת ל-₪{Number(minOrderTotal).toLocaleString()}
+          </span>
+        )}
+      </div>
+
       {/* Table */}
       <div className="bg-white border rounded-xl overflow-hidden">
         {isLoading ? (
@@ -861,6 +1015,105 @@ export default function OpenOrdersPage() {
             <Package className="mx-auto text-gray-400 mb-3" size={40} />
             <p className="text-gray-500">לא נמצאו הזמנות פתוחות</p>
           </div>
+        ) : viewMode === 'customers' ? (
+          /* DEV.20B: customers view — one row per CardCode, expandable */
+          !aggregatedByCustomer.length ? (
+            <div className="text-center py-16">
+              <Package className="mx-auto text-gray-400 mb-3" size={40} />
+              <p className="text-gray-500">אין לקוחות עם הזמנות התואמות למסננים</p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 text-gray-600 text-xs">
+                  <tr>
+                    <th className="w-10"></th>
+                    <th className="px-3 py-2 text-right font-medium">חברה</th>
+                    <th className="px-3 py-2 text-right font-medium">לקוח</th>
+                    <th className="px-3 py-2 text-right font-medium">אזור</th>
+                    <th className="px-3 py-2 text-center font-medium">הזמנות</th>
+                    <th className="px-3 py-2 text-center font-medium">שורות</th>
+                    <th className="px-3 py-2 text-left font-medium">סה"כ לקוח</th>
+                    {planEvalCfg.enabled && (
+                      <th className="px-3 py-2 text-center font-medium">עובר?</th>
+                    )}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {aggregatedByCustomer.map((c) => {
+                    const isExpanded = expandedCustomers.has(c.key);
+                    const companyBadge = c.CompanyCode === 'A'
+                      ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700';
+                    return (
+                      <Fragment key={c.key}>
+                        <tr
+                          className="hover:bg-gray-50 cursor-pointer"
+                          onClick={() => toggleExpandCustomer(c.key)}
+                        >
+                          <td className="text-center">
+                            {isExpanded
+                              ? <ChevronUp size={14} className="inline text-gray-400" />
+                              : <ChevronDown size={14} className="inline text-gray-400" />}
+                          </td>
+                          <td className="px-3 py-2">
+                            <span className={`px-1.5 py-0.5 text-xs rounded ${companyBadge}`}>{c.CompanyName}</span>
+                          </td>
+                          <td className="px-3 py-2">
+                            <div className="font-medium">{c.CardName || c.CardCode}</div>
+                            <div className="text-xs text-gray-500 font-mono">{c.CardCode}</div>
+                          </td>
+                          <td className="px-3 py-2 text-xs">
+                            {c.Zone ? (
+                              <span
+                                className="inline-block px-1.5 py-0.5 rounded"
+                                style={c.ZoneColor ? { backgroundColor: c.ZoneColor + '22', color: c.ZoneColor } : {}}
+                              >
+                                {c.ZoneName || c.Zone}
+                              </span>
+                            ) : '—'}
+                          </td>
+                          <td className="px-3 py-2 text-center font-mono">{c.orders.length}</td>
+                          <td className="px-3 py-2 text-center font-mono">{c.totalLines}</td>
+                          <td className="px-3 py-2 text-left font-mono font-semibold">
+                            ₪{c.totalAmount.toLocaleString()}
+                          </td>
+                          {planEvalCfg.enabled && (
+                            <td className="px-3 py-2 text-center">
+                              {c.anyPasses
+                                ? <span className="text-green-600 text-xs">✓ עובר</span>
+                                : <span className="text-gray-400 text-xs">—</span>}
+                            </td>
+                          )}
+                        </tr>
+                        {isExpanded && c.orders.map((order) => (
+                          <tr key={`${c.key}-order-${order.DocEntry}`} className="bg-gray-50/50 text-xs">
+                            <td></td>
+                            <td className="px-3 py-1.5 text-gray-500">↳</td>
+                            <td className="px-3 py-1.5 font-mono">#{order.DocNum}</td>
+                            <td className="px-3 py-1.5 text-gray-500">
+                              {order.DocDueDate ? format(new Date(order.DocDueDate), 'dd/MM/yy') : '—'}
+                            </td>
+                            <td className="px-3 py-1.5 text-center">{order.LinesCount || 0} שורות</td>
+                            <td></td>
+                            <td className="px-3 py-1.5 text-left font-mono">
+                              ₪{Number(order.DocTotal || 0).toLocaleString()}
+                            </td>
+                            {planEvalCfg.enabled && (
+                              <td className="px-3 py-1.5 text-center">
+                                {order.planEval?.passes
+                                  ? <span className="text-green-600">✓</span>
+                                  : <span className="text-gray-400">—</span>}
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )
         ) : (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
