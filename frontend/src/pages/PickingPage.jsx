@@ -35,7 +35,7 @@ const pickingApi = {
  * Pick-by-Light highlight is per-row, not per-card, so the picker sees
  * exactly which row to handle next.
  */
-function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
+function PickedAllocations({ allocations, onPick, onReset, onApproveOrder, onSendToQc }) {
   if (!allocations?.length) return null;
   // Find the FIRST allocation that is not yet fully picked - that's the
   // current row to highlight (Pick-by-Light per row).
@@ -119,6 +119,27 @@ function PickedAllocations({ allocations, onPick, onReset, onApproveOrder }) {
                 <Check size={10} /> אשר הזמנה
               </button>
             )}
+            {/* (2026-05-31) Partial-QC handoff — picker passes order to QC
+                instead of self-approving. Shows whenever the order has SOME
+                progress (even partial) and hasn't been approved/sent yet.
+                Hidden once already sent to avoid duplicate clicks. */}
+            {a.RunOrderId && onSendToQc && !a.QcApproved && !a.ReadyForQc && (
+              <button
+                onClick={() => onSendToQc(a)}
+                className="inline-flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded text-[10px] font-bold hover:bg-blue-700 mr-1"
+                title="שלח את ההזמנה לבקר QC עכשיו (גם אם נשארו פריטים ללקט)"
+              >
+                <Check size={10} /> שלח לבקרה
+              </button>
+            )}
+            {a.ReadyForQc && !a.QcApproved && (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-blue-100 text-blue-800 border border-blue-300 rounded text-[10px] font-medium"
+                title="ההזמנה נשלחה לבקר QC ומחכה לאישור — המלקט יכול להמשיך בקו"
+              >
+                ⏳ בבקרה
+              </span>
+            )}
             {a.QcApproved && a.AggregatePending && !a.DeliveryNoteId && !a.InvoiceId && (
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 bg-sky-100 text-sky-900 border border-sky-400 rounded text-[10px] font-medium" title="ההזמנה אושרה. תעודת משלוח / חשבונית מאוחדת תופק בסיום ה-run">
                 <Check size={10} /> ממתין לאיחוד
@@ -200,6 +221,32 @@ export default function PickingPage() {
     mutationFn: ({ stopId, palletLabel }) =>
       api.patch(`/stops/${stopId}`, { palletLabel }).then((r) => r.data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', effectiveRunId] }),
+  });
+
+  // (2026-05-31) Partial-QC handoff — flag a single order as ready for
+  // QC review even though the wave is still PICKING. Doesn't approve,
+  // doesn't create documents — just makes the order visible to the QC
+  // controller on /qc-control immediately so they can start work in
+  // parallel. Idempotent — re-click is a no-op.
+  const sendToQcMutation = useMutation({
+    mutationFn: (alloc) =>
+      api.post(`/run-orders/${alloc.RunOrderId}/ready-for-qc`).then((r) => r.data),
+    onSuccess: (result, alloc) => {
+      if (result.alreadyFlagged) {
+        toast.info('הזמנה ' + alloc.SapDocNum + ' כבר נשלחה לבקרה', { duration: 3000 });
+      } else {
+        toast.success(
+          'הזמנה ' + alloc.SapDocNum + ' נשלחה לבקרה — מופיעה אצל הבקר עכשיו',
+          { duration: 5000 },
+        );
+      }
+      queryClient.invalidateQueries({ queryKey: ['wave-for-run', effectiveRunId] });
+      queryClient.invalidateQueries({ queryKey: ['wave', waveIdParam] });
+    },
+    onError: (err) => {
+      const msg = err.response?.data?.message || err.response?.data?.error || 'שגיאה בשליחה לבקרה';
+      toast.error(msg, { duration: 6000 });
+    },
   });
 
   // Per-order QC approve — Feature C, DRY-RUN. Creates the SAP documents the
@@ -693,6 +740,7 @@ export default function PickingPage() {
                     onPick={(allocId, qty) => pickAllocationMutation.mutate({ allocId, qty })}
                     onReset={(allocId) => resetAllocationMutation.mutate(allocId)}
                     onApproveOrder={(a) => approveOrderMutation.mutate(a)}
+                    onSendToQc={(a) => sendToQcMutation.mutate(a)}
                   />
 
                   {line.Notes && (

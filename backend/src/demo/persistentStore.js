@@ -4167,8 +4167,16 @@ export function listQcPendingOrders(filters = {}) {
     if (filters.runDate && run.RunDate !== filters.runDate) continue;
     if (filters.zoneCode && run.ZoneCode !== filters.zoneCode) continue;
 
+    // (2026-05-31) Partial-QC handoff — also surface orders marked
+    // ReadyForQc=true even if their wave is still PICKING. Without this,
+    // the QC controller had to wait until the picker finished the entire
+    // wave before they could see anything. Now an operator can flag
+    // individual orders for QC mid-flight. PENDING_QC waves bring ALL
+    // their orders; PICKING waves bring only the ReadyForQc ones.
     const runWaves = (wavesByRun.get(run.RunId) || []).filter((w) => {
-      if (w.Status !== targetStatus) return false;
+      const statusMatch = w.Status === targetStatus
+        || (targetStatus === 'PENDING_QC' && w.Status === 'PICKING');
+      if (!statusMatch) return false;
       if (filters.pickerId != null && w.AssignedPickerId !== filters.pickerId) return false;
       return true;
     });
@@ -4181,6 +4189,8 @@ export function listQcPendingOrders(filters = {}) {
         if (order.DeliveryNoteId || order.InvoiceId) continue;
         if (order.QcRejected) continue;
         const wave = runWaves[0];
+        // PICKING wave → only orders the picker explicitly flagged.
+        if (wave.Status === 'PICKING' && !order.ReadyForQc) continue;
 
         // Build pickedItems for the expandable row. Match allocations by
         // SapDocEntry + CompanyCode and require their WaveLine to belong
@@ -4234,6 +4244,13 @@ export function listQcPendingOrders(filters = {}) {
           AssignedPickerName: wave.AssignedPickerName || null,
           PickedByName:      wave.PickedByName || null,
           QcSubmittedAt:     wave.CompletedAt || wave.UpdatedAt || null,
+          // (2026-05-31) Surface the per-order partial-QC handoff state
+          // so the QC page can render a "מקו פעיל" badge when an order
+          // came from a still-PICKING wave (via ReadyForQc flag).
+          ReadyForQc:        !!order.ReadyForQc,
+          ReadyForQcAt:      order.ReadyForQcAt || null,
+          ReadyForQcBy:      order.ReadyForQcBy || null,
+          IsPartialHandoff:  wave.Status === 'PICKING' && !!order.ReadyForQc,
           // P5 v2 — item-level detail for the expandable row
           pickedItems,
           totalOrdered,
@@ -4282,6 +4299,36 @@ export function rejectOrderQc(runOrderId, opts = {}) {
   order.QcRejectionReason = opts.reason || null;
   order.QcRejectedBy      = opts.rejectedBy || null;
   order.QcRejectedAt      = new Date().toISOString();
+  save();
+  return { ok: true, order };
+}
+
+/**
+ * (2026-05-31) Partial-QC handoff — flag a single RunOrder so it shows
+ * up on the QC controller's screen even though its wave is still in
+ * PICKING. Idempotent: re-calling on a flagged order is a no-op.
+ *
+ * Returns: { ok, order } | { error, message }
+ *   - ORDER_NOT_FOUND   — no such RunOrderId
+ *   - ALREADY_APPROVED  — order already has DN/INV (nothing to send)
+ *   - ALREADY_REJECTED  — order was rejected; can't send forward
+ */
+export function markRunOrderReadyForQc(runOrderId, opts = {}) {
+  const s = load();
+  const order = (s.runOrders || []).find((o) => o.RunOrderId === Number(runOrderId));
+  if (!order) return { error: 'ORDER_NOT_FOUND' };
+  if (order.DeliveryNoteId || order.InvoiceId) {
+    return { error: 'ALREADY_APPROVED', message: 'ההזמנה כבר אושרה ויש לה תעודות' };
+  }
+  if (order.QcRejected) {
+    return { error: 'ALREADY_REJECTED', message: 'ההזמנה נדחתה — לא ניתן לשלוח לבקרה' };
+  }
+  if (order.ReadyForQc) {
+    return { ok: true, order, alreadyFlagged: true };
+  }
+  order.ReadyForQc   = true;
+  order.ReadyForQcAt = new Date().toISOString();
+  order.ReadyForQcBy = opts.flaggedBy || null;
   save();
   return { ok: true, order };
 }

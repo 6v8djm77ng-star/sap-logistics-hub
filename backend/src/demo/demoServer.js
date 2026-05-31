@@ -4119,6 +4119,33 @@ app.post('/api/qc/approve-order/:runOrderId', qcControllerOnly, (req, res) => {
   }
 });
 
+// (2026-05-31) Partial-QC handoff — picker (or anyone with picker access)
+// can flag a single order in their wave as "ready for QC review" without
+// waiting for the whole wave to finish. The order appears on
+// /qc-control immediately even though its wave is still PICKING.
+// Open to any authenticated user (the picker themselves trigger it).
+app.post('/api/run-orders/:runOrderId/ready-for-qc', (req, res) => {
+  const auth = req.headers.authorization;
+  let flaggedBy = null;
+  if (auth?.startsWith('Bearer ')) {
+    try { flaggedBy = jwt.verify(auth.slice(7), JWT_SECRET).name; } catch {}
+  }
+  if (!flaggedBy) return res.status(401).json({ error: 'Authentication required' });
+  const result = store.markRunOrderReadyForQc(req.params.runOrderId, { flaggedBy });
+  if (result.error) {
+    const code = result.error === 'ORDER_NOT_FOUND' ? 404 : 422;
+    return res.status(code).json(result);
+  }
+  store.recordAudit?.({
+    action: 'qc.ready-for-qc',
+    actorName: flaggedBy,
+    ip: req.ip,
+    details: { runOrderId: Number(req.params.runOrderId), alreadyFlagged: !!result.alreadyFlagged },
+  });
+  io.emit('order:ready-for-qc', { runOrderId: Number(req.params.runOrderId) });
+  res.json(result);
+});
+
 app.post('/api/qc/reject-order/:runOrderId', qcControllerOnly, (req, res) => {
   const reason = (req.body?.reason || '').toString().trim();
   if (!reason) {
