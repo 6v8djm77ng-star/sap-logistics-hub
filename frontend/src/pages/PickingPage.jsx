@@ -181,17 +181,25 @@ export default function PickingPage() {
   // the warehouse / logistics manager, not to the route planner.
   // PATCH endpoints (run + stops) are unchanged.
   // ------------------------------------------------------------------
+  // (2026-05-31) When the user lands here via /picking/:waveId (the post-
+  // "שלח לליקוט" redirect), params.runId is undefined — the wave object's
+  // RunId field is the real source of truth. Falling back to it makes the
+  // pallet-mode + pallet-label mutations work in BOTH entry paths, not just
+  // the legacy /warehouse/runs/:runId one. Without this the PATCH went to
+  // /api/runs/undefined and SAP-side returned 404 "Not found".
+  const effectiveRunId = runId || wave?.RunId;
+
   const palletModeMutation = useMutation({
     mutationFn: (palletMode) =>
-      api.patch(`/runs/${runId}`, { palletMode }).then((r) => r.data),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] }),
+      api.patch(`/runs/${effectiveRunId}`, { palletMode }).then((r) => r.data),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', effectiveRunId] }),
     onError: (err) => toast.error(err.response?.data?.error || 'שגיאה בעדכון מצב ליקוט'),
   });
 
   const palletLabelMutation = useMutation({
     mutationFn: ({ stopId, palletLabel }) =>
       api.patch(`/stops/${stopId}`, { palletLabel }).then((r) => r.data),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', runId] }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['wave-for-run', effectiveRunId] }),
   });
 
   // Per-order QC approve — Feature C, DRY-RUN. Creates the SAP documents the
