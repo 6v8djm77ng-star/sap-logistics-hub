@@ -368,6 +368,9 @@ function OrderDetailsRow({ order, planEval, deliveryDays, todayHebrew, showPlanE
 const VIEW_MODE_KEY     = 'openOrders.viewMode.v1';     // 'customers' | 'orders'
 const MIN_ORDER_KEY     = 'openOrders.minOrderTotal.v1'; // number ≥ 0
 const EXPANDED_KEY      = 'openOrders.expanded.v1';      // Set serialized as array
+// (2026-05-31) Zone-filter selection re-added after the operator asked for
+// click-to-filter. Stored as a Set serialized to array. Empty = show all.
+const SELECTED_ZONES_KEY = 'openOrders.selectedZones.v1';
 
 function loadViewMode() {
   try { return localStorage.getItem(VIEW_MODE_KEY) || 'customers'; } catch { return 'customers'; }
@@ -383,10 +386,37 @@ function loadExpanded() {
     return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
   } catch { return new Set(); }
 }
+function loadSelectedZones() {
+  try {
+    const raw = localStorage.getItem(SELECTED_ZONES_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : []);
+  } catch { return new Set(); }
+}
+function saveSelectedZones(set) {
+  try { localStorage.setItem(SELECTED_ZONES_KEY, JSON.stringify([...set])); } catch {}
+}
 
 export default function OpenOrdersPage() {
   const [search, setSearch] = useState('');
   const [company, setCompany] = useState('');
+  // (2026-05-31) Zone filter — click a chip in the toolbar to limit the
+  // table to that zone, click again to toggle off. Multi-select supported
+  // (selecting two zones shows orders from both). Persisted to localStorage
+  // so the operator's focus survives reload.
+  const [selectedZones, setSelectedZones] = useState(loadSelectedZones);
+  const toggleZone = (zoneKey) => {
+    setSelectedZones((prev) => {
+      const next = new Set(prev);
+      if (next.has(zoneKey)) next.delete(zoneKey); else next.add(zoneKey);
+      saveSelectedZones(next);
+      return next;
+    });
+  };
+  const clearZoneFilter = () => {
+    setSelectedZones(() => { const e = new Set(); saveSelectedZones(e); return e; });
+  };
   const [limit, setLimit] = useState(100);
   const [sortBy, setSortBy] = useState('docDate-desc'); // docDate / cardName / city / zone
   // DEV.20: view mode + filter. 'customers' (default) aggregates by
@@ -559,12 +589,18 @@ export default function OpenOrdersPage() {
       .sort((a, b) => (b.count - a.count) || String(a.label).localeCompare(String(b.label), 'he'));
   }, [filteredRawOrders]);
 
-  // Zone toolbar is read-only now — no filter cascade, no cleanup pass.
-  // zoneAggregates still feeds the display below.
+  // (2026-05-31) Zone filter — multi-select. Empty selection = show all.
+  // The toolbar chip-aggregate above runs on filteredRawOrders BEFORE this
+  // step so chip counts always reflect "what's available in each zone in
+  // the current day+company+search context" — not "after my zone pick".
+  // Otherwise picking SHARON would zero out every other chip → useless.
+  const zoneFilteredOrders = selectedZones.size === 0
+    ? filteredRawOrders
+    : filteredRawOrders.filter((o) => selectedZones.has(zoneKeyOf(o)));
 
   // Apply client-side sort.
   const orders = (() => {
-    const arr = [...filteredRawOrders];
+    const arr = [...zoneFilteredOrders];
     const cityOf = (o) => {
       const addr = (o.ShipToAddress || '').split(/\r?\n|\r/).map((p) => p.trim()).filter(Boolean);
       return addr[addr.length - 1] || o.CustCity || '';
@@ -751,22 +787,48 @@ export default function OpenOrdersPage() {
       {zoneAggregates.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
           <MapPin size={16} className="text-gray-500" />
-          <span className="text-gray-600">אזורי חלוקה במסך:</span>
+          <span className="text-gray-600">אזורי חלוקה:</span>
           {zoneAggregates.map((z) => {
-            const style = z.color
-              ? { backgroundColor: z.color + '22', borderColor: z.color, color: z.color }
-              : { backgroundColor: '#f3f4f6', borderColor: '#d1d5db', color: '#374151' };
+            const active = selectedZones.has(z.key);
+            // (2026-05-31) Clickable filter chips. Inactive = faded
+            // 1px border, active = bold 2px border + brighter background
+            // + checkmark prefix so it's obvious which zones are picked.
+            const baseStyle = z.color
+              ? { borderColor: z.color, color: z.color }
+              : { borderColor: '#d1d5db', color: '#374151' };
+            const bg = z.color ? z.color : '#9ca3af';
+            const style = {
+              ...baseStyle,
+              backgroundColor: active ? bg + '40' : bg + '15',
+              borderWidth: active ? '2px' : '1px',
+              fontWeight: active ? 600 : 400,
+            };
             return (
-              <span
+              <button
                 key={z.key}
-                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md border select-none cursor-default"
+                type="button"
+                onClick={() => toggleZone(z.key)}
+                className="inline-flex items-center gap-1.5 px-3 py-1 rounded-md border select-none cursor-pointer hover:brightness-95 transition-all"
                 style={style}
-                title={`${z.label}: ${z.count} הזמנות`}
+                title={active
+                  ? `לחץ להסרת הסינון מ-${z.label}`
+                  : `לחץ לסנן את הטבלה ל-${z.label} (${z.count} הזמנות)`}
               >
+                {active && <span className="text-[10px]">✓</span>}
                 {z.label} <span className="text-xs opacity-75">({z.count})</span>
-              </span>
+              </button>
             );
           })}
+          {selectedZones.size > 0 && (
+            <button
+              type="button"
+              onClick={clearZoneFilter}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-gray-600 hover:bg-gray-100 underline decoration-dotted"
+              title="נקה את כל הסינון לפי אזורים"
+            >
+              <X size={12} /> נקה סינון ({selectedZones.size})
+            </button>
+          )}
           {planEvalCfg.applyDeliveryDay && (
             <span className="text-xs text-gray-500 mr-1">
               · מסונן ליום: <span className="font-medium text-gray-700">{todayLabel} (היום)</span>
