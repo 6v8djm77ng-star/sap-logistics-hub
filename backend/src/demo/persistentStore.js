@@ -18,7 +18,14 @@ import { writeDeliveryNote, writeInvoice } from './sapWriter.js';
 import { ROLE_CODES, DEFAULT_ROLE_PERMISSIONS, isScreenAllowedForList } from './screenRegistry.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const STORE_PATH = path.resolve(__dirname, '../../data/store.json');
+// Store location. Default is backend/data/store.json (unchanged behaviour, so
+// an unset env var is a no-op). Set LOGISTICS_STORE_PATH to move the live data
+// OUT of OneDrive: a cloud-synced folder once truncated this file and keeps
+// breaking dist builds via file locks / sync conflicts on a live-written JSON
+// (see cowork/INCIDENTS.md). The PowerShell guard scripts resolve the same var.
+const STORE_PATH = process.env.LOGISTICS_STORE_PATH
+  ? path.resolve(process.env.LOGISTICS_STORE_PATH)
+  : path.resolve(__dirname, '../../data/store.json');
 
 let cache = null;
 

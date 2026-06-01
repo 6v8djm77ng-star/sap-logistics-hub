@@ -35,8 +35,25 @@ $ErrorActionPreference = 'Stop'
 
 # --- paths -----------------------------------------------------------------
 $repoRoot   = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
-$sourcePath = Join-Path $repoRoot 'backend\data\store.json'
-$backupDir  = Join-Path $repoRoot 'backend\data\backups'
+
+# Resolve the store from LOGISTICS_STORE_PATH in backend/.env (live data was
+# moved OUT of OneDrive) with a fallback to the legacy location. Backups live
+# next to the store, so they leave OneDrive together with it.
+function Get-ConfiguredStorePath {
+    param([string]$RepoRoot)
+    $envFile = Join-Path $RepoRoot 'backend\.env'
+    if (Test-Path $envFile) {
+        $m = Select-String -Path $envFile -Pattern '^\s*LOGISTICS_STORE_PATH\s*=\s*(.+?)\s*$' |
+             Select-Object -First 1
+        if ($m) {
+            $val = $m.Matches[0].Groups[1].Value.Trim().Trim('"').Trim("'")
+            if ($val) { return $val }
+        }
+    }
+    return (Join-Path $RepoRoot 'backend\data\store.json')
+}
+$sourcePath = Get-ConfiguredStorePath -RepoRoot $repoRoot
+$backupDir  = Join-Path (Split-Path -Parent $sourcePath) 'backups'
 $logDir     = Join-Path $repoRoot 'logs'
 $logPath    = Join-Path $logDir   'store-backup.log'
 

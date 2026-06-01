@@ -54,7 +54,24 @@ $ProgressPreference = 'SilentlyContinue'
 # Configuration
 # -----------------------------------------------------------------------------
 $REPO_ROOT = Split-Path -Parent $PSScriptRoot
-$STORE = if ($StorePath) { $StorePath } else { Join-Path $REPO_ROOT 'backend\data\store.json' }
+
+# Resolve the store path. Priority: explicit -StorePath > LOGISTICS_STORE_PATH
+# in backend/.env (live data was moved OUT of OneDrive) > the legacy default.
+# Single source of truth with the app (persistentStore.js reads the same var).
+function Get-ConfiguredStorePath {
+    param([string]$RepoRoot)
+    $envFile = Join-Path $RepoRoot 'backend\.env'
+    if (Test-Path $envFile) {
+        $m = Select-String -Path $envFile -Pattern '^\s*LOGISTICS_STORE_PATH\s*=\s*(.+?)\s*$' |
+             Select-Object -First 1
+        if ($m) {
+            $val = $m.Matches[0].Groups[1].Value.Trim().Trim('"').Trim("'")
+            if ($val) { return $val }
+        }
+    }
+    return (Join-Path $RepoRoot 'backend\data\store.json')
+}
+$STORE = if ($StorePath) { $StorePath } else { Get-ConfiguredStorePath -RepoRoot $REPO_ROOT }
 $DATA_DIR = Split-Path -Parent $STORE
 $PM2_NAME = 'sap-logistics'
 $MIN_SIZE_BYTES = 100KB     # well below the expected ~2 MB of a healthy store
