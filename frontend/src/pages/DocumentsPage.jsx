@@ -76,104 +76,13 @@ function StatusBadge({ status }) {
 // changes, update here too; a UI test below would catch the divergence.
 const CONFIRM_SAP_MIN_DOCENTRY = 100;
 
-function ConfirmSapDialog({ doc, type, onClose }) {
-  const [docEntry, setDocEntry] = useState('');
-  const [docNum, setDocNum] = useState('');
-  const queryClient = useQueryClient();
-
-  // DEV.11: client-side check mirrors the backend safeguard so the operator
-  // sees an inline reason before submit (instead of a silent 400). The
-  // backend remains the source of truth — this is UX, not enforcement.
-  const numEntry = Number(docEntry);
-  const docEntryInvalid = docEntry === '' || !Number.isInteger(numEntry) || numEntry < CONFIRM_SAP_MIN_DOCENTRY;
-
-  const mutation = useMutation({
-    mutationFn: () => docsApi.confirmSap(type, type === 'invoice' ? doc.InvoiceId : doc.DeliveryNoteId, docEntry, docNum),
-    onSuccess: () => {
-      toast.success('עודכן בהצלחה');
-      queryClient.invalidateQueries();
-      onClose();
-    },
-    // DEV.11: surface backend rejections (DEV.10 INVALID_SAP_DOC_ENTRY /
-    // INVALID_SAP_DOC_NUM → 400) instead of leaving the dialog silently
-    // stuck. The backend `message` is operator-friendly Hebrew/explanation;
-    // fall back to a generic line if the shape differs.
-    onError: (err) => {
-      const msg = err?.response?.data?.message
-        || err?.response?.data?.error
-        || err?.message
-        || 'אישור SAP נכשל';
-      toast.error(msg);
-    },
-  });
-
-  return (
-    <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl max-w-md w-full p-5">
-        <h2 className="font-bold text-lg mb-1">אישור יצירה ב-SAP</h2>
-        <p className="text-sm text-gray-500 mb-4">
-          {type === 'invoice' ? 'חשבונית' : 'תעודת משלוח'} {doc.DocNumber} - {doc.SapCardName}
-        </p>
-
-        <div className="bg-blue-50 border border-blue-200 rounded p-3 mb-4 text-sm">
-          <strong>איך לעשות:</strong>
-          <ol className="text-xs mt-1 space-y-0.5 list-decimal pr-4">
-            <li>פתח את SAP Business One</li>
-            <li>צור {type === 'invoice' ? 'חשבונית A/R חדשה' : 'תעודת משלוח חדשה'} בחברת {doc.CompanyName}</li>
-            <li>בחר לקוח {doc.SapCardCode}</li>
-            <li>אחרי שמירה, חזור והכנס פה את ה-DocEntry וה-DocNum</li>
-          </ol>
-        </div>
-
-        <div className="space-y-3">
-          <div>
-            <label className="block text-sm font-medium mb-1">SAP DocEntry</label>
-            <input
-              type="number"
-              min={CONFIRM_SAP_MIN_DOCENTRY}
-              value={docEntry}
-              onChange={(e) => setDocEntry(e.target.value)}
-              placeholder="42203"
-              className={`w-full px-3 py-2 border rounded-lg ${
-                docEntry !== '' && docEntryInvalid ? 'border-red-400 bg-red-50' : ''
-              }`}
-            />
-            {/* DEV.11 helper — explains the backend safeguard inline so the
-                operator doesn't waste a submit on a placeholder. */}
-            <p className={`text-xs mt-1 ${
-              docEntry !== '' && docEntryInvalid ? 'text-red-600' : 'text-gray-500'
-            }`}>
-              DocEntry אמיתי מ-SAP חייב להיות {CONFIRM_SAP_MIN_DOCENTRY} ומעלה.
-              ערכים כמו 1 הם placeholders ולא יאושרו.
-            </p>
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1">SAP DocNum</label>
-            <input
-              type="number"
-              value={docNum}
-              onChange={(e) => setDocNum(e.target.value)}
-              placeholder="42203"
-              className="w-full px-3 py-2 border rounded-lg"
-            />
-          </div>
-        </div>
-
-        <div className="flex gap-2 mt-4">
-          <button onClick={onClose} className="flex-1 py-2 border rounded-lg">ביטול</button>
-          <button
-            onClick={() => mutation.mutate()}
-            disabled={docEntryInvalid || mutation.isPending}
-            className="flex-1 py-2 bg-brand-600 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
-            title={docEntryInvalid ? `יש להזין DocEntry ≥ ${CONFIRM_SAP_MIN_DOCENTRY}` : undefined}
-          >
-            אשר
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+// (2026-06-01) ConfirmSapDialog removed by operator request. The manual
+// "אשר ב-SAP" flow — where the operator typed the SAP DocEntry by hand
+// after creating the doc inside SAP B1 — is no longer how docs reach
+// SAP. The auto path via /runs/:id → "הפק מסמכים מאוחדים" + ✅ checkbox
+// "שלח חי ל-SAP" is now the only entry point. The dialog component, its
+// trigger buttons on DN/INV rows, and the confirmingDoc state were all
+// dropped together so the UI is honest about what's possible.
 
 // DEV.13: helper to detect a suspicious SAP confirmation in either DN or INV
 // shape. Centralizes the (Status + DocEntry < floor) check so the row-action
@@ -236,8 +145,7 @@ function RevertConfirmDialog({ doc, type, onClose }) {
 
         <div className="bg-blue-50 border border-blue-200 rounded p-3 mb-4 text-xs">
           ⚠️ פעולה זו <strong>אינה משפיעה על SAP</strong>. היא רק מאפסת את הסימון המקומי
-          של "אושר ב-SAP". אם המסמך באמת קיים ב-SAP — עדכן את ה-DocEntry האמיתי
-          דרך "אשר ב-SAP".
+          של "אושר ב-SAP". אם המסמך באמת קיים ב-SAP — בטל אותו ידנית ב-SAP B1 קודם.
         </div>
 
         <div className="mb-4">
@@ -478,7 +386,7 @@ export default function DocumentsPage() {
   const [date, setDate] = useState(format(new Date(), 'yyyy-MM-dd'));
   const [companyFilter, setCompanyFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
-  const [confirmingDoc, setConfirmingDoc] = useState(null);
+  // (2026-06-01) confirmingDoc state removed with the manual confirm flow.
   // DEV.13: separate state for the revert dialog so confirm and revert can't
   // clash. revertingDoc = { doc, type } or null.
   const [revertingDoc, setRevertingDoc] = useState(null);
@@ -821,14 +729,9 @@ export default function DocumentsPage() {
                       {dn.SapDeliveryDocEntry || '—'}
                     </td>
                     <td className="p-3 text-left whitespace-nowrap">
-                      {dn.Status !== 'SAP_CONFIRMED' && (
-                        <button
-                          onClick={() => setConfirmingDoc({ doc: dn, type: 'deliveryNote' })}
-                          className="text-xs text-brand-600 hover:underline mr-2"
-                        >
-                          אשר ב-SAP
-                        </button>
-                      )}
+                      {/* (2026-06-01) Manual "אשר ב-SAP" removed.
+                          Auto-export of aggregate DNs happens via the
+                          /runs/:id "הפק מסמכים מאוחדים" + checkbox flow. */}
                       {/* DEV.13: revert appears ONLY when this row is a
                           suspicious SAP_CONFIRMED (placeholder DocEntry).
                           For real confirmations, the button is hidden — no
@@ -897,14 +800,9 @@ export default function DocumentsPage() {
                           ↗ שלח ל-SAP
                         </button>
                       )}
-                      {inv.Status !== 'SAP_CONFIRMED' && (
-                        <button
-                          onClick={() => setConfirmingDoc({ doc: inv, type: 'invoice' })}
-                          className="text-xs text-brand-600 hover:underline mr-2"
-                        >
-                          אשר ב-SAP
-                        </button>
-                      )}
+                      {/* (2026-06-01) Manual "אשר ב-SAP" removed.
+                          The "↗ שלח ל-SAP" button above is now the
+                          single auto-write path for invoices. */}
                       {/* DEV.13: future-proof — currently no INV is
                           suspicious, but the same guard applies if one
                           ever is. */}
@@ -1100,21 +998,15 @@ export default function DocumentsPage() {
           💡 איך לעבוד עם המסמכים
         </h3>
         <ol className="text-sm space-y-1 list-decimal pr-5">
-          <li>נהג מסיים עצירה → תעודות משלוח <strong>נוצרות אוטומטית</strong> (אחת לכל חברה)</li>
-          <li>אחרי הליקוט/מסירה - לחץ "Excel - OIG" ו-"Excel - Unico" להורדת רשימה לפי חברה</li>
-          <li>פתח את SAP - הזן את התעודות ידנית מהרשימה (חברה אחר חברה)</li>
-          <li>חזור ולחץ "אשר ב-SAP" - הזן את ה-DocEntry שקיבלת מ-SAP</li>
-          <li>לחץ על אייקון <Receipt size={11} className="inline" /> ליצירת חשבונית מתעודת משלוח</li>
+          <li>נהג / מלקט מסיים עצירה → המערכת יוצרת תעודות מקומיות אוטומטית (PENDING_EXPORT)</li>
+          <li>לכתיבה ל-SAP — היכנס ל-<strong>מסלולי הפצה ⇐ פרטי מסלול</strong> ולחץ "הפק מסמכים מאוחדים" עם ה-checkbox <strong>"שלח חי ל-SAP"</strong> דלוק</li>
+          <li>אחרי שליחה — המסמך מקבל DocEntry אמיתי מ-SAP והסטטוס משתנה ל-EXPORTED אוטומטית</li>
+          <li>לחץ על אייקון <Receipt size={11} className="inline" /> ליצירת חשבונית מתעודת משלוח (במצב שעדיין אין)</li>
+          <li>לייצוא ידני אופציונלי — תוכל גם להוריד Excel + להזין ב-SAP B1, אבל זה לא דרוש</li>
         </ol>
       </div>
 
-      {confirmingDoc && (
-        <ConfirmSapDialog
-          doc={confirmingDoc.doc}
-          type={confirmingDoc.type}
-          onClose={() => setConfirmingDoc(null)}
-        />
-      )}
+      {/* (2026-06-01) ConfirmSapDialog rendering removed with the manual flow. */}
 
       {/* DEV.13 revert dialog. Opens only when a suspicious-row button is
           clicked. Backend rejects non-suspicious docs even if the button
