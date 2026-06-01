@@ -603,8 +603,17 @@ export function isPickableUser(userId) {
   return !!(p && p.IsActive === true);
 }
 
-export async function verifyUserPassword(username, password) {
-  const user = getUserByUsername(username);
+export async function verifyUserPassword(identifier, password) {
+  // Accept EITHER username OR email, case-insensitive. Operators repeatedly
+  // failed login by typing their email (e.g. "shayleon@oig.co.il") or a
+  // capitalised username ("Shayleon") into the username field — the old
+  // exact `Username ===` match rejected both. Lookup stays login-only;
+  // getUserByUsername (used for nothing else) is left exact on purpose.
+  const q = String(identifier || '').trim().toLowerCase();
+  const user = load().users.find((u) =>
+    (u.Username && u.Username.toLowerCase() === q) ||
+    (u.Email && u.Email.toLowerCase() === q)
+  );
   if (!user || !user.IsActive || !user.PasswordHash) return null;
   const ok = await bcrypt.compare(password, user.PasswordHash);
   return ok ? user : null;
