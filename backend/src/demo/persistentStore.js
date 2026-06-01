@@ -4168,14 +4168,18 @@ export function listQcPendingOrders(filters = {}) {
     if (filters.zoneCode && run.ZoneCode !== filters.zoneCode) continue;
 
     // (2026-05-31) Partial-QC handoff — also surface orders marked
-    // ReadyForQc=true even if their wave is still PICKING. Without this,
-    // the QC controller had to wait until the picker finished the entire
-    // wave before they could see anything. Now an operator can flag
-    // individual orders for QC mid-flight. PENDING_QC waves bring ALL
-    // their orders; PICKING waves bring only the ReadyForQc ones.
+    // ReadyForQc=true even if their wave is still being picked. Without
+    // this, the QC controller had to wait until the picker finished the
+    // entire wave before they could see anything. Now an operator can
+    // flag individual orders for QC mid-flight. PENDING_QC waves bring
+    // ALL their orders; in-progress waves bring only the ReadyForQc
+    // ones. Wave statuses in this store: PENDING (created, not started),
+    // IN_PROGRESS (picker working), PENDING_QC (picker done), COMPLETED,
+    // CANCELLED. "Pre-QC" statuses are PENDING + IN_PROGRESS.
+    const PRE_QC_STATUSES = new Set(['PENDING', 'IN_PROGRESS']);
     const runWaves = (wavesByRun.get(run.RunId) || []).filter((w) => {
       const statusMatch = w.Status === targetStatus
-        || (targetStatus === 'PENDING_QC' && w.Status === 'PICKING');
+        || (targetStatus === 'PENDING_QC' && PRE_QC_STATUSES.has(w.Status));
       if (!statusMatch) return false;
       if (filters.pickerId != null && w.AssignedPickerId !== filters.pickerId) return false;
       return true;
@@ -4189,8 +4193,8 @@ export function listQcPendingOrders(filters = {}) {
         if (order.DeliveryNoteId || order.InvoiceId) continue;
         if (order.QcRejected) continue;
         const wave = runWaves[0];
-        // PICKING wave → only orders the picker explicitly flagged.
-        if (wave.Status === 'PICKING' && !order.ReadyForQc) continue;
+        // Pre-QC wave → only orders the picker explicitly flagged.
+        if (PRE_QC_STATUSES.has(wave.Status) && !order.ReadyForQc) continue;
 
         // Build pickedItems for the expandable row. Match allocations by
         // SapDocEntry + CompanyCode and require their WaveLine to belong
@@ -4250,7 +4254,7 @@ export function listQcPendingOrders(filters = {}) {
           ReadyForQc:        !!order.ReadyForQc,
           ReadyForQcAt:      order.ReadyForQcAt || null,
           ReadyForQcBy:      order.ReadyForQcBy || null,
-          IsPartialHandoff:  wave.Status === 'PICKING' && !!order.ReadyForQc,
+          IsPartialHandoff:  PRE_QC_STATUSES.has(wave.Status) && !!order.ReadyForQc,
           // P5 v2 — item-level detail for the expandable row
           pickedItems,
           totalOrdered,
