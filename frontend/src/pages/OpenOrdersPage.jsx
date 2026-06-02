@@ -449,8 +449,18 @@ export default function OpenOrdersPage() {
   // bypassed entirely. There is no separate day-tab strip anymore (2026-05-27):
   // the operator complained that having both a day-tab and a checkbox
   // created "לופ ובלגאן" — only one place to control day behavior now.
-  const todayDayIdx = new Date().getDay();
-  const todayLabel = HEBREW_WEEKDAYS[todayDayIdx];
+  // Planning day. Default = today, but the operator can pick any date to plan
+  // a future delivery day. Drives both the client-side day filter below AND the
+  // runDate sent to plan-eval (so per-order badges evaluate for the chosen day).
+  // Re-added 2026-06: the 2026-05-27 removal of the day-tab strip left this
+  // screen locked to the current day, blocking future-day planning here.
+  const todayStr = format(new Date(), 'yyyy-MM-dd');
+  const [planDate, setPlanDate] = useState(todayStr);
+  const isPlanToday = planDate === todayStr;
+  const planDayIdx = new Date(planDate + 'T00:00:00').getDay();
+  // `todayLabel` keeps its name (used by the filter + label below) but now
+  // reflects the SELECTED day's Hebrew weekday, not necessarily the real today.
+  const todayLabel = HEBREW_WEEKDAYS[planDayIdx];
 
   // Customer delivery profiles (1,500+ rows, ~1 MB). Used to join orders
   // to their customer's DeliveryDays array. Cached for 5 min so flipping
@@ -515,11 +525,12 @@ export default function OpenOrdersPage() {
   // Plan-eval data source — used when toggle is ON. Same orders but each
   // carries a per-criterion `planEval` object from the backend.
   const { data: planEvalData, isLoading: planEvalLoading } = useQuery({
-    queryKey: ['orders-with-plan-eval', planEvalCfg.minCustomerTotal, planEvalCfg.requireStock, planEvalCfg.applyDeliveryDay],
+    queryKey: ['orders-with-plan-eval', planEvalCfg.minCustomerTotal, planEvalCfg.requireStock, planEvalCfg.applyDeliveryDay, planDate],
     queryFn: () => ordersApi.openWithPlanEval({
       minCustomerTotal: planEvalCfg.minCustomerTotal,
       requireStock: planEvalCfg.requireStock,
       applyDeliveryDay: planEvalCfg.applyDeliveryDay,
+      runDate: planDate,
     }),
     refetchInterval: 60_000,
     enabled: planEvalCfg.enabled,
@@ -831,7 +842,7 @@ export default function OpenOrdersPage() {
           )}
           {planEvalCfg.applyDeliveryDay && (
             <span className="text-xs text-gray-500 mr-1">
-              · מסונן ליום: <span className="font-medium text-gray-700">{todayLabel} (היום)</span>
+              · מסונן ליום: <span className="font-medium text-gray-700">{todayLabel}{isPlanToday ? ' (היום)' : ''}</span>
             </span>
           )}
         </div>
@@ -849,9 +860,32 @@ export default function OpenOrdersPage() {
           <SlidersHorizontal size={16} className="text-gray-500" />
           <span className="font-medium">החל סינון תנאי תכנון יומי</span>
           {planEvalCfg.enabled && planEvalData?.todayHebrew && (
-            <span className="text-xs text-gray-500 mr-2">· היום: {planEvalData.todayHebrew}</span>
+            <span className="text-xs text-gray-500 mr-2">· יום נבחר: {planEvalData.todayHebrew}</span>
           )}
         </label>
+        {/* Planning-day picker (2026-06): plan a future delivery day, not just
+            today. Drives the client-side day filter + the plan-eval runDate. */}
+        <div className="mt-2 flex items-center gap-2 text-sm flex-wrap">
+          <label htmlFor="plan-date" className="text-gray-600">יום תכנון:</label>
+          <input
+            id="plan-date"
+            type="date"
+            value={planDate}
+            min={todayStr}
+            onChange={(e) => setPlanDate(e.target.value || todayStr)}
+            className="border rounded-md px-2 py-1 text-sm"
+          />
+          <span className="text-xs text-gray-500">({todayLabel}{isPlanToday ? ' · היום' : ''})</span>
+          {!isPlanToday && (
+            <button
+              type="button"
+              onClick={() => setPlanDate(todayStr)}
+              className="text-xs text-blue-600 underline decoration-dotted"
+            >
+              חזור להיום
+            </button>
+          )}
+        </div>
         {planEvalCfg.enabled && (
           <div className="mt-3 pt-3 border-t grid grid-cols-1 md:grid-cols-3 gap-4">
             <div>
