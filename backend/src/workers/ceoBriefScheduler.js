@@ -7,13 +7,15 @@
  *
  * Requires ANTHROPIC_API_KEY to be set, otherwise the scheduler stays idle.
  *
- * No email / Slack delivery — results are persisted to dbo.AgentRuns and read via
- * GET /api/agents/runs. Email integration can be added later.
+ * Results are persisted to dbo.AgentRuns (read via GET /api/agents/runs).
+ * When CEO_BRIEF_EMAIL_ENABLED=true and CEO_BRIEF_EMAIL_TO is set, the brief
+ * is also delivered by email after each scheduled run.
  */
 import cron from 'node-cron';
 import { env, agentsConfigured } from '../config/env.js';
 import { apiLogger } from '../utils/logger.js';
 import { runCeoBrief } from '../agents/ceoBrief.js';
+import { sendCeoBriefEmail } from '../services/ceoBriefEmail.js';
 
 let task = null;
 
@@ -41,6 +43,9 @@ export function startCeoBriefScheduler() {
         costUsd: result.costUsd,
         toolCallCount: result.toolCallCount,
       });
+      const mail = await sendCeoBriefEmail(result.output, { runId: result.runId });
+      if (mail.sent) apiLogger.info(`[ceoBriefScheduler] brief ${result.runId} emailed`);
+      else if (!mail.skipped) apiLogger.warn('[ceoBriefScheduler] brief email not sent', mail);
     } catch (err) {
       apiLogger.error('[ceoBriefScheduler] run failed', { error: err.message });
     }

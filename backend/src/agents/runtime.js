@@ -96,8 +96,11 @@ export async function runAgent({
 
   try {
     for (let step = 0; step < env.AGENT_MAX_TOOL_CALLS + 2; step++) {
-      // After we've used some tool calls, force the model to commit by requiring submitTool.
-      const forceSubmit = !!submitTool && toolCallCount >= 1 && step >= env.AGENT_MAX_TOOL_CALLS;
+      // Force the model to commit via submitTool once it has exhausted its tool
+      // budget — or immediately, for narrator-style agents that have no data
+      // tools (all their data is embedded in the user message).
+      const forceSubmit = !!submitTool &&
+        (tools.length === 0 || (toolCallCount >= 1 && step >= env.AGENT_MAX_TOOL_CALLS));
 
       const response = await client().messages.create({
         model: useModel,
