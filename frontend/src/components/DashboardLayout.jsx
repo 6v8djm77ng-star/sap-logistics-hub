@@ -29,6 +29,7 @@ import {
   ChevronDown,
   ChevronUp,
   ShieldCheck,
+  Sparkles,
 } from 'lucide-react';
 import clsx from 'clsx';
 import RefreshButton from './RefreshButton.jsx';
@@ -71,6 +72,8 @@ const workflowSection = [
 // view-only "look at what's happening" screens, not steps the planner walks
 // through in order. Reordered so that the day-to-day analytics come first.
 const reportsSection = [
+  // CEO Daily Brief — ADMIN only (backend /api/agents/* is admin-gated).
+  { to: '/ceo-brief',   label: 'תקציר מנכ"ל',    icon: Sparkles, roles: ['ADMIN'] },
   { to: '/analytics',   label: 'ניתוח ביצועים',  icon: BarChart3 },
   { to: '/weekly',      label: 'דוח שבועי',      icon: BarChart3 },
   { to: '/leaderboard', label: 'ביצועי נהגים',   icon: Trophy },

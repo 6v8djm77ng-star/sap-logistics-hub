@@ -98,6 +98,8 @@ const envSchema = z.object({
   AGENT_MAX_TOKENS_OUT: z.coerce.number().default(4096),
   CEO_BRIEF_CRON: z.string().default('0 7 * * *'),
   CEO_BRIEF_SCHEDULE_ENABLED: z.coerce.boolean().default(false),
+  CEO_BRIEF_EMAIL_ENABLED: z.coerce.boolean().default(false),
+  CEO_BRIEF_EMAIL_TO: z.string().optional(),  // comma-separated emails
 
   // DAVO Mix weekly report
   DAVO_MIX_REPORT_CRON: z.string().default('0 8 * * 0'),  // Sunday 08:00 Asia/Jerusalem

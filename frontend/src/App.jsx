@@ -38,6 +38,7 @@ import DriverLeaderboardPage from './pages/DriverLeaderboardPage.jsx';
 import CashOnDeliveryPage from './pages/CashOnDeliveryPage.jsx';
 import CustomerProfitabilityPage from './pages/CustomerProfitabilityPage.jsx';
 import AnomaliesPage from './pages/AnomaliesPage.jsx';
+import CeoBriefPage from './pages/CeoBriefPage.jsx';
 import StockPredictionPage from './pages/StockPredictionPage.jsx';
 import PickersPage from './pages/PickersPage.jsx';
 import DavoMixPage from './pages/DavoMixPage.jsx';
@@ -226,6 +227,16 @@ export default function App() {
         <Route path="cod" element={<CashOnDeliveryPage />} />
         <Route path="profitability" element={<CustomerProfitabilityPage />} />
         <Route path="anomalies" element={<AnomaliesPage />} />
+        {/* CEO Daily Brief (v2, verified-metrics) — backend gate is ADMIN-only
+            on /api/agents/*, so the route guard mirrors it. */}
+        <Route
+          path="ceo-brief"
+          element={
+            <RequireAuth roles={['ADMIN']}>
+              <CeoBriefPage />
+            </RequireAuth>
+          }
+        />
         <Route path="stock-prediction" element={<StockPredictionPage />} />
         <Route path="davo-mix" element={<DavoMixPage />} />
       </Route>
